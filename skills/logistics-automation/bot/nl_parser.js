@@ -127,30 +127,33 @@ function parseOrderPrompt(prompt = '') {
   spec.pickup = {};
   spec.dropoff = {};
 
-  const fromToMatch = text.match(/(?:from|dari)\s+([\s\S]+?)\s+(?:to|ke)\s+([\s\S]+?)(?:\s*,?\s*(?:on|at|pada|tanggal|jam|scheduled|pickup|$))/i);
+  // Check if user explicitly mentioned a destination
+  const hasDestinationMention = /(?:\bto\b|\bke\b|\bantar\s+ke\b|\btujuan(?:\s+ke)?\b|\bdrop-?off\b|\bdestination\b)/i.test(text);
+  if (hasDestinationMention) {
+    spec._explicitDestinationProvided = true;
+  }
 
   function cleanLocationText(raw) {
-    if (!raw) return { district: '', city: '', address: '' };
-    let clean = raw.replace(/\s+(?:on|at|pada|tanggal|jam|scheduled).*$/i, '').trim();
-    clean = clean.replace(/^[,\s]+|[,\s]+$/g, '');
+    if (!raw) return { district: '', city: '', province: '', address: '' };
+    let clean = raw.replace(/\s+\b(?:on|at|pada|tanggal|jam|scheduled|pickup)\b.*$/i, '').trim();
+    clean = clean.replace(/^(?:in|at|di|ke|from|dari|to|tujuan)\s+/i, '');
+    clean = clean.replace(/^[,:\s]+|[,:\s]+$/g, '');
 
-    if (clean.includes(',')) {
-      const parts = clean.split(',').map(s => s.trim()).filter(Boolean);
+    if (/(?:unknown|destin|somewhere|unspecified|atlantis|entah)/i.test(clean)) {
       return {
-        district: parts[0] || '',
-        city: parts[1] || parts[0] || '',
-        province: parts[2] || '',
-        address: clean,
+        city: '',
+        unresolved: true,
+        raw: clean,
       };
     }
 
-    // Space-separated city detection
     const knownPairs = [
-      { prefix: 'Tebet', city: 'Jakarta Selatan', district: 'Tebet' },
-      { prefix: 'Gubeng', city: 'Surabaya', district: 'Gubeng' },
-      { prefix: 'Kesambi', city: 'Cirebon', district: 'Kesambi' },
-      { prefix: 'Adiwerna', city: 'Tegal', district: 'Adiwerna' },
-      { prefix: 'Lengkong', city: 'Bandung', district: 'Lengkong' },
+      { prefix: 'Tebet', city: 'Jakarta Selatan', district: 'Tebet', province: 'DKI Jakarta' },
+      { prefix: 'Gubeng', city: 'Kota Surabaya', district: 'Gubeng', province: 'Jawa Timur' },
+      { prefix: 'Kesambi', city: 'Kota Cirebon', district: 'Kesambi', province: 'Jawa Barat' },
+      { prefix: 'Adiwerna', city: 'Kabupaten Tegal', district: 'Adiwerna', province: 'Jawa Tengah' },
+      { prefix: 'Lengkong', city: 'Kota Bandung', district: 'Lengkong', province: 'Jawa Barat' },
+      { prefix: 'Bekasi Barat', city: 'Kota Bekasi', district: 'Bekasi Barat', province: 'Jawa Barat' },
     ];
 
     for (const kp of knownPairs) {
@@ -158,33 +161,89 @@ function parseOrderPrompt(prompt = '') {
         return {
           district: kp.district,
           city: kp.city,
-          address: clean,
+          province: kp.province,
+          address: '',
         };
       }
     }
 
+    if (clean.includes(',')) {
+      const parts = clean.split(',').map(s => s.trim()).filter(Boolean);
+      return {
+        district: parts[0] || '',
+        city: parts[1] || parts[0] || '',
+        province: parts[2] || '',
+        address: '',
+      };
+    }
+
+    if (/jakarta/i.test(clean)) {
+      const dist = /tebet/i.test(clean) ? 'Tebet' : '';
+      return { district: dist, city: 'Jakarta Selatan', province: 'DKI Jakarta', address: '' };
+    }
+    if (/surabaya/i.test(clean)) {
+      const dist = /gubeng/i.test(clean) ? 'Gubeng' : '';
+      return { district: dist, city: 'Kota Surabaya', province: 'Jawa Timur', address: '' };
+    }
+    if (/cirebon/i.test(clean)) {
+      const dist = /kesambi/i.test(clean) ? 'Kesambi' : '';
+      return { district: dist, city: 'Kota Cirebon', province: 'Jawa Barat', address: '' };
+    }
+    if (/tegal/i.test(clean)) {
+      const dist = /adiwerna/i.test(clean) ? 'Adiwerna' : '';
+      return { district: dist, city: 'Kabupaten Tegal', province: 'Jawa Tengah', address: '' };
+    }
+    if (/bandung/i.test(clean)) {
+      return { district: '', city: 'Kota Bandung', province: 'Jawa Barat', address: '' };
+    }
+    if (/tangerang/i.test(clean)) {
+      return { district: '', city: 'Kota Tangerang', province: 'Banten', country: 'Indonesia', address: '' };
+    }
+    if (/singapore|orchard/i.test(clean)) {
+      return { district: '', city: 'Orchard', country: 'Singapore', postalCode: '238801', address: '' };
+    }
+
     return {
       city: clean,
-      address: clean,
+      address: '',
     };
   }
 
-  if (fromToMatch) {
-    const fromParsed = cleanLocationText(fromToMatch[1]);
-    const toParsed = cleanLocationText(fromToMatch[2]);
+  // Primary Route Regex: "pickup in X to Y", "from X to Y", "dari X ke Y"
+  const routeMatch = text.match(/(?:from|dari|pickup(?:\s+in|\s+at|\s+di)?)\s+([\s\S]+?)\s+(?:to|ke|antar\s+ke|tujuan\s+ke)\s+([\s\S]+?)(?:\s*,?\s*\b(?:on|at|pada|tanggal|jam|scheduled|pickup)\b|$)/i);
+
+  if (routeMatch) {
+    const fromRaw = routeMatch[1].trim();
+    const toRaw = routeMatch[2].trim();
+
+    const fromParsed = cleanLocationText(fromRaw);
+    const toParsed = cleanLocationText(toRaw);
 
     Object.assign(spec.pickup, fromParsed);
     Object.assign(spec.dropoff, toParsed);
+
+    if (!toParsed.city || toParsed.city.trim() === '') {
+      spec.dropoff.unresolved = true;
+      spec.dropoff.raw = toRaw;
+    }
   } else {
     // Check individual pickup / dropoff mentions
-    const pickupMatch = text.match(/(?:pickup|jemput|asal)\s+(?:in|di|ke)?\s*([^,.\n]+)/i);
+    const pickupMatch = text.match(/(?:pickup|jemput|asal|from|dari)(?:\s+(?:in|at|di))?\s*[:\-]?\s*([^,.\n]+?)(?=\s+(?:to|ke|drop-?off|tujuan|antar|on|at|pada|tanggal|jam|scheduled|$))/i);
     if (pickupMatch) {
       Object.assign(spec.pickup, cleanLocationText(pickupMatch[1]));
     }
 
-    const dropoffMatch = text.match(/(?:drop-?off|tujuan|antar)\s+(?:in|di|ke)?\s*([^,.\n]+)/i);
+    const dropoffMatch = text.match(/(?:to|ke|drop-?off|tujuan|antar|destination)(?:\s+(?:in|at|di|ke))?\s*[:\-]?\s*([^,.\n]+?)(?=\s+(?:on|at|pada|tanggal|jam|scheduled|$))/i);
     if (dropoffMatch) {
-      Object.assign(spec.dropoff, cleanLocationText(dropoffMatch[1]));
+      const toParsed = cleanLocationText(dropoffMatch[1]);
+      Object.assign(spec.dropoff, toParsed);
+      if (!toParsed.city || toParsed.city.trim() === '') {
+        spec.dropoff.unresolved = true;
+        spec.dropoff.raw = dropoffMatch[1].trim();
+      }
+    } else if (hasDestinationMention) {
+      spec.dropoff.unresolved = true;
+      spec.dropoff.raw = text;
     }
   }
 

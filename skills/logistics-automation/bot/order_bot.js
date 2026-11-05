@@ -85,6 +85,55 @@ async function promptSpecificationEdits(rl, spec) {
 }
 
 /**
+ * Validate specification before confirmation gate.
+ * Returns array of warning/blocking issues.
+ */
+function validateSpecificationForExecution(resolvedSpec, sources = {}, userPrompt = '') {
+  const issues = [];
+  const warnings = [];
+
+  // 1. Pickup Point & City
+  if (!resolvedSpec.pickup || !resolvedSpec.pickup.city || String(resolvedSpec.pickup.city).trim() === '') {
+    issues.push('Pickup City is empty or unresolved.');
+  }
+
+  // 2. Dropoff Point & City
+  if (!resolvedSpec.dropoff || !resolvedSpec.dropoff.city || String(resolvedSpec.dropoff.city).trim() === '') {
+    issues.push('Drop-off City is empty or unresolved.');
+  }
+
+  // 3. Explicit destination provided but unresolved
+  if (resolvedSpec.dropoff && resolvedSpec.dropoff.unresolved) {
+    issues.push(`Explicit destination was requested ("${resolvedSpec.dropoff.raw || userPrompt}") but could not be resolved.`);
+  }
+  if (sources.dropoff && sources.dropoff.city === 'unresolved_explicit') {
+    issues.push('Explicit destination was requested but remains unresolved.');
+  }
+
+  // 4. Warning if user typed destination keywords in prompt, but sources says reused
+  const hasDestInPrompt = /(?:\bto\b|\bke\b|\bantar\s+ke\b|\btujuan\b)/i.test(userPrompt);
+  if (hasDestInPrompt && sources.dropoff && sources.dropoff.city === 'reused') {
+    warnings.push(`Destination keywords detected in prompt, but drop-off was reused from previous baseline (${resolvedSpec.dropoff.city}). Verify carefully.`);
+  }
+
+  // 5. Pickup address sanity check
+  if (resolvedSpec.pickup && resolvedSpec.pickup.address && /(?:\bto\b|\bke\b|\bantar\b)/i.test(resolvedSpec.pickup.address)) {
+    issues.push(`Pickup address contains route fragment: "${resolvedSpec.pickup.address}". Address must not include destination.`);
+  }
+
+  // 6. Scheduled date
+  if (!resolvedSpec.scheduledDate || String(resolvedSpec.scheduledDate).trim() === '') {
+    issues.push('Scheduled date is empty.');
+  }
+
+  return {
+    issues,
+    warnings,
+    canSubmit: issues.length === 0,
+  };
+}
+
+/**
  * Handle single order flow
  */
 async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', autoPay = false } = {}) {
@@ -119,6 +168,20 @@ async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', aut
     resolvedSpec = recheck.resolvedSpec;
     sources = recheck.sources;
     console.log('\nUpdated Specification:\n' + formatSpecificationReview(resolvedSpec, sources));
+  }
+
+  // Pre-execution validation
+  const validation = validateSpecificationForExecution(resolvedSpec, sources, userPrompt);
+  if (validation.warnings.length > 0) {
+    console.log('\n[WARNINGS DETECTED]');
+    validation.warnings.forEach(w => console.warn(`  ! ${w}`));
+  }
+
+  if (!validation.canSubmit) {
+    console.error('\n[BLOCKER] Order cannot be submitted due to unresolved fields:');
+    validation.issues.forEach(iss => console.error(`  x ${iss}`));
+    console.log('\n[CANCELED] Submission blocked due to unresolved fields.');
+    return;
   }
 
   // Confirmation gate
@@ -207,6 +270,20 @@ async function handleBatchOrderFlow(rl, config, { autoPay = false } = {}) {
   console.log(`- Execution Mode: Sequential (${config.maxRetries} max retries per order)`);
   console.log(`- Payment Simulation: ${autoPay ? 'YES (Pospay VA + Sandbox)' : 'NO'}`);
   console.log(`- Headless Mode: ${config.headless}`);
+
+  // Pre-execution validation
+  const validation = validateSpecificationForExecution(resolvedSpec, sources, userPrompt);
+  if (validation.warnings.length > 0) {
+    console.log('\n[WARNINGS DETECTED]');
+    validation.warnings.forEach(w => console.warn(`  ! ${w}`));
+  }
+
+  if (!validation.canSubmit) {
+    console.error('\n[BLOCKER] Batch orders cannot be submitted due to unresolved fields:');
+    validation.issues.forEach(iss => console.error(`  x ${iss}`));
+    console.log('\n[CANCELED] Batch submission blocked.');
+    return;
+  }
 
   const confirm = await promptQuestion(rl, `Confirm creating and processing all ${count} orders? (yes/no): `);
   if (confirm.toLowerCase() !== 'yes' && confirm.toLowerCase() !== 'y') {
@@ -342,5 +419,6 @@ module.exports = {
   handleSingleOrderFlow,
   handleBatchOrderFlow,
   handleViewHistory,
+  validateSpecificationForExecution,
   promptQuestion,
 };

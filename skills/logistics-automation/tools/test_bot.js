@@ -146,14 +146,88 @@ function runBotTests() {
   // Test 8: Mock Failure Recovery State Handling
   console.log('\n[Test 8] Testing batch failure classification...');
   const mockOrderFailureStates = [
-    { index: 1, success: true, orderId: 'ORCA001', sandboxPayment: 'SUCCESS', omsStatus: 'Dibayar' },
-    { index: 2, success: false, orderId: 'ORCA002', sandboxPayment: 'FAILED', error: 'Payment Sandbox HTTP 500' },
-    { index: 3, success: false, orderId: null, error: 'Service Catalog Not Found' },
+    { index: 1, success: true, orderId: "ORCA001", sandboxPayment: "SUCCESS", omsStatus: "Dibayar" },
+    { index: 2, success: false, orderId: "ORCA002", sandboxPayment: "FAILED", error: "Payment Sandbox HTTP 500" },
+    { index: 3, success: false, orderId: null, error: "Service Catalog Not Found" },
   ];
-  assert.strictEqual(mockOrderFailureStates[0].omsStatus, 'Dibayar');
-  assert.strictEqual(mockOrderFailureStates[1].orderId !== null, true, 'Distinguishes order created but payment failed');
-  assert.strictEqual(mockOrderFailureStates[2].orderId, null, 'Distinguishes order creation failure');
-  console.log('  [PASS] Independent failure state classification verified.');
+  assert.strictEqual(mockOrderFailureStates[0].omsStatus, "Dibayar");
+  assert.strictEqual(mockOrderFailureStates[1].orderId !== null, true, "Distinguishes order created but payment failed");
+  assert.strictEqual(mockOrderFailureStates[2].orderId, null, "Distinguishes order creation failure");
+  console.log("  [PASS] Independent failure state classification verified.");
+
+  // Test 9: Regression - "pickup in tebet jakarta to gubeng surabaya on 1 dec 2026 at 08:00"
+  console.log('\n[Test 9] Regression: "pickup in tebet jakarta to gubeng surabaya on 1 dec 2026 at 08:00"...');
+  const reg1 = parseOrderPrompt('pickup in tebet jakarta to gubeng surabaya on 1 dec 2026 at 08:00');
+  assert.strictEqual(reg1.spec.scheduledDate, '2026-12-01');
+  assert.strictEqual(reg1.spec.scheduledTime, '08:00');
+  assert.strictEqual(reg1.spec.pickup.district, 'Tebet');
+  assert.strictEqual(reg1.spec.pickup.city, 'Jakarta Selatan');
+  assert.strictEqual(reg1.spec.dropoff.district, 'Gubeng');
+  assert.strictEqual(reg1.spec.dropoff.city, 'Kota Surabaya');
+  assert(!reg1.spec.pickup.address.includes('gubeng'), 'Pickup address must not contain dropoff text');
+  assert(!reg1.spec.pickup.address.includes('surabaya'), 'Pickup address must not contain dropoff city');
+  console.log('  [PASS] Route and schedule correctly parsed independently.');
+
+  // Test 10: Regression - "from Tebet Jakarta Selatan to Gubeng Surabaya on 1 December 2026 at 08:00"
+  console.log('\n[Test 10] Regression: "from Tebet Jakarta Selatan to Gubeng Surabaya on 1 December 2026 at 08:00"...');
+  const reg2 = parseOrderPrompt('from Tebet Jakarta Selatan to Gubeng Surabaya on 1 December 2026 at 08:00');
+  assert.strictEqual(reg2.spec.scheduledDate, '2026-12-01');
+  assert.strictEqual(reg2.spec.scheduledTime, '08:00');
+  assert.strictEqual(reg2.spec.pickup.city, 'Jakarta Selatan');
+  assert.strictEqual(reg2.spec.dropoff.city, 'Kota Surabaya');
+  console.log('  [PASS] Formal from-to route parsed cleanly.');
+
+  // Test 11: Regression - "pickup in Kesambi Cirebon to Adiwerna Tegal on 1 Dec 2026 at 10:00"
+  console.log('\n[Test 11] Regression: "pickup in Kesambi Cirebon to Adiwerna Tegal on 1 Dec 2026 at 10:00"...');
+  const reg3 = parseOrderPrompt('pickup in Kesambi Cirebon to Adiwerna Tegal on 1 Dec 2026 at 10:00');
+  assert.strictEqual(reg3.spec.scheduledDate, '2026-12-01');
+  assert.strictEqual(reg3.spec.scheduledTime, '10:00');
+  assert.strictEqual(reg3.spec.pickup.district, 'Kesambi');
+  assert.strictEqual(reg3.spec.pickup.city, 'Kota Cirebon');
+  assert.strictEqual(reg3.spec.dropoff.district, 'Adiwerna');
+  assert.strictEqual(reg3.spec.dropoff.city, 'Kabupaten Tegal');
+  console.log('  [PASS] Cirebon to Tegal route parsed cleanly.');
+
+  // Test 12: Protection against silent destination inheritance when destination requested but unresolved
+  console.log('\n[Test 12] Regression: Unresolved destination blocks submission without silent inheritance...');
+  const unresolvedPrompt = parseOrderPrompt('pickup in tebet jakarta to unknown destination on 1 dec 2026 at 08:00');
+  const prevBaseline = {
+    dropoff: { city: 'Kota Surabaya', district: 'Gubeng', province: 'Jawa Timur' }
+  };
+  const resolvedUnres = resolveSpecification(unresolvedPrompt.spec, { previousSpec: prevBaseline });
+  // Must NOT have inherited Surabaya!
+  assert.notStrictEqual(resolvedUnres.resolvedSpec.dropoff.city, 'Kota Surabaya', 'Must not silently inherit Surabaya');
+  assert.strictEqual(resolvedUnres.sources.dropoff.city, 'unresolved_explicit');
+  assert(resolvedUnres.missingMandatory.includes('dropoff.city'), 'Must be flagged in missingMandatory');
+
+  const { validateSpecificationForExecution } = require('../bot/order_bot');
+  const valCheck = validateSpecificationForExecution(resolvedUnres.resolvedSpec, resolvedUnres.sources, 'pickup in tebet jakarta to unknown destination');
+  assert.strictEqual(valCheck.canSubmit, false, 'Unresolved destination must block submission');
+  console.log('  [PASS] Explicit unresolved destination blocked submission and prevented silent inheritance.');
+
+  // Test 13: Genuinely omitted destination continues to inherit previous baseline
+  console.log('\n[Test 13] Regression: Omitted destination continues normal inheritance...');
+  const omittedPrompt = parseOrderPrompt('pickup in tebet jakarta on 1 dec 2026 at 08:00'); // No "to" or destination
+  const resolvedOmitted = resolveSpecification(omittedPrompt.spec, { previousSpec: prevBaseline });
+  assert.strictEqual(resolvedOmitted.resolvedSpec.dropoff.city, 'Kota Surabaya', 'Omitted destination should inherit previous baseline');
+  assert.strictEqual(resolvedOmitted.sources.dropoff.city, 'reused');
+  console.log('  [PASS] Genuinely omitted destination inherits previous baseline as expected.');
+
+  // Test 14: Retry safety classification
+  console.log('\n[Test 14] Regression: Failure classification distinguishing safe vs unsafe retries...');
+  const { classifyFailure } = require('./batch_executor');
+  const catFail = classifyFailure(new Error('No applicable Service Catalog found for domestic route'));
+  assert.strictEqual(catFail.type, 'CATALOG_NOT_FOUND');
+  assert.strictEqual(catFail.retryable, false, 'Catalog not found must never retry');
+
+  const subFail = classifyFailure(new Error('Order ID could not be identified after final submission in OMS UI.'));
+  assert.strictEqual(subFail.type, 'UNCERTAIN_SUBMISSION');
+  assert.strictEqual(subFail.retryable, false, 'Uncertain submission must not retry blindly');
+
+  const uiFail = classifyFailure(new Error('Pickup date selector (#pickup_date) could not be located after clicking Tambah Pengiriman.'));
+  assert.strictEqual(uiFail.type, 'TRANSIENT_UI_FAILURE');
+  assert.strictEqual(uiFail.retryable, true, 'Transient UI failure is safe to retry');
+  console.log('  [PASS] Failure classification verified.');
 
   console.log('\n>>> ALL POSIND ORDERING BOT TESTS PASSED SUCCESSFULLY! <<<');
 }

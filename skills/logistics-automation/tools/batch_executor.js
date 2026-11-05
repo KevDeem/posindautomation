@@ -81,6 +81,55 @@ function normalizeBatchInput(batchInput) {
 }
 
 /**
+ * Classify failure to determine if retry is safe and appropriate.
+ */
+function classifyFailure(err) {
+  const msg = err && err.message ? err.message : String(err);
+
+  // 1. Deterministic catalog failure: no service catalog exists for route
+  if (msg.includes('No applicable Service Catalog found') || msg.includes('no inquiry fallback') || msg.includes('Service Catalog selection could not be confirmed')) {
+    return {
+      type: 'CATALOG_NOT_FOUND',
+      retryable: false,
+      reason: 'No applicable Non-Contract Service Catalog found for route. Deterministic policy stop; retries aborted.',
+    };
+  }
+
+  // 2. Uncertain submission: order was submitted or final button clicked
+  if (msg.includes('Order ID could not be identified after final submission') || msg.includes('Submitting Final Order') || msg.includes('konfirmasi|buat pesanan')) {
+    return {
+      type: 'UNCERTAIN_SUBMISSION',
+      retryable: false,
+      reason: 'Order submission was initiated and may have succeeded in OMS. Retrying is aborted to prevent duplicate transactions.',
+    };
+  }
+
+  // 3. Autocomplete / Location resolution failure
+  if (msg.includes('Autocomplete search') || msg.includes('No option matching') || msg.includes('No selectable options')) {
+    return {
+      type: 'AUTOCOMPLETE_FAILURE',
+      retryable: false,
+      reason: 'Location lookup failed on form autocomplete. Halting order.',
+    };
+  }
+
+  // 4. Pre-submission UI / transient network / date picker failures
+  if (msg.includes('Pickup date selector') || msg.includes('Navigation') || msg.includes('Timeout') || msg.includes('net::')) {
+    return {
+      type: 'TRANSIENT_UI_FAILURE',
+      retryable: true,
+      reason: 'Transient UI initialization or network lag before submission.',
+    };
+  }
+
+  return {
+    type: 'GENERAL_ERROR',
+    retryable: true,
+    reason: 'Unclassified error before submission.',
+  };
+}
+
+/**
  * Execute a batch of orders sequentially.
  * 
  * @param {Array|Object} batchInput Specifications or groups to execute
@@ -188,8 +237,15 @@ async function executeBatch(batchInput, options = {}) {
           break; // Succeeded, exit retry loop
 
         } catch (err) {
-          console.error(`[BatchExecutor] ${orderLabel} attempt ${attempt} failed:`, err.message);
-          orderRecord.error = err.message;
+          const classification = classifyFailure(err);
+          console.error(`[BatchExecutor] ${orderLabel} attempt ${attempt} failed [${classification.type}]:`, err.message);
+          orderRecord.error = `${classification.type}: ${err.message}`;
+
+          if (!classification.retryable) {
+            console.warn(`[BatchExecutor] Non-retryable condition: ${classification.reason} Stopping retries for ${orderLabel}.`);
+            break;
+          }
+
           if (attempt === maxRetries) {
             console.error(`[BatchExecutor] ${orderLabel} exhausted all ${maxRetries} attempts.`);
           }
@@ -220,4 +276,5 @@ async function executeBatch(batchInput, options = {}) {
 module.exports = {
   executeBatch,
   normalizeBatchInput,
+  classifyFailure,
 };

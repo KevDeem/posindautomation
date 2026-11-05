@@ -41,7 +41,95 @@ function getSearchTerm(val) {
 }
 
 /**
- * Helper to select an option in an Ant Design dropdown
+ * Robust helper to select an option in an Ant Design dropdown with network suggestion waiting
+ * and verification.
+ */
+async function selectAntLocationOption(page, dialog, fieldId, searchTerm, matchRegex, options = {}) {
+  const input = dialog.locator(`#${fieldId}`);
+  const container = dialog.locator(`.ant-select:has(#${fieldId})`).first();
+
+  await container.waitFor({ state: 'visible', timeout: 15000 });
+
+  // 1. Wait until enabled (disabled class removed)
+  const isCurrentlyDisabled = await container.evaluate(el => el.classList.contains('ant-select-disabled'));
+  if (isCurrentlyDisabled) {
+    console.log(`[OrderExecutor] Waiting for #${fieldId} to become enabled...`);
+    await page.waitForFunction(
+      el => !el.classList.contains('ant-select-disabled'),
+      await container.elementHandle(),
+      { timeout: 15000 }
+    );
+    await page.waitForTimeout(300);
+  }
+
+  // 2. Click to open dropdown
+  await container.click();
+  await page.waitForTimeout(300);
+
+  // 3. Type search term using pressSequentially if provided
+  let query = searchTerm ? getSearchTerm(searchTerm) : '';
+  if (/jakarta/i.test(query)) query = 'Jakarta';
+  if (/surabaya/i.test(query)) query = 'Surabaya';
+  if (/cirebon/i.test(query)) query = 'Cirebon';
+  if (/tegal/i.test(query)) query = 'Tegal';
+
+  if (query && String(query).trim() !== '') {
+    await input.click();
+    await input.fill('');
+    await input.pressSequentially(query, { delay: 60 });
+    await page.waitForTimeout(600);
+  }
+
+  // 4. Locate active dropdown
+  const dropdown = page.locator('.ant-select-dropdown:not(.ant-select-dropdown-hidden)').last();
+  await dropdown.waitFor({ state: 'visible', timeout: 10000 });
+
+  // 5. Check loading / empty results distinctly
+  const hasEmpty = await dropdown.locator('.ant-empty').isVisible().catch(() => false);
+  if (hasEmpty && !options.fallbackFirst) {
+    throw new Error(`Autocomplete search for "${query}" on #${fieldId} returned no results (ant-empty).`);
+  }
+
+  // Wait for network-backed options to populate
+  await page.waitForFunction(d => {
+    return d.querySelectorAll('.ant-select-item-option').length > 0;
+  }, await dropdown.elementHandle(), { timeout: 10000 }).catch(() => {});
+
+  const optionCount = await dropdown.locator('.ant-select-item-option').count();
+  if (optionCount === 0) {
+    throw new Error(`No selectable options found in dropdown for #${fieldId} (query: "${query}").`);
+  }
+
+  // 6. Select matching option
+  let targetOption;
+  if (matchRegex) {
+    targetOption = dropdown.locator('.ant-select-item-option').filter({ hasText: matchRegex }).first();
+    const count = await targetOption.count();
+    if (count === 0) {
+      const available = await dropdown.locator('.ant-select-item-option').evaluateAll(els => els.map(e => e.innerText.trim()));
+      if (options.fallbackFirst && available.length > 0) {
+        console.warn(`[OrderExecutor] Exact match for ${matchRegex} not found on #${fieldId}, using first available: "${available[0]}"`);
+        targetOption = dropdown.locator('.ant-select-item-option').first();
+      } else {
+        throw new Error(`No option matching "${matchRegex}" found on #${fieldId}. Available: ${available.slice(0, 8).join(', ')}`);
+      }
+    }
+  } else {
+    targetOption = dropdown.locator('.ant-select-item-option').first();
+  }
+
+  const selectedOptionText = (await targetOption.innerText()).trim();
+  await targetOption.click();
+  await page.waitForTimeout(500);
+
+  // 7. Verify selection updated in container
+  const containerText = await container.innerText();
+  console.log(`[OrderExecutor] #${fieldId} selected: "${selectedOptionText}" (display: "${containerText.replace(/\n/g, ' ')}")`);
+  return selectedOptionText;
+}
+
+/**
+ * Container-based Ant Design select helper (used in International order UI)
  */
 async function selectAntOption(page, containerLocator, rawText, matchRegex) {
   await containerLocator.click();
@@ -52,7 +140,7 @@ async function selectAntOption(page, containerLocator, rawText, matchRegex) {
     const input = containerLocator.locator('input');
     if (await input.count() > 0) {
       await input.fill(searchText);
-      await page.waitForTimeout(800);
+      await page.waitForTimeout(600);
     }
   }
 
@@ -68,7 +156,7 @@ async function selectAntOption(page, containerLocator, rawText, matchRegex) {
 
   await option.waitFor({ state: 'visible', timeout: 10000 });
   await option.click();
-  await page.waitForTimeout(800);
+  await page.waitForTimeout(600);
 }
 
 /**
@@ -87,15 +175,40 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
   const name = options.transactionLabel || 'Domestic Order';
   console.log(`[${name}] Navigating to /domestic-shipping...`);
   await page.goto('https://sr-pos-oms-web.nisims.web.id/domestic-shipping', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(2000);
 
-  const btn = page.locator('button.shipment-title');
-  await btn.waitFor({ state: 'visible', timeout: 30000 });
-  await page.waitForTimeout(1000);
-  await btn.click();
+  // 1. Page Readiness & Pickup Date Input Detection
+  const dateInputLocator = page.locator('#pickup_date, input[placeholder*="Pilih Tanggal"]');
+  if (!await dateInputLocator.isVisible()) {
+    const addShipmentBtn = page.locator('button.shipment-title, button:has-text("Tambah Pengiriman")').first();
+    await addShipmentBtn.waitFor({ state: 'visible', timeout: 30000 });
 
-  await page.waitForSelector('#pickup_date', { state: 'visible', timeout: 30000 });
-  await page.waitForTimeout(500);
+    let dateVisible = false;
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      if (await dateInputLocator.isVisible()) {
+        dateVisible = true;
+        break;
+      }
+      console.log(`[${name}] Clicking Tambah Pengiriman (Attempt ${attempt}/4)...`);
+      await addShipmentBtn.click({ force: true }).catch(() => {});
+      try {
+        await dateInputLocator.waitFor({ state: 'visible', timeout: 3500 });
+        dateVisible = true;
+        break;
+      } catch (err) {
+        await page.waitForTimeout(800);
+      }
+    }
+
+    if (!dateVisible) {
+      const buttonsOnPage = await page.locator('button').allInnerTexts().catch(() => []);
+      const inputsOnPage = await page.locator('input').evaluateAll(els => els.map(e => e.id || e.placeholder)).catch(() => []);
+      console.error(`[${name}] DIAGNOSTIC: date input not found. Visible buttons: ${buttonsOnPage.slice(0, 10).join(', ')}. Inputs: ${inputsOnPage.slice(0, 10).join(', ')}`);
+      throw new Error('Pickup date selector (#pickup_date) could not be located after clicking Tambah Pengiriman.');
+    }
+  }
+
+  await page.waitForTimeout(400);
 
   // 1. Pickup Date & Time
   const dateParts = spec.scheduledDate.split('-'); // [YYYY, MM, DD]
@@ -148,78 +261,84 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
   if (await okBtn.isVisible()) await okBtn.click();
   await page.waitForTimeout(500);
 
-  // 2. Pickup Location
+  // 2. Pickup Location Modal
   console.log(`[${name}] Filling Pickup Point...`);
   await page.locator('button.pikcup-title').click();
   await page.waitForTimeout(1000);
-  let dialog = page.locator('[role="dialog"]:not([style*="display: none"])').last();
-  await dialog.locator('label').filter({ hasText: new RegExp(`^${spec.pickup.locationType || 'Door'}$`, 'i') }).first().click();
+  let pDialog = page.locator('[role="dialog"]:not([style*="display: none"])').last();
+  await pDialog.locator('label').filter({ hasText: new RegExp(`^${spec.pickup.locationType || 'Door'}$`, 'i') }).first().click();
 
   // Province
-  await selectAntOption(page, dialog.locator('.ant-select').nth(0), spec.pickup.province || spec.pickup.searchProv, null);
+  const provQuery = spec.pickup.province || 'Jakarta';
+  await selectAntLocationOption(page, pDialog, 'customer_province', provQuery, new RegExp(getSearchTerm(provQuery), 'i'));
+
   // City
-  await selectAntOption(page, dialog.locator('.ant-select').nth(1), spec.pickup.city || spec.pickup.searchCity, null);
+  const cityQuery = spec.pickup.city || 'Jakarta Selatan';
+  await selectAntLocationOption(page, pDialog, 'customer_city', cityQuery, new RegExp(getSearchTerm(cityQuery), 'i'));
+
   // District
-  await selectAntOption(page, dialog.locator('.ant-select').nth(2), spec.pickup.district, null);
+  const distQuery = spec.pickup.district || 'Tebet';
+  await selectAntLocationOption(page, pDialog, 'customer_district', distQuery, new RegExp(getSearchTerm(distQuery), 'i'));
+
   // Subdistrict
-  if (spec.pickup.subdistrict) {
-    await selectAntOption(page, dialog.locator('.ant-select').nth(3), spec.pickup.subdistrict, null);
-  } else {
-    // Select first available subdistrict
-    await dialog.locator('.ant-select').nth(3).click();
-    await page.waitForTimeout(600);
-    await page.locator('.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option').first().click();
-    await page.waitForTimeout(400);
-  }
+  const subQuery = spec.pickup.subdistrict || '';
+  await selectAntLocationOption(page, pDialog, 'customer_subdistrict', subQuery, subQuery ? new RegExp(getSearchTerm(subQuery), 'i') : null, { fallbackFirst: true });
 
-  await dialog.locator('input[placeholder*="detail pickup"], textarea[placeholder*="detail pickup"]').fill(spec.pickup.address || spec.pickup.city);
-  await dialog.locator('input[placeholder*="Nama PIC"]').fill(spec.pickup.pic.name);
-  await dialog.locator('input[placeholder*="Nama kontak pengirim"], input[placeholder*="Nama Perusahaan"]').fill(spec.pickup.pic.company);
-  await dialog.locator('input[placeholder*="Email"]').fill(spec.pickup.pic.email);
-  await dialog.locator('input[placeholder*="Nomor telepon"]').fill(spec.pickup.pic.phone);
+  await pDialog.locator('input[placeholder*="Alamat detail pickup"], input[placeholder*="detail pickup"], textarea[placeholder*="detail pickup"]').fill(spec.pickup.address || `${spec.pickup.district || ''} ${spec.pickup.city || ''}`);
+  await pDialog.locator('input[placeholder*="Masukkan Nama PIC"], input[placeholder*="Nama PIC"]').fill(spec.pickup.pic.name);
+  await pDialog.locator('input[placeholder*="Nama kontak pengirim"], input[placeholder*="Nama Perusahaan"]').fill(spec.pickup.pic.company);
+  await pDialog.locator('input[placeholder*="Email Aktif Pengirim"], input[placeholder*="Email"]').fill(spec.pickup.pic.email);
+  await pDialog.locator('#customer_phone, input[placeholder*="Nomor telepon"]').first().fill(spec.pickup.pic.phone);
 
-  await dialog.getByRole('button', { name: /simpan titik pickup/i }).click();
+  await pDialog.getByRole('button', { name: /simpan titik pickup/i }).click();
   await page.waitForTimeout(1500);
 
-  // 3. Dropoff Location
+  // 3. Dropoff Location Modal
   console.log(`[${name}] Filling Dropoff Point...`);
-  await page.locator('button.dropoff-title').click();
+  const dropBtn = page.locator('button.dropoff-title');
+  // Wait until dropoff button is enabled
+  await page.waitForFunction(
+    btn => !btn.classList.contains('disabled') && !btn.hasAttribute('disabled'),
+    await dropBtn.elementHandle(),
+    { timeout: 15000 }
+  );
+  await dropBtn.click();
   await page.waitForTimeout(1000);
-  dialog = page.locator('[role="dialog"]:not([style*="display: none"])').last();
-  await dialog.locator('label').filter({ hasText: new RegExp(`^${spec.dropoff.locationType || 'Door'}$`, 'i') }).first().click();
+  let dDialog = page.locator('[role="dialog"]:not([style*="display: none"])').last();
+  await dDialog.locator('label').filter({ hasText: new RegExp(`^${spec.dropoff.locationType || 'Door'}$`, 'i') }).first().click();
 
   // Province
-  await selectAntOption(page, dialog.locator('.ant-select').nth(0), spec.dropoff.province || spec.dropoff.searchProv, null);
+  const dProvQuery = spec.dropoff.province || 'Jawa Timur';
+  await selectAntLocationOption(page, dDialog, 'recipient_province', dProvQuery, new RegExp(getSearchTerm(dProvQuery), 'i'));
+
   // City
-  await selectAntOption(page, dialog.locator('.ant-select').nth(1), spec.dropoff.city || spec.dropoff.searchCity, null);
+  const dCityQuery = spec.dropoff.city || 'Surabaya';
+  await selectAntLocationOption(page, dDialog, 'recipient_city', dCityQuery, new RegExp(getSearchTerm(dCityQuery), 'i'));
+
   // District
-  await selectAntOption(page, dialog.locator('.ant-select').nth(2), spec.dropoff.district, null);
+  const dDistQuery = spec.dropoff.district || 'Gubeng';
+  await selectAntLocationOption(page, dDialog, 'recipient_district', dDistQuery, new RegExp(getSearchTerm(dDistQuery), 'i'));
+
   // Subdistrict
-  if (spec.dropoff.subdistrict) {
-    await selectAntOption(page, dialog.locator('.ant-select').nth(3), spec.dropoff.subdistrict, null);
-  } else {
-    await dialog.locator('.ant-select').nth(3).click();
-    await page.waitForTimeout(600);
-    await page.locator('.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option').first().click();
-    await page.waitForTimeout(400);
-  }
+  const dSubQuery = spec.dropoff.subdistrict || '';
+  await selectAntLocationOption(page, dDialog, 'recipient_subdistrict', dSubQuery, dSubQuery ? new RegExp(getSearchTerm(dSubQuery), 'i') : null, { fallbackFirst: true });
 
-  const dropoffAddrInput = dialog.locator('input[placeholder*="Alamat Penerima"], textarea[placeholder*="Alamat Penerima"], input[placeholder*="detail drop off"], textarea[placeholder*="detail drop off"], textarea, input[name="address"]').first();
-  await dropoffAddrInput.fill(spec.dropoff.address || spec.dropoff.city);
+  const dropoffAddrInput = dDialog.locator('input[placeholder*="Alamat Penerima"], textarea[placeholder*="Alamat Penerima"], input[placeholder*="detail drop off"], textarea[placeholder*="detail drop off"]').first();
+  await dropoffAddrInput.fill(spec.dropoff.address || `${spec.dropoff.district || ''} ${spec.dropoff.city || ''}`);
 
-  const dropoffPicInput = dialog.locator('input[placeholder*="Nama Lengkap PIC"], input[placeholder*="Nama PIC"], input[name="picName"]').first();
+  const dropoffPicInput = dDialog.locator('input[placeholder*="Nama Lengkap PIC"], input[placeholder*="Nama PIC"]').first();
   await dropoffPicInput.fill(spec.dropoff.pic.name);
 
-  const dropoffCompanyInput = dialog.locator('input[placeholder*="Nama kontak penerima"], input[placeholder*="Nama Perusahaan"], input[name="company"]').first();
+  const dropoffCompanyInput = dDialog.locator('input[placeholder*="Nama Perusahaan / Nama Penerima"], input[placeholder*="Nama Perusahaan"], input[placeholder*="Nama kontak penerima"]').first();
   await dropoffCompanyInput.fill(spec.dropoff.pic.company);
 
-  const dropoffEmailInput = dialog.locator('input[placeholder*="Email"], input[name="email"]').first();
+  const dropoffEmailInput = dDialog.locator('input[placeholder*="Email Aktif Penerima"], input[placeholder*="Email"]').first();
   await dropoffEmailInput.fill(spec.dropoff.pic.email);
 
-  const dropoffPhoneInput = dialog.locator('input[placeholder*="Nomor telepon"], input[name="phone"]').first();
+  const dropoffPhoneInput = dDialog.locator('#recipient_phone, input[placeholder*="Nomor telepon"]').first();
   await dropoffPhoneInput.fill(spec.dropoff.pic.phone);
 
-  const simpanDropBtn = dialog.locator('button:has-text("simpan titik drop"), button:has-text("Simpan Titik Drop Off"), button:has-text("Simpan")').first();
+  const simpanDropBtn = dDialog.locator('button:has-text("Simpan Titik Drop Off"), button:has-text("simpan titik drop"), button:has-text("Simpan")').first();
   await simpanDropBtn.click();
   await page.waitForTimeout(1500);
 

@@ -284,26 +284,51 @@ function resolveSpecification(inputSpec = {}, options = {}) {
   const inputDropoff = inputSpec.dropoff || {};
   const prevDropoff = (!isTypeChanged && prev.dropoff) ? prev.dropoff : {};
 
-  // Check if dropoff city or province was changed
-  const isDropoffLocationChanged = Boolean(
-    (inputDropoff.city && prevDropoff.city && inputDropoff.city !== prevDropoff.city) ||
-    (inputDropoff.province && prevDropoff.province && inputDropoff.province !== prevDropoff.province) ||
-    (inputDropoff.country && prevDropoff.country && inputDropoff.country !== prevDropoff.country)
+  const isExplicitDropoffRequested = Boolean(
+    inputSpec._explicitDestinationProvided ||
+    inputDropoff.unresolved ||
+    (inputDropoff.raw && String(inputDropoff.raw).trim() !== '')
   );
 
-  const dropoffKeys = ['country', 'locationType', 'province', 'city', 'district', 'subdistrict', 'address', 'postalCode'];
-  for (const k of dropoffKeys) {
-    if (inputDropoff[k] !== undefined && inputDropoff[k] !== null && String(inputDropoff[k]).trim() !== '') {
-      resolved.dropoff[k] = inputDropoff[k];
-      sources.dropoff[k] = 'provided';
-    } else if (isDropoffLocationChanged && ['district', 'subdistrict', 'postalCode'].includes(k)) {
-      resolved.dropoff[k] = '';
-      sources.dropoff[k] = 'reset_on_location_change';
-    } else if (prevDropoff[k] !== undefined) {
-      resolved.dropoff[k] = prevDropoff[k];
-      sources.dropoff[k] = 'reused';
-    } else {
-      sources.dropoff[k] = 'missing';
+  // If destination was explicitly requested but unresolved or missing city: do NOT inherit previous destination!
+  if (isExplicitDropoffRequested && (!inputDropoff.city || inputDropoff.city.trim() === '' || inputDropoff.unresolved)) {
+    resolved.dropoff = {
+      country: inputDropoff.country || 'Indonesia',
+      locationType: inputDropoff.locationType || 'Door',
+      province: inputDropoff.province || '',
+      city: '',
+      district: '',
+      subdistrict: '',
+      address: '',
+      postalCode: '',
+      unresolved: true,
+      raw: inputDropoff.raw || '',
+    };
+    for (const k of ['country', 'locationType', 'province', 'city', 'district', 'subdistrict', 'address', 'postalCode']) {
+      sources.dropoff[k] = 'unresolved_explicit';
+    }
+  } else {
+    // Check if dropoff city or province was changed
+    const isDropoffLocationChanged = Boolean(
+      (inputDropoff.city && prevDropoff.city && inputDropoff.city !== prevDropoff.city) ||
+      (inputDropoff.province && prevDropoff.province && inputDropoff.province !== prevDropoff.province) ||
+      (inputDropoff.country && prevDropoff.country && inputDropoff.country !== prevDropoff.country)
+    );
+
+    const dropoffKeys = ['country', 'locationType', 'province', 'city', 'district', 'subdistrict', 'address', 'postalCode'];
+    for (const k of dropoffKeys) {
+      if (inputDropoff[k] !== undefined && inputDropoff[k] !== null && String(inputDropoff[k]).trim() !== '') {
+        resolved.dropoff[k] = inputDropoff[k];
+        sources.dropoff[k] = 'provided';
+      } else if (isDropoffLocationChanged && ['district', 'subdistrict', 'postalCode'].includes(k)) {
+        resolved.dropoff[k] = '';
+        sources.dropoff[k] = 'reset_on_location_change';
+      } else if (prevDropoff[k] !== undefined) {
+        resolved.dropoff[k] = prevDropoff[k];
+        sources.dropoff[k] = 'reused';
+      } else {
+        sources.dropoff[k] = 'missing';
+      }
     }
   }
 
@@ -403,6 +428,7 @@ function formatSpecificationReview(resolvedSpec, sources) {
       case 'ui_default': return '[UI Default]';
       case 'policy_enforced': return '[Policy Enforced]';
       case 'reset_on_location_change': return '[Reset - Location Changed]';
+      case 'unresolved_explicit': return '**[EXPLICIT UNRESOLVED]**';
       case 'missing': return '**[MISSING]**';
       default: return `[${src}]`;
     }
