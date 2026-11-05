@@ -1,0 +1,26 @@
+{
+  "name": "posind-automation",
+  "version": "1.0.0",
+  "description": "Reusable Logistics Automation skill and workflow engine for PandaCode, enabling natural-language creation of orders, batch orders, and service catalogs across staging environments **exclusively via web browser automation using Playwright**.",
+  "main": "index.js",
+  "scripts": {
+    "smoke-test": "node skills/logistics-automation/tools/smoke_test.js",
+    "inspect-ui": "node skills/logistics-automation/tools/inspect_ui.js",
+    "test": "npm run smoke-test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KevDeem/posindautomation.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/KevDeem/posindautomation/issues"
+  },
+  "homepage": "https://github.com/KevDeem/posindautomation#readme",
+  "dependencies": {
+    "playwright": "^1.64.1"
+  }
+}

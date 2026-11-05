@@ -1,0 +1,5 @@
+node_modules/
+.sessions/
+.artifacts/
+*.log
+.DS_Store

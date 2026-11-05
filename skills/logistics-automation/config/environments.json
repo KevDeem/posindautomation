@@ -1,0 +1,49 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "environments": {
+    "staging-oms": {
+      "name": "staging-oms",
+      "description": "POSIND OMS Staging Environment",
+      "applicationUrl": "https://sr-pos-oms-web.nisims.web.id",
+      "defaultAccount": "kevin.d.imas@gmail.com",
+      "accounts": {
+        "kevin.d.imas@gmail.com": {
+          "accountId": "kevin.d.imas@gmail.com",
+          "displayName": "Account kevin.d.imas@gmail.com",
+          "loginMethod": "manual-interactive-login",
+          "loginUrl": "/login",
+          "credentialRef": {
+            "type": "env",
+            "customVar": "OMS_KEVIN"
+          },
+          "roles": [
+            "order_creator",
+            "catalog_manager"
+          ]
+        }
+      },
+      "supportedWorkflows": [
+        "order-creation"
+      ],
+      "environmentSpecificConfig": {
+        "browser": {
+          "headless": true,
+          "slowMo": 0,
+          "viewport": {
+            "width": 1280,
+            "height": 800
+          },
+          "navigationTimeoutMs": 30000,
+          "actionTimeoutMs": 10000
+        },
+        "sessionPersistence": {
+          "enabled": true,
+          "storageStateDir": ".sessions"
+        },
+        "flags": {
+          "strictRouteValidation": true
+        }
+      }
+    }
+  }
+}

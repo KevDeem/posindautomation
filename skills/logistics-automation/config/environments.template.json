@@ -3,18 +3,17 @@
   "environments": {
     "staging-posind-core": {
       "name": "staging-posind-core",
-      "description": "Primary staging environment for core logistics services.",
+      "description": "Primary staging web interface for core logistics operations.",
       "applicationUrl": "https://staging-app.example.internal",
-      "apiUrl": "https://staging-api.example.internal",
       "defaultAccount": "ops-admin",
       "accounts": {
         "ops-admin": {
           "accountId": "ops-admin",
           "displayName": "Operations Admin",
-          "authMethod": "bearer-token",
+          "loginMethod": "standard-ui-form",
+          "loginUrl": "/login",
           "credentialRef": {
             "type": "env",
-            "tokenVar": "POSIND_STAGING_TOKEN",
             "usernameVar": "POSIND_STAGING_USERNAME",
             "passwordVar": "POSIND_STAGING_PASSWORD"
           },
@@ -23,7 +22,8 @@
         "dispatcher-user": {
           "accountId": "dispatcher-user",
           "displayName": "Dispatch Staff",
-          "authMethod": "browser-session",
+          "loginMethod": "sso-ui-redirect",
+          "loginUrl": "/auth/sso",
           "credentialRef": {
             "type": "env",
             "usernameVar": "POSIND_DISPATCH_USERNAME",
@@ -37,32 +37,40 @@
         "service-catalog-creation"
       ],
       "environmentSpecificConfig": {
-        "timeoutMs": 30000,
-        "defaultHeaders": {
-          "X-Client-App": "posind-automation"
+        "browser": {
+          "headless": true,
+          "slowMo": 0,
+          "viewport": {
+            "width": 1280,
+            "height": 800
+          },
+          "navigationTimeoutMs": 30000,
+          "actionTimeoutMs": 10000
+        },
+        "sessionPersistence": {
+          "enabled": true,
+          "storageStateDir": ".sessions"
         },
         "flags": {
-          "enableApiDirect": true,
-          "enableUiFallback": true,
           "strictRouteValidation": true
         }
       }
     },
     "uat-posind-partner": {
       "name": "uat-posind-partner",
-      "description": "User Acceptance Testing environment for partner logistics flows.",
+      "description": "UAT web portal for partner logistics workflows.",
       "applicationUrl": "https://uat-app.example.internal",
-      "apiUrl": "https://uat-api.example.internal",
       "defaultAccount": "uat-partner-admin",
       "accounts": {
         "uat-partner-admin": {
           "accountId": "uat-partner-admin",
           "displayName": "Partner Admin UAT",
-          "authMethod": "oauth2-client-credentials",
+          "loginMethod": "standard-ui-form",
+          "loginUrl": "/portal/login",
           "credentialRef": {
             "type": "env",
-            "clientIdVar": "POSIND_UAT_CLIENT_ID",
-            "clientSecretVar": "POSIND_UAT_CLIENT_SECRET"
+            "usernameVar": "POSIND_UAT_USERNAME",
+            "passwordVar": "POSIND_UAT_PASSWORD"
           },
           "roles": ["order_creator", "catalog_manager"]
         }
@@ -71,13 +79,21 @@
         "order-creation"
       ],
       "environmentSpecificConfig": {
-        "timeoutMs": 45000,
-        "defaultHeaders": {
-          "X-Client-App": "posind-automation"
+        "browser": {
+          "headless": true,
+          "slowMo": 0,
+          "viewport": {
+            "width": 1280,
+            "height": 800
+          },
+          "navigationTimeoutMs": 45000,
+          "actionTimeoutMs": 15000
+        },
+        "sessionPersistence": {
+          "enabled": true,
+          "storageStateDir": ".sessions"
         },
         "flags": {
-          "enableApiDirect": true,
-          "enableUiFallback": false,
           "strictRouteValidation": false
         }
       }
