@@ -81,6 +81,13 @@ Natural Language Instruction
 ```text
 skills/logistics-automation/
 ├── SKILL.md                                 # Skill definition & architecture documentation
+├── bot/                                     # Standalone interactive CLI ordering bot
+│   ├── README.md                           # Bot user guide & CLI documentation
+│   ├── cli.js                              # CLI executable entry point (`npm run order`)
+│   ├── config.js                           # Bot runtime & environment configuration
+│   ├── history_manager.js                  # Persistent execution log & credential sanitizer
+│   ├── nl_parser.js                        # Natural language instruction parser
+│   └── order_bot.js                        # Interactive CLI workflow & menu manager
 ├── config/
 │   ├── environments.json                   # Active environment configurations
 │   └── environments.template.json          # Template environment registry
@@ -98,6 +105,7 @@ skills/logistics-automation/
     ├── payment_executor.js                 # Decoupled payment & sandbox UI engine
     ├── pic_manager.js                      # Synthetic realistic Indonesian PIC generator
     ├── smoke_test.js                       # Playwright infrastructure smoke test
+    ├── test_bot.js                         # Bot CLI unit tests & parser validation
     ├── test_engine.js                      # Reusable engine & batch verification test suite
     └── test_specification.js               # Specification inheritance unit tests
 ```
@@ -139,3 +147,23 @@ Agent:
 4. Shows review table tagging reused vs generated fields.
 5. Executes order upon confirmation.
 ```
+
+---
+## Standalone Ordering Bot CLI (`npm run order`)
+
+The repository includes an interactive terminal bot that operates independently of PandaCode or external AI harnesses:
+
+```bash
+# Launch interactive bot
+npm run order
+
+# Run headless
+HEADLESS=true npm run order
+```
+
+### Key Bot Features
+- **7-Option Interactive Menu**: Domestic, International, Batch, and Payment Simulation workflows.
+- **Natural Language Parsing**: Direct conversion of freeform instructions to structured specifications.
+- **Pre-Submission Review & Edit Gate**: Displays explicit field origin tags with edit and abort controls.
+- **Sanitized Execution History**: Persists order IDs, airway bills, and payment states in `.execution-history/` while automatically scrubbing session credentials and secrets.
+

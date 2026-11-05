@@ -4,9 +4,13 @@
   "description": "Reusable Logistics Automation skill and workflow engine for PandaCode, enabling natural-language creation of orders, batch orders, and service catalogs across staging environments **exclusively via web browser automation using Playwright**.",
   "main": "index.js",
   "scripts": {
+    "order": "node skills/logistics-automation/bot/cli.js",
     "smoke-test": "node skills/logistics-automation/tools/smoke_test.js",
     "inspect-ui": "node skills/logistics-automation/tools/inspect_ui.js",
-    "test": "npm run smoke-test"
+    "test-engine": "node skills/logistics-automation/tools/test_engine.js",
+    "test-spec": "node skills/logistics-automation/tools/test_specification.js",
+    "test-bot": "node skills/logistics-automation/tools/test_bot.js",
+    "test": "node skills/logistics-automation/tools/test_engine.js && node skills/logistics-automation/tools/test_specification.js && node skills/logistics-automation/tools/test_bot.js && npm run smoke-test"
   },
   "repository": {
     "type": "git",

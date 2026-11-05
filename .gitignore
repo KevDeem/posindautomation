@@ -1,5 +1,6 @@
 node_modules/
 .sessions/
+.execution-history/
 .artifacts/
 *.log
 .DS_Store

@@ -30,21 +30,33 @@ const {
 const DEFAULT_SESSION_PATH = path.resolve(__dirname, '../../../.sessions/staging-oms_kevin_d_imas_gmail_com_session.json');
 
 /**
+ * Normalize location search term (strip formal administrative prefixes for Ant Design search)
+ */
+function getSearchTerm(val) {
+  if (!val) return '';
+  let str = String(val).trim();
+  str = str.replace(/^(DKI|Daerah Khusus Ibukota)\s+/i, '');
+  str = str.replace(/^(Kota|Kabupaten|Kab\.?)\s+/i, '');
+  return str.trim();
+}
+
+/**
  * Helper to select an option in an Ant Design dropdown
  */
-async function selectAntOption(page, containerLocator, searchText, matchRegex) {
+async function selectAntOption(page, containerLocator, rawText, matchRegex) {
   await containerLocator.click();
   await page.waitForTimeout(400);
 
+  const searchText = getSearchTerm(rawText);
   if (searchText) {
     const input = containerLocator.locator('input');
     if (await input.count() > 0) {
       await input.fill(searchText);
-      await page.waitForTimeout(700);
+      await page.waitForTimeout(800);
     }
   }
 
-  const dropdown = page.locator('.ant-select-dropdown:not(.ant-select-dropdown-hidden)');
+  const dropdown = page.locator('.ant-select-dropdown:not(.ant-select-dropdown-hidden)').last();
   await dropdown.waitFor({ state: 'visible', timeout: 10000 });
 
   let option;
@@ -56,7 +68,7 @@ async function selectAntOption(page, containerLocator, searchText, matchRegex) {
 
   await option.waitFor({ state: 'visible', timeout: 10000 });
   await option.click();
-  await page.waitForTimeout(600);
+  await page.waitForTimeout(800);
 }
 
 /**
@@ -89,8 +101,21 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
   const dateParts = spec.scheduledDate.split('-'); // [YYYY, MM, DD]
   const yearStr = dateParts[0];
   const dayStr = String(parseInt(dateParts[2], 10));
-  const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  const monthStr = monthNames[parseInt(dateParts[1], 10) - 1];
+  const monthRegexes = [
+    /^(Jan|Januari|January)$/i,
+    /^(Feb|Februari|February)$/i,
+    /^(Mar|Maret|March)$/i,
+    /^(Apr|April)$/i,
+    /^(Mei|May)$/i,
+    /^(Jun|Juni|June)$/i,
+    /^(Jul|Juli|July)$/i,
+    /^(Agt|Aug|Agustus|August)$/i,
+    /^(Sep|September)$/i,
+    /^(Okt|Oct|Oktober|October)$/i,
+    /^(Nov|November)$/i,
+    /^(Des|Dec|Desember|December)$/i,
+  ];
+  const monthRegex = monthRegexes[parseInt(dateParts[1], 10) - 1] || /^(Des|Dec)$/i;
 
   const timeParts = (spec.scheduledTime || '10:00').split(':');
   const hourStr = timeParts[0];
@@ -106,7 +131,7 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
     await page.waitForTimeout(300);
     await page.locator('.ant-picker-cell-in-view').filter({ hasText: new RegExp(`^${yearStr}$`) }).first().click();
     await page.waitForTimeout(300);
-    await page.locator('.ant-picker-cell-in-view').filter({ hasText: new RegExp(`^${monthStr}$`, 'i') }).first().click();
+    await page.locator('.ant-picker-cell-in-view').filter({ hasText: monthRegex }).first().click();
     await page.waitForTimeout(300);
   }
 
@@ -179,14 +204,31 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
     await page.waitForTimeout(400);
   }
 
-  await dialog.locator('input[placeholder*="detail drop off"], textarea[placeholder*="detail drop off"]').fill(spec.dropoff.address || spec.dropoff.city);
-  await dialog.locator('input[placeholder*="Nama PIC"]').fill(spec.dropoff.pic.name);
-  await dialog.locator('input[placeholder*="Nama kontak penerima"], input[placeholder*="Nama Perusahaan"]').fill(spec.dropoff.pic.company);
-  await dialog.locator('input[placeholder*="Email"]').fill(spec.dropoff.pic.email);
-  await dialog.locator('input[placeholder*="Nomor telepon"]').fill(spec.dropoff.pic.phone);
+  const dropoffAddrInput = dialog.locator('input[placeholder*="Alamat Penerima"], textarea[placeholder*="Alamat Penerima"], input[placeholder*="detail drop off"], textarea[placeholder*="detail drop off"], textarea, input[name="address"]').first();
+  await dropoffAddrInput.fill(spec.dropoff.address || spec.dropoff.city);
 
-  await dialog.getByRole('button', { name: /simpan titik drop off/i }).click();
+  const dropoffPicInput = dialog.locator('input[placeholder*="Nama Lengkap PIC"], input[placeholder*="Nama PIC"], input[name="picName"]').first();
+  await dropoffPicInput.fill(spec.dropoff.pic.name);
+
+  const dropoffCompanyInput = dialog.locator('input[placeholder*="Nama kontak penerima"], input[placeholder*="Nama Perusahaan"], input[name="company"]').first();
+  await dropoffCompanyInput.fill(spec.dropoff.pic.company);
+
+  const dropoffEmailInput = dialog.locator('input[placeholder*="Email"], input[name="email"]').first();
+  await dropoffEmailInput.fill(spec.dropoff.pic.email);
+
+  const dropoffPhoneInput = dialog.locator('input[placeholder*="Nomor telepon"], input[name="phone"]').first();
+  await dropoffPhoneInput.fill(spec.dropoff.pic.phone);
+
+  const simpanDropBtn = dialog.locator('button:has-text("simpan titik drop"), button:has-text("Simpan Titik Drop Off"), button:has-text("Simpan")').first();
+  await simpanDropBtn.click();
   await page.waitForTimeout(1500);
+
+  // Mode Selection (SEMUA / Land / etc.)
+  const modeBtn = page.getByRole('button', { name: new RegExp(`^${spec.transportationMode || 'SEMUA'}$`, 'i') });
+  if (await modeBtn.isVisible().catch(() => false)) {
+    await modeBtn.click();
+    await page.waitForTimeout(600);
+  }
 
   // Save Locations
   console.log(`[${name}] Saving Locations...`);
@@ -438,8 +480,21 @@ async function executeInternationalOrderUI(page, spec, options = {}) {
   const dateParts = spec.scheduledDate.split('-');
   const yearStr = dateParts[0];
   const dayStr = String(parseInt(dateParts[2], 10));
-  const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  const monthStr = monthNames[parseInt(dateParts[1], 10) - 1];
+  const monthRegexes = [
+    /^(Jan|Januari|January)$/i,
+    /^(Feb|Februari|February)$/i,
+    /^(Mar|Maret|March)$/i,
+    /^(Apr|April)$/i,
+    /^(Mei|May)$/i,
+    /^(Jun|Juni|June)$/i,
+    /^(Jul|Juli|July)$/i,
+    /^(Agt|Aug|Agustus|August)$/i,
+    /^(Sep|September)$/i,
+    /^(Okt|Oct|Oktober|October)$/i,
+    /^(Nov|November)$/i,
+    /^(Des|Dec|Desember|December)$/i,
+  ];
+  const monthRegex = monthRegexes[parseInt(dateParts[1], 10) - 1] || /^(Des|Dec)$/i;
 
   await page.locator('#pickup_date').click();
   await page.waitForTimeout(500);
@@ -449,7 +504,7 @@ async function executeInternationalOrderUI(page, spec, options = {}) {
     await page.waitForTimeout(300);
     await page.locator('.ant-picker-cell-in-view').filter({ hasText: new RegExp(`^${yearStr}$`) }).first().click();
     await page.waitForTimeout(300);
-    await page.locator('.ant-picker-cell-in-view').filter({ hasText: new RegExp(`^${monthStr}$`) }).first().click();
+    await page.locator('.ant-picker-cell-in-view').filter({ hasText: monthRegex }).first().click();
     await page.waitForTimeout(300);
   }
   await page.locator('.ant-picker-cell-in-view:not(.ant-picker-cell-disabled)').filter({ hasText: new RegExp(`^${dayStr}$`) }).first().click();

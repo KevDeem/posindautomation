@@ -198,9 +198,12 @@ function resolveSpecification(inputSpec = {}, options = {}) {
   if (inputSpec.scheduledDate) {
     resolved.scheduledDate = inputSpec.scheduledDate;
     sources.scheduledDate = 'provided';
-  } else {
-    resolved.scheduledDate = prev.scheduledDate || '2026-11-19';
+  } else if (prev.scheduledDate) {
+    resolved.scheduledDate = prev.scheduledDate;
     sources.scheduledDate = 'reused';
+  } else {
+    resolved.scheduledDate = '';
+    sources.scheduledDate = 'missing';
   }
 
   if (inputSpec.scheduledTime) {
