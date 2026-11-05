@@ -92,12 +92,59 @@ When prompted, you can enter natural language instructions or structured fields:
 > "Create 5 domestic orders from Tebet Jakarta Selatan to Gubeng Surabaya, scheduled for 1 December 2026 at 08:00"
 
 ### Order with Payment Simulation
-Choose Option 4 or 5. The engine will:
-1. Complete order submission in OMS.
-2. Extract the dedicated Virtual Account (VA) from the UI payment instructions.
-3. Extract the dynamic total amount from the UI summary.
-4. Open the Payment Sandbox UI and simulate the bank transfer.
-5. Re-check the OMS order list (`/my/order`) and verify status transitions to `Dibayar`.
+Choose Option 4 or 5. The engine executes the complete UI-driven payment workflow:
+1. **Step A (Order Summary)**: Verifies Order ID and Shipment ID, extracts dynamic total cost, and clicks `Proses Pembayaran`. If the UI does not immediately transition, automatically falls back to direct navigation (`/shipment-journey-detail/complete-payment/${orderId}`).
+2. **Step B (Select Payment Method)**: Locates and selects Pospay, then clicks `Simpan Metode Pembayaran`.
+3. **Step C (Generate & Extract VA)**: Verifies Pospay instruction screen, dynamically extracts the dedicated Virtual Account (e.g. `17296006`) and amount, strictly asserting `VA !== orderId` and `VA !== shipmentId`.
+4. **Step D (Payment Sandbox Simulation)**: Opens `https://pospay-sandbox.vercel.app`, sets API endpoint to `https://sr-pos-oms-api.nisims.web.id/api/v1`, inputs dedicated VA and nominal, submits `Pay Now`, and confirms sandbox approval.
+5. **Step E (OMS Paid-Status Verification)**: Returns to OMS (`/my/order`), verifies that the order row status is confirmed as `Dibayar` / `PAID`. If unconfirmed, reports `PAYMENT_PENDING_VERIFICATION` without false success.
+
+### Granular Transaction Statuses
+- `ORDER_CREATED`: Order created, payment not requested.
+- `ORDER_CREATED_PAYMENT_PENDING`: Order created, payment workflow in progress.
+- `PAYMENT_METHOD_SELECTED`: Pospay selected, awaiting payment instructions.
+- `VA_GENERATED`: Dedicated VA extracted and verified.
+- `PAYMENT_SIMULATED`: Sandbox reported simulation success.
+- `PAYMENT_VERIFIED`: OMS confirmed paid status in `/my/order`.
+- `PAYMENT_FAILED`: Simulation or UI interaction failed.
+- `PAYMENT_PENDING_VERIFICATION`: Sandbox succeeded, but OMS status not yet confirmed.
+- `ORDER_FAILED`: Order submission in OMS failed.
+
+Only orders with `ORDER_CREATED` + `VA_GENERATED` + `PAYMENT_SIMULATED` + `PAYMENT_VERIFIED` report overall `SUCCESS`.
+
+### Execution Reports
+For orders with payment simulation:
+```text
+TRANSACTION EXECUTION REPORT
+
+Order Status:      SUCCESS
+Order ID:          ORCA1793873267537
+Shipment ID:       SOCB1793873267726
+Service Catalog:   SOLUSI PENGIRIMAN TERBAIK
+
+Payment Status:    VERIFIED
+Payment Method:    POSPAY
+VA Number:        17296006
+Payment Amount:   Rp295.837
+Sandbox Status:    SUCCESS
+OMS Status:        PAID
+
+Overall Status:    SUCCESS
+```
+
+For orders without payment simulation:
+```text
+TRANSACTION EXECUTION REPORT
+
+Order Status:      SUCCESS
+Order ID:          ORCA1793873267537
+Shipment ID:       SOCB1793873267726
+Service Catalog:   SOLUSI PENGIRIMAN TERBAIK
+
+Payment Status:    ORDER_CREATED (Not Requested)
+
+Overall Status:    SUCCESS (Order Created - Payment Not Requested)
+```
 
 ---
 

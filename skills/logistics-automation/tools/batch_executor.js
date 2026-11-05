@@ -316,7 +316,9 @@ async function executeBatch(batchInput, options = {}) {
 
       if (orderRecord.success) {
         results.succeeded++;
-        results.totalAmountPaid += (orderRecord.amount || 0);
+        if (autoPay && orderRecord.paymentStatus === 'PAYMENT_VERIFIED') {
+          results.totalAmountPaid += (orderRecord.amount || 0);
+        }
       } else {
         results.failed++;
       }

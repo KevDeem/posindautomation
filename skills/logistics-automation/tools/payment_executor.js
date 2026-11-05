@@ -100,17 +100,24 @@ async function executeOrderPayment(page, context, orderResult = {}, options = {}
       console.log(`[Payment:Step A] Clicking 'Proses Pembayaran' for Order ${orderId}...`);
       await prosesPembayaranBtn.click();
       await page.waitForTimeout(3000);
-    } else {
-      // Check if we are already on complete-payment or payment instructions screen
-      const currentUrl = page.url();
-      if (!currentUrl.includes('complete-payment')) {
-        console.log(`[Payment:Step A] Navigating directly to complete-payment page for Order ${orderId}...`);
-        await page.goto(`https://sr-pos-oms-web.nisims.web.id/shipment-journey-detail/complete-payment/${orderId}`, {
-          waitUntil: 'domcontentloaded',
-          timeout: 45000,
-        });
-        await page.waitForTimeout(3000);
-      }
+    }
+
+    // Ensure we transition to complete-payment / payment method screen
+    const currentUrl = page.url();
+    const pospayLocator = page.locator('text=pospay, #radio-container, input#PTMI1765081604728, input[type="radio"]');
+    const vaSpanLocator = page.locator('span:has-text("VA :"), div:has-text("VA :"), p:has-text("VA :")');
+
+    const reachedPaymentScreen = currentUrl.includes('complete-payment') ||
+      (await pospayLocator.first().isVisible({ timeout: 2500 }).catch(() => false)) ||
+      (await vaSpanLocator.first().isVisible({ timeout: 2500 }).catch(() => false));
+
+    if (!reachedPaymentScreen) {
+      console.log(`[Payment:Step A] Payment method screen not reached after clicking 'Proses Pembayaran'. Navigating directly to complete-payment/${orderId}...`);
+      await page.goto(`https://sr-pos-oms-web.nisims.web.id/shipment-journey-detail/complete-payment/${orderId}`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 45000,
+      });
+      await page.waitForTimeout(3000);
     }
 
     // Extract dynamic amount from the page if not already known
@@ -129,24 +136,24 @@ async function executeOrderPayment(page, context, orderResult = {}, options = {}
 
     // Check if payment instructions (VA) are ALREADY visible (skip selection if so)
     const existingVaSpan = page.locator('span:has-text("VA :"), div:has-text("VA :"), p:has-text("VA :")').first();
-    const hasExistingVa = await existingVaSpan.isVisible({ timeout: 2000 }).catch(() => false);
+    const hasExistingVa = await existingVaSpan.isVisible({ timeout: 2500 }).catch(() => false);
 
     if (!hasExistingVa) {
       console.log(`[Payment:Step B] Selecting Pospay payment channel...`);
-      await page.waitForSelector('text=pospay, #radio-container, input[type="radio"]', { state: 'visible', timeout: 20000 });
+      await page.waitForSelector('text=pospay, #radio-container, input[type="radio"], input#PTMI1765081604728', { state: 'visible', timeout: 25000 });
 
       // Click pospay radio or container
       const pospayRadio = page.locator('#radio-container, input#PTMI1765081604728, input[type="radio"]').first();
       if (await pospayRadio.isVisible().catch(() => false)) {
         await pospayRadio.click();
       } else {
-        await page.locator('button:has-text("pospay"), div:has-text("pospay")').first().click();
+        await page.locator('button:has-text("pospay"), div:has-text("pospay"), text=/pospay/i').first().click();
       }
       await page.waitForTimeout(1000);
 
       // Click "Simpan Metode Pembayaran"
-      const simpanMetodeBtn = page.locator('button:has-text("Simpan Metode Pembayaran")').first();
-      await simpanMetodeBtn.waitFor({ state: 'visible', timeout: 10000 });
+      const simpanMetodeBtn = page.locator('button:has-text("Simpan Metode Pembayaran"), button[type="submit"]:has-text("Simpan Metode Pembayaran")').first();
+      await simpanMetodeBtn.waitFor({ state: 'visible', timeout: 15000 });
       console.log(`[Payment:Step B] Clicking 'Simpan Metode Pembayaran'...`);
       await simpanMetodeBtn.click();
       await page.waitForTimeout(4000);

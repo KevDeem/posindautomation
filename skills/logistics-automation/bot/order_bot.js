@@ -201,6 +201,9 @@ async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', aut
     return;
   }
 
+  // Check if payment was requested either via menu option or natural language
+  const isPaymentRequested = autoPay || parsed.autoPay === true;
+
   // Policy log & direct execution
   console.log('\n[POLICY] All orders submitted strictly as Non-Contract with no automatic inquiry fallback.');
 
@@ -208,7 +211,7 @@ async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', aut
   console.log(`\nLaunching order execution (Browser Mode: ${modeLabel})...`);
   const batchResult = await executeBatch([resolvedSpec], {
     headless: config.headless,
-    autoPay,
+    autoPay: isPaymentRequested,
     maxRetries: config.maxRetries,
     sessionPath: config.sessionPath,
   });
@@ -216,10 +219,10 @@ async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', aut
   // Save execution record
   const savedRecord = saveExecutionRecord({
     request: userPrompt || 'Default single order',
-    menuOption: autoPay ? 'Single Order + Payment' : 'Single Order',
+    menuOption: isPaymentRequested ? 'Single Order + Payment' : 'Single Order',
     orderType: resolvedSpec.orderType,
     batchCount: 1,
-    autoPay,
+    autoPay: isPaymentRequested,
     summary: {
       total: batchResult.total,
       succeeded: batchResult.succeeded,
@@ -239,17 +242,23 @@ async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', aut
   console.log(`Order ID:          ${o.orderId || '-'}`);
   console.log(`Shipment ID:       ${o.shipmentId || '-'}`);
   console.log(`Service Catalog:   ${o.serviceCatalog || '-'}`);
-  if (autoPay) {
+  if (isPaymentRequested) {
     console.log('');
-    console.log(`Payment Status:    ${o.paymentStatus || '-'}`);
+    console.log(`Payment Status:    ${o.paymentStatus === 'PAYMENT_VERIFIED' ? 'VERIFIED' : (o.paymentStatus || 'FAILED')}`);
     console.log(`Payment Method:    ${o.paymentMethod || 'POSPAY'}`);
     console.log(`VA Number:        ${o.vaNumber || '-'}`);
     console.log(`Payment Amount:   ${formatRupiah(o.amount)}`);
     console.log(`Sandbox Status:    ${o.sandboxPayment || '-'}`);
     console.log(`OMS Status:        ${o.omsStatus || '-'}`);
+    console.log('');
+    const paymentSuccess = o.orderStatus === 'SUCCESS' && o.paymentStatus === 'PAYMENT_VERIFIED' && o.overallStatus === 'SUCCESS';
+    console.log(`Overall Status:    ${paymentSuccess ? 'SUCCESS' : 'FAILED'}`);
+  } else {
+    console.log('');
+    console.log(`Payment Status:    ORDER_CREATED (Not Requested)`);
+    console.log('');
+    console.log(`Overall Status:    ${o.orderStatus === 'SUCCESS' ? 'SUCCESS (Order Created - Payment Not Requested)' : 'FAILED'}`);
   }
-  console.log('');
-  console.log(`Overall Status:    ${o.overallStatus || (o.success ? 'SUCCESS' : 'FAILED')}`);
   if (o.error) {
     console.log(`Error Blocker:     ${o.error}`);
   }
@@ -267,6 +276,7 @@ async function handleBatchOrderFlow(rl, config, { autoPay = false } = {}) {
 
   const userPrompt = await promptQuestion(rl, '\nBatch description: ');
   const parsed = parseOrderPrompt(userPrompt);
+  const isPaymentRequested = autoPay || parsed.autoPay === true;
 
   let count = parsed.count || 1;
   if (count <= 1) {
@@ -286,7 +296,7 @@ async function handleBatchOrderFlow(rl, config, { autoPay = false } = {}) {
   console.log(`\n[Batch Summary]`);
   console.log(`- Total Orders to create: ${count}`);
   console.log(`- Execution Mode: Sequential (${config.maxRetries} max retries per order)`);
-  console.log(`- Payment Simulation: ${autoPay ? 'YES (Pospay VA + Sandbox)' : 'NO'}`);
+  console.log(`- Payment Simulation: ${isPaymentRequested ? 'YES (Pospay VA + Sandbox)' : 'NO'}`);
   console.log(`- Browser Mode: ${modeLabel}`);
 
   // Pre-execution validation
@@ -306,17 +316,17 @@ async function handleBatchOrderFlow(rl, config, { autoPay = false } = {}) {
   console.log(`\nLaunching batch execution for ${count} orders (Browser Mode: ${modeLabel})...`);
   const batchResult = await executeBatch({ specification: resolvedSpec, count }, {
     headless: config.headless,
-    autoPay,
+    autoPay: isPaymentRequested,
     maxRetries: config.maxRetries,
     sessionPath: config.sessionPath,
   });
 
   const savedRecord = saveExecutionRecord({
     request: userPrompt || `Batch ${count} orders`,
-    menuOption: autoPay ? 'Multiple Orders + Payment' : 'Multiple Orders',
+    menuOption: isPaymentRequested ? 'Multiple Orders + Payment' : 'Multiple Orders',
     orderType: resolvedSpec.orderType,
     batchCount: count,
-    autoPay,
+    autoPay: isPaymentRequested,
     summary: {
       total: batchResult.total,
       succeeded: batchResult.succeeded,
@@ -334,10 +344,10 @@ async function handleBatchOrderFlow(rl, config, { autoPay = false } = {}) {
   console.log(`Total Amount Paid: Rp${batchResult.totalAmountPaid}`);
   console.log('------------------------------------------------------');
   batchResult.orders.forEach(o => {
-    if (autoPay) {
+    if (isPaymentRequested) {
       console.log(`[#${o.index}] ${o.label}: ${o.overallStatus || (o.success ? 'SUCCESS' : 'FAILED')} | Order: ${o.orderId || '-'} | VA: ${o.vaNumber || '-'} | Payment: ${o.paymentStatus || '-'} | OMS: ${o.omsStatus || '-'}`);
     } else {
-      console.log(`[#${o.index}] ${o.label}: ${o.orderStatus || (o.success ? 'SUCCESS' : 'FAILED')} | Order: ${o.orderId || '-'} | Status: ${o.orderStatus || '-'}`);
+      console.log(`[#${o.index}] ${o.label}: ${o.orderStatus || (o.success ? 'SUCCESS' : 'FAILED')} | Order: ${o.orderId || '-'} | Status: ORDER_CREATED (Payment Not Requested)`);
     }
   });
   console.log(`Saved Record ID: ${savedRecord.id}`);

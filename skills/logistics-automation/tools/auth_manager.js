@@ -115,12 +115,27 @@ async function performFreshLogin(page, context, options = {}) {
 
   // Check for authentication error alerts
   const errorAlert = page.locator('.ant-message-error, .ant-notification-notice-error, .text-danger, p:has-text("Incorrect email or password")')
-    .or(page.locator('[role="alert"]').filter({ hasText: /incorrect|gagal|salah|invalid/i }));
+    .or(page.locator('[role="alert"]').filter({ hasText: /incorrect|gagal|salah|invalid|failed/i }));
 
   if (await errorAlert.first().isVisible().catch(() => false)) {
-    const errMsg = await errorAlert.first().innerText().catch(() => 'Incorrect credentials');
-    await captureScreenshot(page, 'login_credentials_rejected');
-    throw new Error(`[Authentication] Login failed: ${errMsg.trim().replace(/\n/g, ' ')}`);
+    const rawErr = await errorAlert.first().innerText().catch(() => 'Incorrect credentials');
+    const errMsg = rawErr.trim().replace(/\n/g, ' ');
+
+    // Retry once on transient network fetch error
+    if (/failed to fetch|network/i.test(errMsg)) {
+      console.warn(`[Authentication] Transient network warning ("${errMsg}"). Retrying submission once...`);
+      await page.waitForTimeout(2000);
+      await submitBtn.click();
+      await page.waitForTimeout(3000);
+      if (await errorAlert.first().isVisible().catch(() => false)) {
+        const retryErr = (await errorAlert.first().innerText().catch(() => errMsg)).trim().replace(/\n/g, ' ');
+        await captureScreenshot(page, 'login_credentials_rejected');
+        throw new Error(`[Authentication] Login failed: ${retryErr}`);
+      }
+    } else {
+      await captureScreenshot(page, 'login_credentials_rejected');
+      throw new Error(`[Authentication] Login failed: ${errMsg}`);
+    }
   }
 
   // 6. Explicitly verify authenticated OMS session
