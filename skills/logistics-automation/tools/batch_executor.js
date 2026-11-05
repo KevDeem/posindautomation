@@ -21,6 +21,7 @@ const fs = require('fs');
 const { executeOrder } = require('./order_executor');
 const { executeOrderPayment } = require('./payment_executor');
 const { resolveSpecification, formatSpecificationReview } = require('./order_specification');
+const { performFreshLogin } = require('./auth_manager');
 
 const DEFAULT_SESSION_PATH = path.resolve(__dirname, '../../../.sessions/staging-oms_kevin_d_imas_gmail_com_session.json');
 
@@ -86,6 +87,15 @@ function normalizeBatchInput(batchInput) {
 function classifyFailure(err) {
   const msg = err && err.message ? err.message : String(err);
 
+  // 0. Authentication failure or session expiry mid-batch
+  if (msg.includes('Authentication expired') || msg.includes('session lost') || msg.includes('[Authentication]')) {
+    return {
+      type: 'AUTH_EXPIRED',
+      retryable: false,
+      reason: 'Authentication session expired or failed mid-batch. Halting batch safely.',
+    };
+  }
+
   // 1. Deterministic catalog failure: no service catalog exists for route
   if (msg.includes('No applicable Service Catalog found') || msg.includes('no inquiry fallback') || msg.includes('Service Catalog selection could not be confirmed')) {
     return {
@@ -104,7 +114,16 @@ function classifyFailure(err) {
     };
   }
 
-  // 3. Autocomplete / Location resolution failure
+  // 3. Payment failures: do not retry order creation if order already placed
+  if (msg.includes('Payment') || msg.includes('Sandbox') || msg.includes('sandbox') || msg.includes('payment') || msg.includes('VA Number')) {
+    return {
+      type: 'PAYMENT_FAILURE',
+      retryable: false,
+      reason: 'Payment simulation or verification failed; order creation already succeeded. Retrying order creation is forbidden.',
+    };
+  }
+
+  // 4. Autocomplete / Location resolution failure
   if (msg.includes('Autocomplete search') || msg.includes('No option matching') || msg.includes('No selectable options')) {
     return {
       type: 'AUTOCOMPLETE_FAILURE',
@@ -142,13 +161,13 @@ function classifyFailure(err) {
  */
 async function executeBatch(batchInput, options = {}) {
   const items = normalizeBatchInput(batchInput);
-  const headless = options.headless !== undefined ? options.headless : true;
+  const headless = options.headless === true;
   const autoPay = options.autoPay !== undefined ? options.autoPay : true;
   const maxRetries = options.maxRetries !== undefined ? options.maxRetries : 2;
   const sessionPath = options.sessionPath || DEFAULT_SESSION_PATH;
 
   console.log(`\n======================================================`);
-  console.log(`[BatchExecutor] Starting batch of ${items.length} order(s) (headless: ${headless}, autoPay: ${autoPay}, maxRetries: ${maxRetries})`);
+  console.log(`[BatchExecutor] Starting batch of ${items.length} order(s) (Browser Mode: ${headless ? 'Headless (background)' : 'Headed (visible browser)'}, autoPay: ${autoPay}, maxRetries: ${maxRetries})`);
   console.log(`======================================================\n`);
 
   const results = {
@@ -161,9 +180,23 @@ async function executeBatch(batchInput, options = {}) {
 
   const browser = await chromium.launch({ headless, slowMo: headless ? 0 : 100 });
   const context = await browser.newContext({
-    storageState: sessionPath,
     viewport: { width: 1440, height: 950 },
   });
+
+  // Authenticate once at the beginning of the batch
+  console.log('[BatchExecutor] Initializing single batch authentication session...');
+  const authPage = await context.newPage();
+  try {
+    await performFreshLogin(authPage, context, {
+      ...options,
+      sessionPath,
+    });
+  } finally {
+    await authPage.close().catch(() => {});
+  }
+  console.log('[BatchExecutor] Batch authentication session established.');
+
+  let authExpiredMidBatch = false;
 
   try {
     for (let index = 0; index < items.length; index++) {
@@ -180,9 +213,13 @@ async function executeBatch(batchInput, options = {}) {
         shipmentId: null,
         amount: 0,
         serviceCatalog: null,
+        orderStatus: 'FAILED',
+        paymentStatus: autoPay ? 'ORDER_CREATED_PAYMENT_PENDING' : 'ORDER_CREATED',
+        paymentMethod: autoPay ? 'POSPAY' : null,
         vaNumber: null,
         sandboxPayment: null,
         omsStatus: null,
+        overallStatus: 'FAILED',
         error: null,
       };
 
@@ -197,10 +234,12 @@ async function executeBatch(batchInput, options = {}) {
             headless,
             existingBrowser: browser,
             existingContext: context,
+            skipLogin: true, // Reuse authenticated batch session
             transactionLabel: `${orderLabel} (Try ${attempt})`,
           });
 
           if (!createResult.success) {
+            orderRecord.orderStatus = 'ORDER_FAILED';
             throw new Error(createResult.error || 'Order creation failed');
           }
 
@@ -208,38 +247,61 @@ async function executeBatch(batchInput, options = {}) {
           orderRecord.shipmentId = createResult.shipmentId;
           orderRecord.amount = createResult.amount || 0;
           orderRecord.serviceCatalog = createResult.serviceCatalog;
+          orderRecord.orderStatus = 'SUCCESS';
 
           // Execute Payment if requested
           if (autoPay && orderRecord.orderId) {
-            console.log(`[BatchExecutor] Proceeding to payment for Order ${orderRecord.orderId}...`);
+            console.log(`[BatchExecutor] Proceeding to payment simulation for Order ${orderRecord.orderId}...`);
             const payResult = await executeOrderPayment(page, context, {
               orderId: orderRecord.orderId,
               shipmentId: orderRecord.shipmentId,
               amount: orderRecord.amount,
+            }, {
+              headless,
+              sandboxUrl: options.sandboxUrl,
+              apiEndpoint: options.apiEndpoint,
             });
 
             orderRecord.vaNumber = payResult.vaNumber;
             orderRecord.sandboxPayment = payResult.sandboxResult;
             orderRecord.omsStatus = payResult.omsPaymentStatus;
+            orderRecord.paymentStatus = payResult.paymentStatus;
+            orderRecord.paymentMethod = payResult.paymentMethod || 'POSPAY';
 
             if (payResult.amount && (!orderRecord.amount || orderRecord.amount === 0)) {
               orderRecord.amount = payResult.amount;
             }
 
-            if (payResult.sandboxResult !== 'SUCCESS') {
-              console.warn(`[BatchExecutor] Payment simulation did not return SUCCESS for Order ${orderRecord.orderId}`);
+            if (payResult.paymentStatus === 'PAYMENT_VERIFIED' && payResult.overallStatus === 'SUCCESS') {
+              orderRecord.success = true;
+              orderRecord.overallStatus = 'SUCCESS';
+              orderRecord.error = null;
+            } else {
+              orderRecord.success = false;
+              orderRecord.overallStatus = 'FAILED';
+              orderRecord.error = payResult.error || `Payment incomplete: ${payResult.paymentStatus}`;
+              console.warn(`[BatchExecutor] Payment simulation did not verify SUCCESS for Order ${orderRecord.orderId}: ${payResult.paymentStatus}`);
             }
+          } else {
+            orderRecord.paymentStatus = 'ORDER_CREATED';
+            orderRecord.success = true;
+            orderRecord.overallStatus = 'SUCCESS';
+            orderRecord.error = null;
           }
 
-          orderRecord.success = true;
-          orderRecord.error = null;
           await page.close().catch(() => {});
-          break; // Succeeded, exit retry loop
+          break; // Order created, exit retry loop (never retry creation)
 
         } catch (err) {
           const classification = classifyFailure(err);
           console.error(`[BatchExecutor] ${orderLabel} attempt ${attempt} failed [${classification.type}]:`, err.message);
           orderRecord.error = `${classification.type}: ${err.message}`;
+
+          if (classification.type === 'AUTH_EXPIRED') {
+            console.error(`[BatchExecutor] Authentication expired mid-batch on ${orderLabel}. Aborting batch safely.`);
+            authExpiredMidBatch = true;
+            break;
+          }
 
           if (!classification.retryable) {
             console.warn(`[BatchExecutor] Non-retryable condition: ${classification.reason} Stopping retries for ${orderLabel}.`);
@@ -260,6 +322,11 @@ async function executeBatch(batchInput, options = {}) {
       }
 
       results.orders.push(orderRecord);
+
+      if (authExpiredMidBatch) {
+        console.error(`[BatchExecutor] Stopped batch safely due to expired session on ${orderLabel}.`);
+        break;
+      }
     }
   } finally {
     await browser.close().catch(() => {});

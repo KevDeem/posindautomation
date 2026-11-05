@@ -32,7 +32,7 @@ async function launchBrowser(options = {}) {
   const slowMo = options.slowMo !== undefined ? options.slowMo : (headless ? 0 : 100);
   const timeoutMs = options.timeoutMs || 30000;
 
-  logAction('Launching Chromium browser', `(headless: ${headless}, slowMo: ${slowMo}ms)`);
+  logAction('Launching Chromium browser', `(Browser Mode: ${headless ? 'Headless (background)' : 'Headed (visible browser)'}, slowMo: ${slowMo}ms)`);
   try {
     const browser = await chromium.launch({
       headless,

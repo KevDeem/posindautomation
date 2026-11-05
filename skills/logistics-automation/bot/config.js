@@ -14,11 +14,13 @@ const DEFAULT_CONFIG = {
   omsUrl: 'https://sr-pos-oms-web.nisims.web.id',
   apiEndpoint: 'https://sr-pos-oms-api.nisims.web.id/api/v1',
   paymentSandboxUrl: 'https://pospay-sandbox.vercel.app',
-  headless: true,
+  headless: false,
   maxRetries: 2,
   navigationTimeoutMs: 45000,
   actionTimeoutMs: 15000,
   paymentCooldownMs: 2000,
+  username: process.env.OMS_USERNAME || 'kevin.d.imas@gmail.com',
+  password: process.env.OMS_PASSWORD || '@Admin123.',
   sessionPath: path.join(ROOT_DIR, '.sessions/staging-oms_kevin_d_imas_gmail_com_session.json'),
 };
 

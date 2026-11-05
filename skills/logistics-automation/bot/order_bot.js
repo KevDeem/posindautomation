@@ -17,7 +17,7 @@ const {
 } = require('../tools/order_specification');
 const { executeOrder } = require('../tools/order_executor');
 const { executeBatch } = require('../tools/batch_executor');
-const { executeOrderPayment } = require('../tools/payment_executor');
+const { executeOrderPayment, formatRupiah } = require('../tools/payment_executor');
 
 /**
  * Prompt user for input via readline
@@ -25,6 +25,23 @@ const { executeOrderPayment } = require('../tools/payment_executor');
 async function promptQuestion(rl, questionText) {
   const answer = await rl.question(questionText);
   return answer.trim();
+}
+
+/**
+ * Prompt user for browser execution mode at the beginning of each session.
+ * 
+ * @param {readline.Interface} rl
+ * @returns {Promise<boolean>} headless (false = Headed, true = Headless)
+ */
+async function promptBrowserMode(rl) {
+  console.log('\nBrowser Mode:');
+  console.log('1. Headed (visible browser)');
+  console.log('2. Headless (background)\n');
+  const answer = await promptQuestion(rl, 'Select mode [1-2] (default: 1): ');
+  if (answer === '2') {
+    return true; // Headless
+  }
+  return false; // Headed (default: 1)
 }
 
 /**
@@ -184,16 +201,11 @@ async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', aut
     return;
   }
 
-  // Confirmation gate
+  // Policy log & direct execution
   console.log('\n[POLICY] All orders submitted strictly as Non-Contract with no automatic inquiry fallback.');
-  const confirm = await promptQuestion(rl, `Confirm submission of this ${resolvedSpec.orderType} order? (yes/no): `);
 
-  if (confirm.toLowerCase() !== 'yes' && confirm.toLowerCase() !== 'y') {
-    console.log('\n[CANCELED] Order submission canceled by user. No transactions were created.');
-    return;
-  }
-
-  console.log(`\nLaunching order execution (headless: ${config.headless})...`);
+  const modeLabel = config.headless ? 'Headless (background)' : 'Headed (visible browser)';
+  console.log(`\nLaunching order execution (Browser Mode: ${modeLabel})...`);
   const batchResult = await executeBatch([resolvedSpec], {
     headless: config.headless,
     autoPay,
@@ -223,16 +235,21 @@ async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', aut
   console.log('              TRANSACTION EXECUTION REPORT            ');
   console.log('======================================================');
   const o = batchResult.orders[0] || {};
-  console.log(`Status:            ${o.success ? 'SUCCESS' : 'FAILED'}`);
+  console.log(`Order Status:      ${o.orderStatus || (o.orderId ? 'SUCCESS' : 'FAILED')}`);
   console.log(`Order ID:          ${o.orderId || '-'}`);
   console.log(`Shipment ID:       ${o.shipmentId || '-'}`);
   console.log(`Service Catalog:   ${o.serviceCatalog || '-'}`);
   if (autoPay) {
-    console.log(`Dedicated VA:      ${o.vaNumber || '-'}`);
-    console.log(`Amount Paid:       Rp${o.amount || 0}`);
-    console.log(`Sandbox Result:    ${o.sandboxPayment || '-'}`);
-    console.log(`OMS Order Status:  ${o.omsStatus || '-'}`);
+    console.log('');
+    console.log(`Payment Status:    ${o.paymentStatus || '-'}`);
+    console.log(`Payment Method:    ${o.paymentMethod || 'POSPAY'}`);
+    console.log(`VA Number:        ${o.vaNumber || '-'}`);
+    console.log(`Payment Amount:   ${formatRupiah(o.amount)}`);
+    console.log(`Sandbox Status:    ${o.sandboxPayment || '-'}`);
+    console.log(`OMS Status:        ${o.omsStatus || '-'}`);
   }
+  console.log('');
+  console.log(`Overall Status:    ${o.overallStatus || (o.success ? 'SUCCESS' : 'FAILED')}`);
   if (o.error) {
     console.log(`Error Blocker:     ${o.error}`);
   }
@@ -265,11 +282,12 @@ async function handleBatchOrderFlow(rl, config, { autoPay = false } = {}) {
   }
 
   console.log('\n' + formatSpecificationReview(resolvedSpec, sources));
+  const modeLabel = config.headless ? 'Headless (background)' : 'Headed (visible browser)';
   console.log(`\n[Batch Summary]`);
   console.log(`- Total Orders to create: ${count}`);
   console.log(`- Execution Mode: Sequential (${config.maxRetries} max retries per order)`);
   console.log(`- Payment Simulation: ${autoPay ? 'YES (Pospay VA + Sandbox)' : 'NO'}`);
-  console.log(`- Headless Mode: ${config.headless}`);
+  console.log(`- Browser Mode: ${modeLabel}`);
 
   // Pre-execution validation
   const validation = validateSpecificationForExecution(resolvedSpec, sources, userPrompt);
@@ -285,13 +303,7 @@ async function handleBatchOrderFlow(rl, config, { autoPay = false } = {}) {
     return;
   }
 
-  const confirm = await promptQuestion(rl, `Confirm creating and processing all ${count} orders? (yes/no): `);
-  if (confirm.toLowerCase() !== 'yes' && confirm.toLowerCase() !== 'y') {
-    console.log('\n[CANCELED] Batch creation canceled by user. No orders created.');
-    return;
-  }
-
-  console.log(`\nLaunching batch execution for ${count} orders...`);
+  console.log(`\nLaunching batch execution for ${count} orders (Browser Mode: ${modeLabel})...`);
   const batchResult = await executeBatch({ specification: resolvedSpec, count }, {
     headless: config.headless,
     autoPay,
@@ -322,7 +334,11 @@ async function handleBatchOrderFlow(rl, config, { autoPay = false } = {}) {
   console.log(`Total Amount Paid: Rp${batchResult.totalAmountPaid}`);
   console.log('------------------------------------------------------');
   batchResult.orders.forEach(o => {
-    console.log(`[#${o.index}] ${o.label}: ${o.success ? 'SUCCESS' : 'FAILED'} | Order: ${o.orderId || '-'} | VA: ${o.vaNumber || '-'} | Status: ${o.omsStatus || o.error || '-'}`);
+    if (autoPay) {
+      console.log(`[#${o.index}] ${o.label}: ${o.overallStatus || (o.success ? 'SUCCESS' : 'FAILED')} | Order: ${o.orderId || '-'} | VA: ${o.vaNumber || '-'} | Payment: ${o.paymentStatus || '-'} | OMS: ${o.omsStatus || '-'}`);
+    } else {
+      console.log(`[#${o.index}] ${o.label}: ${o.orderStatus || (o.success ? 'SUCCESS' : 'FAILED')} | Order: ${o.orderId || '-'} | Status: ${o.orderStatus || '-'}`);
+    }
   });
   console.log(`Saved Record ID: ${savedRecord.id}`);
   console.log('======================================================\n');
@@ -357,15 +373,25 @@ async function handleViewHistory(rl) {
 /**
  * Main interactive loop
  */
-async function startOrderingBot() {
+async function startOrderingBot(options = {}) {
   const config = loadConfig();
-  const rl = readline.createInterface({ input, output });
+  const rl = options.rl || readline.createInterface({ input, output });
 
   console.log('\n==========================================================');
   console.log('            POSIND STANDALONE ORDERING BOT                ');
   console.log('  Specification-driven Logistics Automation for POSIND    ');
   console.log('==========================================================');
-  console.log(`Environment: ${config.environment} | Headless: ${config.headless}`);
+
+  // Select browser mode once per execution session
+  if (options.headless !== undefined) {
+    config.headless = Boolean(options.headless);
+  } else {
+    config.headless = await promptBrowserMode(rl);
+  }
+
+  const modeLabel = config.headless ? 'Headless (background)' : 'Headed (visible browser)';
+  console.log(`\n[Browser Mode] Selected: ${modeLabel}`);
+  console.log(`Environment: ${config.environment} | Browser Mode: ${modeLabel}`);
 
   let running = true;
   while (running) {
@@ -421,4 +447,5 @@ module.exports = {
   handleViewHistory,
   validateSpecificationForExecution,
   promptQuestion,
+  promptBrowserMode,
 };

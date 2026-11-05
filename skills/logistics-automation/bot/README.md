@@ -19,17 +19,19 @@ npx playwright install chromium
 
 ---
 
-## 2. Session Authentication
+## 2. Authentication & Session Lifecycle
 
-The bot relies on a stored Playwright session cookie to interact with the POSIND OMS web UI.
+The bot performs a **mandatory fresh login** on every execution run rather than relying on stale saved session state:
+- Clean browser context is launched with cookies cleared.
+- OMS landing page is loaded and credentials (`OMS_USERNAME` and `OMS_PASSWORD`, defaulting to configured account) are submitted.
+- Authentication success is explicitly verified (absence of error alerts, active user profile/cookies).
+- Diagnostic logs and screenshots (`.artifacts/screenshots/`) are emitted automatically if authentication fails.
+- **Batch Executions**: Authenticates once at the start of the batch, maintains the authenticated session across all orders, and halts safely if the session expires mid-batch.
 
-Ensure an active session file exists in `.sessions/`:
+Environment Variables:
 ```bash
-# Verify session health
-node skills/logistics-automation/tools/smoke_test.js
-
-# If expired or missing, run interactive login:
-node skills/logistics-automation/tools/interactive_login.js
+export OMS_USERNAME="kevin.d.imas@gmail.com"
+export OMS_PASSWORD="@Admin123."
 ```
 
 ---
@@ -42,18 +44,19 @@ Start the interactive CLI:
 npm run order
 ```
 
-### Environment Overrides
+### Browser Execution Mode Selection
+At the start of each execution session, the CLI asks whether to run with a visible browser (headed) or in the background (headless):
 
-```bash
-# Run in headless mode (default is headed visual execution)
-HEADLESS=true npm run order
+```text
+Browser Mode:
+1. Headed (visible browser)
+2. Headless (background)
 
-# Enable debug logs
-LOG_LEVEL=debug npm run order
-
-# Custom session path
-SESSION_PATH=.sessions/custom_session.json npm run order
+Select mode [1-2] (default: 1):
 ```
+- Pressing **Enter** or **1** selects **Headed (visible browser)**.
+- Selecting **2** selects **Headless (background)**.
+- The selected mode applies across all orders and payments in the session.
 
 ---
 
@@ -119,15 +122,16 @@ Pickup PIC Name           Budi Santoso                             [Generated Sy
 Pickup PIC Phone          08123456789                              [Generated Synthetic]
 Dropoff PIC Name          Siti Rahayu                              [Generated Synthetic]
 Dropoff PIC Phone         08219876543                              [Generated Synthetic]
-Policy                    Non-Contract Only                        [UI Default]
+Order Mode                NON-CONTRACT (Policy Enforced)           [Policy Enforced]
 ================================================================================
 ```
 
 You will be prompted:
-`Proceed with submission? (y/N/edit):`
-- **y**: Proceed to UI execution.
-- **edit**: Manually update any field before proceeding.
-- **N**: Cancel execution safely without placing any order.
+`Modify any of these values before proceeding? (y/N):`
+- **y**: Interactively modify fields before execution.
+- **N / Enter**: Proceed directly to execution.
+
+After review and optional modification, order execution proceeds directly without any secondary submission confirmation prompt.
 
 ---
 

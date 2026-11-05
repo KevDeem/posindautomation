@@ -26,6 +26,11 @@ const {
   savePreviousSpecification,
   formatSpecificationReview,
 } = require('./order_specification');
+const {
+  performFreshLogin,
+  navigateToShippingPage,
+  captureScreenshot,
+} = require('./auth_manager');
 
 const DEFAULT_SESSION_PATH = path.resolve(__dirname, '../../../.sessions/staging-oms_kevin_d_imas_gmail_com_session.json');
 
@@ -160,6 +165,136 @@ async function selectAntOption(page, containerLocator, rawText, matchRegex) {
 }
 
 /**
+ * Step 3: Service Catalog Discovery & Selection
+ * 
+ * Handles State A (Selectable service cards available) and State B (Explicit unavailable notice).
+ * Verifies workflow advancement to Step 4.
+ */
+async function handleServiceCatalogStep3(page, spec, name = 'Domestic Order', result = {}) {
+  console.log(`[${name}] [ServiceCatalog] Entering Step 3: Pilih Layanan...`);
+
+  const simpanLayananBtn = page.getByRole('button', { name: /simpan pilihan layanan/i })
+    .or(page.locator('button:has-text("Simpan Pilihan Layanan")')).first();
+
+  try {
+    await simpanLayananBtn.waitFor({ state: 'attached', timeout: 25000 });
+  } catch (err) {
+    throw new Error(`[UI Detection Error] 'Simpan Pilihan Layanan' button not found at Step 3: ${err.message}`);
+  }
+
+  // Wait for loading indicators to detach
+  await page.locator('.ant-spin-spinning, .ant-skeleton').waitFor({ state: 'detached', timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(600);
+
+  // Selectors for State A (Selectable Service Cards) and State B (Explicit Unavailable State)
+  const cardLocator = page.locator('.ant-card, [class*="card"]')
+    .filter({ hasText: /PENGIRIMAN TERBAIK|LTL|FTL|Estimasi|Rp\s*[0-9]/i })
+    .or(page.locator('div.border, div.rounded, div[role="radio"]').filter({ hasText: /Rp\s*[0-9]/i }));
+
+  const unavailableNotice = page.locator('text=/Maaf,\\s*layanan belum tersedia/i')
+    .or(page.locator('text=/layanan belum tersedia/i'))
+    .or(page.getByRole('button', { name: /ajukan quotation layanan/i }))
+    .or(page.locator('button:has-text("Ajukan Quotation Layanan")'));
+
+  let detectedState = null; // 'AVAILABLE' | 'UNAVAILABLE'
+  const pollStart = Date.now();
+
+  while (Date.now() - pollStart < 15000) {
+    if (await cardLocator.first().isVisible().catch(() => false)) {
+      detectedState = 'AVAILABLE';
+      break;
+    }
+    if (await unavailableNotice.first().isVisible().catch(() => false)) {
+      detectedState = 'UNAVAILABLE';
+      break;
+    }
+    await page.waitForTimeout(400);
+  }
+
+  const pickupCity = spec?.pickup?.city || 'Origin';
+  const dropoffCity = spec?.dropoff?.city || 'Destination';
+
+  if (detectedState === 'UNAVAILABLE') {
+    console.warn(`[${name}] [ServiceCatalog] Explicit unavailable state detected: 'Maaf, layanan belum tersedia.'`);
+    throw new Error(`No applicable Service Catalog found for domestic route ${pickupCity} -> ${dropoffCity}. Staging OMS confirmed unavailable: 'Maaf, layanan belum tersedia'. Stopped per policy (no quotation/inquiry fallback).`);
+  }
+
+  if (detectedState !== 'AVAILABLE') {
+    throw new Error(`[UI Detection Error] Neither selectable service cards nor explicit unavailable state ('Maaf, layanan belum tersedia') detected at Step 3 for route ${pickupCity} -> ${dropoffCity}.`);
+  }
+
+  // State A: Service Catalog Available
+  const cardCount = await cardLocator.count();
+  console.log(`[${name}] [ServiceCatalog] Detected ${cardCount} selectable service card(s):`);
+
+  for (let i = 0; i < cardCount; i++) {
+    const cardText = (await cardLocator.nth(i).innerText().catch(() => '')).trim().replace(/\s+/g, ' ');
+    console.log(`[${name}] [ServiceCatalog] Card #${i + 1}: ${cardText}`);
+  }
+
+  // Match preference or default to PENGIRIMAN TERBAIK / first available
+  const catalogPref = spec?.serviceCatalogPreference && spec.serviceCatalogPreference !== 'auto'
+    ? spec.serviceCatalogPreference
+    : null;
+
+  let selectedCard = null;
+  let selectedCatalogName = null;
+
+  if (catalogPref) {
+    const prefCard = cardLocator.filter({ hasText: new RegExp(catalogPref, 'i') }).first();
+    if (await prefCard.isVisible().catch(() => false)) {
+      selectedCard = prefCard;
+      selectedCatalogName = catalogPref;
+    }
+  }
+
+  if (!selectedCard) {
+    const bestCard = cardLocator.filter({ hasText: /PENGIRIMAN TERBAIK/i }).first();
+    if (await bestCard.isVisible().catch(() => false)) {
+      selectedCard = bestCard;
+    } else {
+      selectedCard = cardLocator.first();
+    }
+  }
+
+  await selectedCard.click();
+  await page.waitForTimeout(500);
+
+  const fullCardText = (await selectedCard.innerText().catch(() => '')).trim();
+  const firstLine = fullCardText.split('\n')[0].trim();
+  selectedCatalogName = selectedCatalogName || firstLine || 'LTL (Standard)';
+  result.serviceCatalog = selectedCatalogName;
+  console.log(`[${name}] [ServiceCatalog] Selected card: ${selectedCatalogName}`);
+
+  // Confirm Simpan Pilihan Layanan button is enabled and click
+  if (!await simpanLayananBtn.isEnabled()) {
+    await selectedCard.click().catch(() => {});
+    await page.waitForTimeout(500);
+  }
+
+  if (!await simpanLayananBtn.isEnabled()) {
+    throw new Error(`[ServiceCatalog] 'Simpan Pilihan Layanan' button remained disabled after card selection for ${pickupCity} -> ${dropoffCity}.`);
+  }
+
+  console.log(`[${name}] [ServiceCatalog] Clicking 'Simpan Pilihan Layanan'...`);
+  await simpanLayananBtn.click();
+  await page.waitForTimeout(1500);
+
+  // Verify workflow advances to Step 4 (Ringkasan Pengiriman)
+  const step4ShipmentBtn = page.getByRole('button', { name: /simpan shipment/i }).first()
+    .or(page.locator('button:has-text("Simpan Shipment")').first());
+
+  try {
+    await step4ShipmentBtn.waitFor({ state: 'visible', timeout: 15000 });
+    console.log(`[${name}] [ServiceCatalog] Workflow successfully advanced to Step 4 (Ringkasan Pengiriman).`);
+  } catch (advErr) {
+    throw new Error(`[ServiceCatalog] Workflow failed to advance to Step 4 after selecting service catalog: ${advErr.message}`);
+  }
+
+  return selectedCatalogName;
+}
+
+/**
  * Domestic Order UI Execution
  */
 async function executeDomesticOrderUI(page, spec, options = {}) {
@@ -173,9 +308,7 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
   };
 
   const name = options.transactionLabel || 'Domestic Order';
-  console.log(`[${name}] Navigating to /domestic-shipping...`);
-  await page.goto('https://sr-pos-oms-web.nisims.web.id/domestic-shipping', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(2000);
+  await navigateToShippingPage(page, 'domestic', options);
 
   // 1. Page Readiness & Pickup Date Input Detection
   const dateInputLocator = page.locator('#pickup_date, input[placeholder*="Pilih Tanggal"]');
@@ -365,15 +498,23 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
     .filter({ hasText: new RegExp(spec.cargo.characteristics || 'General Cargo', 'i') }).first().click();
   await page.waitForTimeout(800);
 
-  await page.getByRole('button', { name: /tambah informasi muatan/i }).click();
+  // 4a. Scoped Pickup Manifest Button
+  console.log(`[${name}] [Cargo:Pickup] Locating and clicking Pickup Manifest button (+ Tambah Informasi Muatan)...`);
+  const pickupManifestBtn = page.locator('button.manifest-pickup-title')
+    .or(page.locator('.box-shadow-mod').filter({ hasText: /^Pickup/i }).locator('button:has-text("Tambah Informasi Muatan")'))
+    .first();
+  await pickupManifestBtn.waitFor({ state: 'visible', timeout: 15000 });
+  await pickupManifestBtn.click();
   await page.waitForTimeout(1500);
 
   const cargoDialog = page.locator('[role="dialog"]:not([style*="display: none"])').last();
+  console.log(`[${name}] [Cargo:Pickup] Opening Tambah Barang modal...`);
   await cargoDialog.getByRole('button', { name: /tambah barang/i }).click();
   await page.waitForTimeout(1500);
 
   const subDialog = page.locator('[role="dialog"]:not([style*="display: none"])').last();
-  const comSelect = subDialog.locator('.ant-select').filter({ hasText: /pilih komoditas/i }).first();
+  console.log(`[${name}] [Cargo:Pickup] Selecting commodity...`);
+  const comSelect = subDialog.locator('.ant-select:has(#commodity), .ant-select').filter({ hasText: /komoditas/i }).first();
   await comSelect.click();
   await page.waitForTimeout(500);
   await page.locator('.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option')
@@ -387,15 +528,21 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
   await subDialog.locator('input[name="width"]').fill(String(spec.cargo.widthCm || 50));
   await subDialog.locator('input[name="height"]').fill(String(spec.cargo.heightCm || 50));
 
+  console.log(`[${name}] [Cargo:Pickup] Saving item manifest...`);
   await subDialog.getByRole('button', { name: /simpan item manifest/i }).click();
   await page.waitForTimeout(1500);
 
   const mDialog = page.locator('[role="dialog"]:not([style*="display: none"])').last();
+  console.log(`[${name}] [Cargo:Packaging] Proceeding to packaging selection...`);
   await mDialog.getByRole('button', { name: /selanjutnya/i }).click();
   await page.waitForTimeout(1500);
 
-  const packSelect = mDialog.locator('.ant-select').filter({ hasText: /pilih tipe kemasan/i }).first();
-  await packSelect.click();
+  const packSelect = mDialog.locator('.ant-select').filter({ hasText: /kemasan/i }).first();
+  if (await packSelect.count() > 0) {
+    await packSelect.click();
+  } else {
+    await mDialog.locator('.ant-select').first().click();
+  }
   await page.waitForTimeout(500);
   await page.locator('.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option')
     .filter({ hasText: new RegExp(spec.cargo.packagingType || 'Kardus XL', 'i') }).first().click();
@@ -405,14 +552,19 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
   await mDialog.locator('input[name="width"]').fill(String(spec.cargo.widthCm || 50));
   await mDialog.locator('input[name="height"]').fill(String(spec.cargo.heightCm || 50));
 
+  console.log(`[${name}] [Cargo:Packaging] Saving packaging...`);
   await mDialog.getByRole('button', { name: /simpan kemasan/i }).click();
   await page.waitForTimeout(1500);
 
+  console.log(`[${name}] [Cargo:Pickup] Confirming manifest goods...`);
   await page.getByRole('button', { name: /iya, simpan manifest barang/i }).click();
   await page.waitForTimeout(2000);
 
-  // Link Dropoff Muatan
-  const dropMuatanBtn = page.locator('button.manifest-dropoff-title');
+  // 4b. Scoped Dropoff Manifest Button
+  console.log(`[${name}] [Cargo:Dropoff] Linking Drop-off Cargo Manifest (+ Tambah Informasi Muatan)...`);
+  const dropMuatanBtn = page.locator('button.manifest-dropoff-title')
+    .or(page.locator('.box-shadow-mod').filter({ hasText: /^Drop\s*Off/i }).locator('button:has-text("Tambah Informasi Muatan")'))
+    .first();
   if (await dropMuatanBtn.count() > 0 && !await dropMuatanBtn.isDisabled()) {
     await dropMuatanBtn.click();
     await page.waitForTimeout(1500);
@@ -426,49 +578,22 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
     if (await simpanDrop.isVisible()) {
       await simpanDrop.click();
       await page.waitForTimeout(1500);
+      console.log(`[${name}] [Cargo:Dropoff] Drop-off manifest items linked successfully.`);
     }
+  } else {
+    console.log(`[${name}] [Cargo:Dropoff] Drop-off manifest button not present or already completed.`);
   }
 
   await page.getByRole('button', { name: /simpan informasi muatan/i }).click();
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(2000);
 
   // 5. Step 3: Service Catalog Discovery & Selection
-  console.log(`[${name}] Checking available Service Catalogs...`);
-  const step3Body = await page.locator('body').innerText();
-
-  // Check if inquiry prompt appears (meaning no catalog)
-  if (step3Body.includes('Ajukan Inquiry Layanan') || step3Body.includes('Hubungi Kami')) {
-    throw new Error(`No applicable Service Catalog found for domestic route ${spec.pickup.city} -> ${spec.dropoff.city}. Stopped per policy (no inquiry fallback).`);
-  }
-
-  const catalogPref = spec.serviceCatalogPreference && spec.serviceCatalogPreference !== 'auto'
-    ? spec.serviceCatalogPreference
-    : 'FUSO BOX';
-
-  const catalogCard = page.locator(`.ant-card:has-text("${catalogPref}"), div:has-text("${catalogPref}")`).first();
-  if (await catalogCard.isVisible().catch(() => false)) {
-    await catalogCard.click();
-    result.serviceCatalog = catalogPref;
-  } else {
-    // Select first available service card
-    const anyCard = page.locator('.ant-card-hoverable, .ant-card:has-text("LTL"), .ant-card:has-text("FTL")').first();
-    if (await anyCard.isVisible().catch(() => false)) {
-      await anyCard.click();
-      result.serviceCatalog = (await anyCard.innerText()).split('\n')[0];
-    }
-  }
-
-  await page.waitForTimeout(800);
-  const simpanLayananBtn = page.getByRole('button', { name: /simpan pilihan layanan/i });
-  if (!await simpanLayananBtn.isEnabled()) {
-    throw new Error(`Service Catalog selection could not be confirmed for ${spec.pickup.city} -> ${spec.dropoff.city}.`);
-  }
-  await simpanLayananBtn.click();
-  await page.waitForTimeout(3500);
+  await handleServiceCatalogStep3(page, spec, name, result);
 
   // 6. Step 4: Summary & Confirm Shipment
   console.log(`[${name}] Confirming Shipment...`);
-  const simpanShipmentBtn = page.getByRole('button', { name: /simpan shipment/i }).first();
+  const simpanShipmentBtn = page.getByRole('button', { name: /simpan shipment/i }).first()
+    .or(page.locator('button:has-text("Simpan Shipment")')).first();
   await simpanShipmentBtn.click();
   await page.waitForTimeout(1500);
 
@@ -535,9 +660,7 @@ async function executeInternationalOrderUI(page, spec, options = {}) {
   };
 
   const name = options.transactionLabel || 'International Order';
-  console.log(`[${name}] Navigating to /international-shipping...`);
-  await page.goto('https://sr-pos-oms-web.nisims.web.id/international-shipping', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(3000);
+  await navigateToShippingPage(page, 'international', options);
 
   const btn = page.locator('button.shipment-title');
   await btn.waitFor({ state: 'visible', timeout: 30000 });
@@ -652,7 +775,11 @@ async function executeInternationalOrderUI(page, spec, options = {}) {
   const hsSelect = page.locator('.ant-select').filter({ hasText: /pilih kode hs/i }).first();
   await selectAntOption(page, hsSelect, spec.cargo.hsCode || '85359010', null);
 
-  await page.getByRole('button', { name: /^simpan$/i }).click();
+  const kemasanDialog = page.locator('[role="dialog"]:not([style*="display: none"])').last();
+  const simpanKemasanBtn = kemasanDialog.getByRole('button', { name: /^simpan$/i })
+    .or(page.getByRole('button', { name: /^simpan$/i }))
+    .first();
+  await simpanKemasanBtn.click();
   await page.waitForTimeout(1500);
 
   // Submit Step 1
@@ -661,7 +788,7 @@ async function executeInternationalOrderUI(page, spec, options = {}) {
 
   // Inspect Step 2: Service Catalog
   const step2Text = await page.locator('body').innerText();
-  if (step2Text.includes('Ajukan Inquiry Layanan') || step2Text.includes('Hubungi Kami') || step2Text.includes('Harga terbaik sedang kami sesuaikan')) {
+  if (step2Text.includes('Ajukan Inquiry Layanan') || step2Text.includes('Harga terbaik sedang kami sesuaikan')) {
     throw new Error(`No applicable Service Catalog exists on staging OMS for International route ${spec.pickup.city} -> ${spec.dropoff.city}. Stopped per policy (no inquiry fallback).`);
   }
 
@@ -699,32 +826,36 @@ async function executeOrder(inputSpecification = {}, options = {}) {
     throw new Error(`Order specification cannot be executed. Missing mandatory fields: ${missingMandatory.join(', ')}`);
   }
 
-  const headless = options.headless !== undefined ? options.headless : true;
+  const headless = options.headless === true;
   const sessionPath = options.sessionPath || DEFAULT_SESSION_PATH;
-
-  if (!fs.existsSync(sessionPath)) {
-    throw new Error(`Authenticated session file not found at ${sessionPath}. Please run interactive login.`);
-  }
+  console.log(`[OrderExecutor] Executing ${resolvedSpec.orderType} order (Browser Mode: ${headless ? 'Headless (background)' : 'Headed (visible browser)'})`);
 
   let browser = options.existingBrowser;
   let context = options.existingContext;
   let ownsBrowser = false;
 
+  if (!browser && !context) {
+    browser = await chromium.launch({ headless, slowMo: headless ? 0 : 100 });
+    ownsBrowser = true;
+  }
+
   if (!context) {
-    if (!browser) {
-      browser = await chromium.launch({ headless, slowMo: headless ? 0 : 100 });
-      ownsBrowser = true;
-    }
     context = await browser.newContext({
-      storageState: sessionPath,
       viewport: { width: 1440, height: 950 },
     });
   }
 
-  const page = await context.newPage();
+  const page = options.existingPage || await context.newPage();
   let result = null;
 
   try {
+    if (!options.skipLogin) {
+      await performFreshLogin(page, context, {
+        ...options,
+        sessionPath,
+      });
+    }
+
     if (resolvedSpec.orderType === 'international') {
       result = await executeInternationalOrderUI(page, resolvedSpec, options);
     } else {
@@ -738,6 +869,7 @@ async function executeOrder(inputSpecification = {}, options = {}) {
     savePreviousSpecification(resolvedSpec);
 
   } catch (err) {
+    await captureScreenshot(page, 'order_exec_failure').catch(() => null);
     result = {
       success: false,
       orderId: null,
@@ -760,5 +892,7 @@ module.exports = {
   executeOrder,
   executeDomesticOrderUI,
   executeInternationalOrderUI,
+  handleServiceCatalogStep3,
   formatSpecificationReview,
+  selectAntLocationOption,
 };

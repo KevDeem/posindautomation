@@ -154,9 +154,9 @@ function resolveSpecification(inputSpec = {}, options = {}) {
 
   const isTypeChanged = prev.orderType && prev.orderType !== resolved.orderType;
 
-  // Temporary global policy: always Non-Contract
+  // Global policy: Always Non-Contract. User input or previous specifications cannot override.
   resolved.orderMode = 'non-contract';
-  sources.orderMode = inputSpec.orderMode ? 'provided' : 'policy_enforced';
+  sources.orderMode = 'policy_enforced';
 
   // 1b. Service Type (e.g., Cargo, Express)
   if (inputSpec.serviceType) {
@@ -440,7 +440,7 @@ function formatSpecificationReview(resolvedSpec, sources) {
     '| Field | Resolved Value | Origin Status |',
     '| :--- | :--- | :--- |',
     `| **Order Type** | ${resolvedSpec.orderType} | ${badge(sources.orderType)} |`,
-    `| **Order Mode** | ${resolvedSpec.orderMode.toUpperCase()} (Policy: Non-Contract Only) | ${badge(sources.orderMode)} |`,
+    `| **Order Mode** | NON-CONTRACT (Policy Enforced) | ${badge(sources.orderMode)} |`,
     `| **Transportation Mode** | ${resolvedSpec.transportationMode} ${resolvedSpec.serviceType ? `(${resolvedSpec.serviceType})` : ''} | ${badge(sources.transportationMode)} |`,
     `| **Pickup Date & Time** | ${resolvedSpec.scheduledDate} ${resolvedSpec.scheduledTime} | ${badge(sources.scheduledDate)} |`,
     `| **Pickup Point** | ${[resolvedSpec.pickup.district, resolvedSpec.pickup.city, resolvedSpec.pickup.province, resolvedSpec.pickup.country].filter(Boolean).join(', ')} (${resolvedSpec.pickup.postalCode || '-'}) | ${badge(sources.pickup.city)} |`,

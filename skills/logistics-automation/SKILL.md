@@ -26,7 +26,7 @@ Natural Language Instruction
   - Policy enforcement: Non-Contract Only
          │
          ▼
-[Specification Review & User Confirmation]
+[Specification Review & Optional Modification] (No submission confirmation prompt)
          │
          ├─────────────────────────────────────────┐
          ▼                                         ▼
@@ -67,13 +67,23 @@ Natural Language Instruction
    - Extracts dynamic order amount from the UI.
    - Executes payment exclusively through the Payment Sandbox web UI.
    - Verifies updated status directly in OMS.
-5. **Non-Contract Ordering Policy (Temporary Global Policy)**:
-   - Always select **Order Without Contract / Non-Contract**.
-   - Never search, select, or input contracts.
-   - If no applicable Service Catalog exists, halts immediately without redirecting to Inquiry.
-6. **Headed Visual Execution by Default**:
-   - Setup, inspection, and manual review default to headed Chromium.
-   - Headless execution is opt-in upon request (`run it headless`).
+5. **Non-Contract Ordering Policy & Service Catalog Resolution**:
+   - Always select **Order Without Contract / Non-Contract**; review displays `NON-CONTRACT (Policy Enforced)`.
+   - Never search, select, or input contracts. Contract selection is completely removed from CLI prompts.
+   - **Step 3 Service Catalog Detection**:
+     - State A (Available): Detects selectable service cards (`PENGIRIMAN TERBAIK`, delivery date, estimated price `Rp`, transport `LTL/FTL`, vehicle `FUSO BOX`), extracts and logs visible card text, selects the card, clicks `Simpan Pilihan Layanan`, and verifies workflow advances to Step 4 (`Ringkasan Pengiriman`).
+     - State B (Explicit Unavailable): Detects explicit notice `Maaf, layanan belum tersedia` and halts with non-retryable `CATALOG_NOT_FOUND`. Never clicks `Ajukan Quotation Layanan`.
+     - State C (Ambiguous UI): Reports `[UI Detection Error]` instead of falsely claiming no catalog exists.
+   - If no applicable Service Catalog exists, halts immediately without redirecting to Inquiry or Quotation.
+6. **Browser Mode Selection**:
+   - Interactive sessions prompt user to select Headed (visible browser) or Headless (background).
+   - Defaults to Headed if Enter or 1 is chosen.
+   - Selected mode is passed consistently to Browser Manager, Order Executor, Batch Executor, and Payment Executor.
+7. **Mandatory Fresh Login & Session Lifecycle (`auth_manager.js`)**:
+   - Performs a clean UI login on every execution run; avoids stale session or cookie interference.
+   - Verifies absence of login error messages and presence of authenticated user session before proceeding.
+   - Emits structured diagnostic logs and captures failure screenshots (`.artifacts/screenshots/`).
+   - Batch executions authenticate once at the beginning, share the active session, and abort safely on session loss.
 
 ---
 ## Tools & Directory Structure
@@ -96,7 +106,8 @@ skills/logistics-automation/
 │   ├── oms-international-order-ui.md       # International UI structure reference
 │   └── order-specification-template.md     # Natural language order specification guide
 └── tools/
-    ├── batch_executor.js                   # Generic batch executor (sequential, retries)
+    ├── auth_manager.js                     # Fresh OMS UI login, session verification & screenshot capture
+    ├── batch_executor.js                   # Generic batch executor (single batch auth, retries)
     ├── browser_manager.js                  # Playwright lifecycle (headed default)
     ├── inspect_ui.js                       # Non-destructive UI inspector
     ├── manage_environments.py              # Environment onboarding CLI tool
