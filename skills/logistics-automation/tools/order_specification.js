@@ -81,10 +81,10 @@ const DEFAULT_SPECIFICATION = {
 /**
  * Load the last saved order specification.
  */
-function loadPreviousSpecification() {
+function loadPreviousSpecification(filepath = PREV_SPEC_FILE) {
   try {
-    if (fs.existsSync(PREV_SPEC_FILE)) {
-      const data = JSON.parse(fs.readFileSync(PREV_SPEC_FILE, 'utf-8'));
+    if (fs.existsSync(filepath)) {
+      const data = JSON.parse(fs.readFileSync(filepath, 'utf-8'));
       return data;
     }
   } catch (err) {
@@ -97,21 +97,23 @@ function loadPreviousSpecification() {
  * Save an order specification as the new remembered baseline.
  * Transactional identifiers (order IDs, VAs) are explicitly excluded.
  */
-function savePreviousSpecification(spec) {
+function savePreviousSpecification(spec, filepath = PREV_SPEC_FILE) {
   try {
-    if (!fs.existsSync(SESSIONS_DIR)) {
-      fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+    const targetDir = path.dirname(filepath);
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true });
     }
     // Clean out transaction-specific state
     const cleanSpec = JSON.parse(JSON.stringify(spec));
     delete cleanSpec.orderId;
     delete cleanSpec.shipmentId;
     delete cleanSpec.vaNumber;
+    delete cleanSpec.amount;
     delete cleanSpec.metadata;
     delete cleanSpec._sources;
     
-    fs.writeFileSync(PREV_SPEC_FILE, JSON.stringify(cleanSpec, null, 2), 'utf-8');
-    console.log('[OrderSpec] Previous specification baseline updated at:', PREV_SPEC_FILE);
+    fs.writeFileSync(filepath, JSON.stringify(cleanSpec, null, 2), 'utf-8');
+    console.log('[OrderSpec] Previous specification baseline updated at:', filepath);
   } catch (err) {
     console.error('[OrderSpec] Failed to save previous specification:', err.message);
   }
@@ -125,16 +127,19 @@ function savePreviousSpecification(spec) {
  * - Explicitly supplied fields always take precedence (tagged 'provided').
  * - Missing fields check previous specification (tagged 'reused').
  * - Pickup changes do NOT affect Drop-off, and vice versa.
+ * - When orderType changes (e.g. domestic <-> international), incompatible route specifics are not blindly reused.
+ * - When a city/location changes, lower-level child fields (district/subdistrict/postalCode) are not blindly preserved if incompatible.
  * - If PIC generation is requested or missing without previous profile, generate (tagged 'generated').
  * 
  * @param {Object} inputSpec Partial or full specification
  * @param {Object} options
  * @param {boolean} [options.generatePickupPic=false]
  * @param {boolean} [options.generateDropoffPic=false]
+ * @param {Object} [options.previousSpec=null] Optional explicit previous specification object
  * @returns {Object} { resolvedSpec, sources, missingMandatory }
  */
 function resolveSpecification(inputSpec = {}, options = {}) {
-  const prev = loadPreviousSpecification();
+  const prev = options.previousSpec || loadPreviousSpecification();
   const sources = {};
   const resolved = {};
 
@@ -147,6 +152,8 @@ function resolveSpecification(inputSpec = {}, options = {}) {
     sources.orderType = 'reused';
   }
 
+  const isTypeChanged = prev.orderType && prev.orderType !== resolved.orderType;
+
   // Temporary global policy: always Non-Contract
   resolved.orderMode = 'non-contract';
   sources.orderMode = inputSpec.orderMode ? 'provided' : 'policy_enforced';
@@ -155,11 +162,11 @@ function resolveSpecification(inputSpec = {}, options = {}) {
   if (inputSpec.serviceType) {
     resolved.serviceType = inputSpec.serviceType;
     sources.serviceType = 'provided';
-  } else if (prev.serviceType) {
+  } else if (prev.serviceType && !isTypeChanged) {
     resolved.serviceType = prev.serviceType;
     sources.serviceType = 'reused';
   } else {
-    resolved.serviceType = 'Cargo';
+    resolved.serviceType = resolved.orderType === 'international' ? 'Cargo' : 'LTL';
     sources.serviceType = 'ui_default';
   }
 
@@ -167,7 +174,7 @@ function resolveSpecification(inputSpec = {}, options = {}) {
   if (inputSpec.incoterm) {
     resolved.incoterm = inputSpec.incoterm;
     sources.incoterm = 'provided';
-  } else if (prev.incoterm) {
+  } else if (prev.incoterm && resolved.orderType === 'international' && !isTypeChanged) {
     resolved.incoterm = prev.incoterm;
     sources.incoterm = 'reused';
   } else if (resolved.orderType === 'international') {
@@ -179,6 +186,9 @@ function resolveSpecification(inputSpec = {}, options = {}) {
   if (inputSpec.transportationMode) {
     resolved.transportationMode = inputSpec.transportationMode;
     sources.transportationMode = 'provided';
+  } else if (isTypeChanged && resolved.orderType === 'international') {
+    resolved.transportationMode = 'Air';
+    sources.transportationMode = 'ui_default';
   } else {
     resolved.transportationMode = prev.transportationMode || 'SEMUA';
     sources.transportationMode = 'reused';
@@ -205,19 +215,36 @@ function resolveSpecification(inputSpec = {}, options = {}) {
   resolved.pickup = {};
   sources.pickup = {};
   const inputPickup = inputSpec.pickup || {};
-  const prevPickup = prev.pickup || {};
+  const prevPickup = (!isTypeChanged && prev.pickup) ? prev.pickup : {};
+
+  // Check if pickup city or province was changed
+  const isPickupLocationChanged = Boolean(
+    (inputPickup.city && prevPickup.city && inputPickup.city !== prevPickup.city) ||
+    (inputPickup.province && prevPickup.province && inputPickup.province !== prevPickup.province) ||
+    (inputPickup.country && prevPickup.country && inputPickup.country !== prevPickup.country)
+  );
 
   const pickupKeys = ['country', 'locationType', 'province', 'city', 'district', 'subdistrict', 'address', 'postalCode'];
   for (const k of pickupKeys) {
     if (inputPickup[k] !== undefined && inputPickup[k] !== null && String(inputPickup[k]).trim() !== '') {
       resolved.pickup[k] = inputPickup[k];
       sources.pickup[k] = 'provided';
+    } else if (isPickupLocationChanged && ['district', 'subdistrict', 'postalCode'].includes(k)) {
+      // Incompatible child fields should not be blindly preserved from previous different city
+      resolved.pickup[k] = '';
+      sources.pickup[k] = 'reset_on_location_change';
     } else if (prevPickup[k] !== undefined) {
       resolved.pickup[k] = prevPickup[k];
       sources.pickup[k] = 'reused';
     } else {
       sources.pickup[k] = 'missing';
     }
+  }
+
+  // Default locationType
+  if (!resolved.pickup.locationType) {
+    resolved.pickup.locationType = 'Door';
+    sources.pickup.locationType = 'ui_default';
   }
 
   // 5. Pickup PIC (Independent from drop-off PIC)
@@ -241,7 +268,6 @@ function resolveSpecification(inputSpec = {}, options = {}) {
         resolved.pickup.pic[k] = prevPickupPic[k];
         sources.pickup.pic[k] = 'reused';
       } else {
-        // Fallback: generate realistic synthetic contact
         const gen = generateRealisticPIC({ type: 'pickup', city: resolved.pickup.city });
         resolved.pickup.pic[k] = gen[k];
         sources.pickup.pic[k] = 'generated';
@@ -253,19 +279,34 @@ function resolveSpecification(inputSpec = {}, options = {}) {
   resolved.dropoff = {};
   sources.dropoff = {};
   const inputDropoff = inputSpec.dropoff || {};
-  const prevDropoff = prev.dropoff || {};
+  const prevDropoff = (!isTypeChanged && prev.dropoff) ? prev.dropoff : {};
+
+  // Check if dropoff city or province was changed
+  const isDropoffLocationChanged = Boolean(
+    (inputDropoff.city && prevDropoff.city && inputDropoff.city !== prevDropoff.city) ||
+    (inputDropoff.province && prevDropoff.province && inputDropoff.province !== prevDropoff.province) ||
+    (inputDropoff.country && prevDropoff.country && inputDropoff.country !== prevDropoff.country)
+  );
 
   const dropoffKeys = ['country', 'locationType', 'province', 'city', 'district', 'subdistrict', 'address', 'postalCode'];
   for (const k of dropoffKeys) {
     if (inputDropoff[k] !== undefined && inputDropoff[k] !== null && String(inputDropoff[k]).trim() !== '') {
       resolved.dropoff[k] = inputDropoff[k];
       sources.dropoff[k] = 'provided';
+    } else if (isDropoffLocationChanged && ['district', 'subdistrict', 'postalCode'].includes(k)) {
+      resolved.dropoff[k] = '';
+      sources.dropoff[k] = 'reset_on_location_change';
     } else if (prevDropoff[k] !== undefined) {
       resolved.dropoff[k] = prevDropoff[k];
       sources.dropoff[k] = 'reused';
     } else {
       sources.dropoff[k] = 'missing';
     }
+  }
+
+  if (!resolved.dropoff.locationType) {
+    resolved.dropoff.locationType = 'Door';
+    sources.dropoff.locationType = 'ui_default';
   }
 
   // 7. Dropoff PIC (Independent from pickup PIC)
@@ -289,7 +330,6 @@ function resolveSpecification(inputSpec = {}, options = {}) {
         resolved.dropoff.pic[k] = prevDropoffPic[k];
         sources.dropoff.pic[k] = 'reused';
       } else {
-        // Fallback: generate realistic synthetic contact
         const gen = generateRealisticPIC({ type: 'dropoff', city: resolved.dropoff.city });
         resolved.dropoff.pic[k] = gen[k];
         sources.dropoff.pic[k] = 'generated';
@@ -305,7 +345,7 @@ function resolveSpecification(inputSpec = {}, options = {}) {
 
   const cargoKeys = [
     'characteristics', 'commodity', 'itemName', 'weightKg',
-    'quantity', 'quantityUnit', 'lengthCm', 'widthCm', 'heightCm', 'packagingType'
+    'quantity', 'quantityUnit', 'lengthCm', 'widthCm', 'heightCm', 'packagingType', 'hsCode'
   ];
 
   for (const k of cargoKeys) {
@@ -358,6 +398,8 @@ function formatSpecificationReview(resolvedSpec, sources) {
       case 'reused': return '[Reused]';
       case 'generated': return '[Generated Synthetic]';
       case 'ui_default': return '[UI Default]';
+      case 'policy_enforced': return '[Policy Enforced]';
+      case 'reset_on_location_change': return '[Reset - Location Changed]';
       case 'missing': return '**[MISSING]**';
       default: return `[${src}]`;
     }
@@ -373,11 +415,11 @@ function formatSpecificationReview(resolvedSpec, sources) {
     `| **Transportation Mode** | ${resolvedSpec.transportationMode} ${resolvedSpec.serviceType ? `(${resolvedSpec.serviceType})` : ''} | ${badge(sources.transportationMode)} |`,
     `| **Pickup Date & Time** | ${resolvedSpec.scheduledDate} ${resolvedSpec.scheduledTime} | ${badge(sources.scheduledDate)} |`,
     `| **Pickup Point** | ${[resolvedSpec.pickup.district, resolvedSpec.pickup.city, resolvedSpec.pickup.province, resolvedSpec.pickup.country].filter(Boolean).join(', ')} (${resolvedSpec.pickup.postalCode || '-'}) | ${badge(sources.pickup.city)} |`,
-    `| **Pickup Address** | ${resolvedSpec.pickup.address} | ${badge(sources.pickup.address)} |`,
+    `| **Pickup Address** | ${resolvedSpec.pickup.address || '-'} | ${badge(sources.pickup.address)} |`,
     `| **Pickup PIC** | ${resolvedSpec.pickup.pic.name} (${resolvedSpec.pickup.pic.company}) | ${badge(sources.pickup.pic.name)} |`,
     `| **Pickup Contact** | ${resolvedSpec.pickup.pic.phone} / ${resolvedSpec.pickup.pic.email} | ${badge(sources.pickup.pic.phone)} |`,
     `| **Drop-off Point** | ${[resolvedSpec.dropoff.district, resolvedSpec.dropoff.city, resolvedSpec.dropoff.province, resolvedSpec.dropoff.country].filter(Boolean).join(', ')} (${resolvedSpec.dropoff.postalCode || '-'}) | ${badge(sources.dropoff.city)} |`,
-    `| **Drop-off Address** | ${resolvedSpec.dropoff.address} | ${badge(sources.dropoff.address)} |`,
+    `| **Drop-off Address** | ${resolvedSpec.dropoff.address || '-'} | ${badge(sources.dropoff.address)} |`,
     `| **Drop-off PIC** | ${resolvedSpec.dropoff.pic.name} (${resolvedSpec.dropoff.pic.company}) | ${badge(sources.dropoff.pic.name)} |`,
     `| **Drop-off Contact** | ${resolvedSpec.dropoff.pic.phone} / ${resolvedSpec.dropoff.pic.email} | ${badge(sources.dropoff.pic.phone)} |`,
     resolvedSpec.incoterm ? `| **Incoterm** | ${resolvedSpec.incoterm} | ${badge(sources.incoterm)} |` : null,
@@ -388,7 +430,7 @@ function formatSpecificationReview(resolvedSpec, sources) {
     ''
   ].filter(Boolean);
 
-  return lines.join('\n');
+  return lines.join(String.fromCharCode(10));
 }
 
 module.exports = {
@@ -399,3 +441,4 @@ module.exports = {
   DEFAULT_SPECIFICATION,
   PREV_SPEC_FILE,
 };
+

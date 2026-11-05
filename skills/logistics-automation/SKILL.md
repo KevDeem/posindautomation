@@ -9,133 +9,133 @@ description: 'Reusable skill for automated logistics operations in POSIND enviro
 
 The Logistics Automation skill coordinates natural language dispatch for logistics operations performed **exclusively through web browser UI automation using Playwright**.
 
-**No API endpoints or API-based submissions are used for any part of these workflows.** All authentication, navigation, form filling, master data selection, and transaction verification occur through the browser interface.
+**No API endpoints or direct API calls are used for transactional operations (order creation, confirmation, VA retrieval, or payment execution).** All operations occur through the browser interface.
 
 ---
+## Reusable Order Execution Architecture
 
-## Core Capabilities
-
-1. **Natural Language Request Dispatch**:
-   - Classifies intent (`order-creation`, `service-catalog-creation`, or batch variants).
-   - Extracts route parameters, schedules, cargo, and environment indicators.
-2. **Strict Environment & Account Isolation**:
-   - Validates requested target environment against `config/environments.json`.
-   - Never assumes default environment when intent is ambiguous; halts and prompts user.
-   - Resolves credentials strictly from runtime environment variables (no hardcoded secrets).
-3. **Dynamic Specification Resolution & Granular Reuse**:
-   - Manages previous order specifications in `.sessions/previous_order_spec.json`.
-   - Reuses past values on a granular, field-by-field basis without hardcoding.
-   - Independent Pickup and Drop-off locations and PICs.
-   - Generates realistic, safe Indonesian PIC contact profiles on demand (`pic_manager.js`).
-   - Displays pre-submission review tables tagging every field origin (`[Provided]`, `[Reused]`, `[Generated Synthetic]`, `[UI Default]`).
-4. **Headed Visual Execution by Default**:
-   - Both inspection and repeatable execution default to **headed Chromium** with human-observable slowMo pacing.
-   - Headless execution is strictly opt-in upon explicit user request.
-5. **Playwright UI Execution & Verification**:
-   - Interacts with web forms, inputs, dropdowns, date pickers, modals, and submission controls.
-   - Uses accessible and semantic locators (`getByRole`, `getByLabel`, `getByPlaceholder`).
-   - Reuses authenticated browser sessions via Playwright `storageState` when valid.
-   - Verifies created entity IDs, tracking numbers, and statuses directly from DOM elements, toasts, and data tables.
-6. **Non-Contract Ordering Policy (Temporary Global Policy)**:
-   - Always select **Order Without Contract / Non-Contract** when creating any domestic or international order.
-   - Never search, select, or input contracts, even if contracts exist.
-   - Progress directly to Service Catalog matching under the Non-Contract flow.
-   - If no applicable Service Catalog exists, halts immediately without redirecting to Inquiry.
-
----
-
-## Workflow Directory Structure
+The execution engine is fully decoupled from individual routes, dates, order quantities, or transaction identifiers:
 
 ```text
-skills/logistics-automation/
-├── SKILL.md                                 # Skill definition and dispatcher
-├── config/
-│   └── environments.template.json           # Template environment registry (UI-only)
-├── docs/
-│   ├── auth-and-credentials.md             # UI auth and session management rules
-│   └── order-specification-template.md     # Dynamic order specification guide & examples
-├── tools/
-│   ├── browser_manager.js                  # Playwright lifecycle (headed default)
-│   ├── inspect_ui.js                       # Non-destructive UI & locator inspector
-│   ├── manage_environments.py              # Environment onboarding CLI tool
-│   ├── order_specification.js              # Dynamic specification resolution engine
-│   ├── pic_manager.js                      # Synthetic realistic Indonesian PIC generator
-│   └── smoke_test.js                       # Headed & headless browser smoke test runner
-└── workflows/
-    ├── order-creation.md                   # UI Order creation specification & reuse model
-    └── service-catalog-creation.md         # UI Service catalog creation specification
+Natural Language Instruction
+         │
+         ▼
+[Specification Resolver] (order_specification.js)
+  - Granular inheritance & field origin tagging
+  - Independent PICs & location-change child resets
+  - Policy enforcement: Non-Contract Only
+         │
+         ▼
+[Specification Review & User Confirmation]
+         │
+         ├─────────────────────────────────────────┐
+         ▼                                         ▼
+[General Order Engine] (order_executor.js)    [Generic Batch Executor] (batch_executor.js)
+  - executeOrder(spec, options)                 - executeBatch(batchInput, options)
+  - Dynamic Domestic / Intl Dispatch            - Accepts array, count N, or multi-groups
+  - Real-time catalog discovery                 - Sequential execution & retry loop (from start)
+  - Halts if catalog missing (no inquiry)       - Per-order tracking & independent errors
+         │                                         │
+         └────────────────────┬────────────────────┘
+                              ▼
+                [Reusable Payment Engine] (payment_executor.js)
+                  - executeOrderPayment(page, context, orderResult)
+                  - Dedicated VA extraction from payment page (never Order/Shipment ID)
+                  - Dynamic amount extraction from UI summary (no hardcoded costs)
+                  - Playwright simulation in Payment Sandbox UI
+                  - Status verification in OMS (/my/order -> 'Dibayar')
 ```
 
 ---
+## Core Capabilities
 
-## Environment Onboarding
-
-Environments can be registered via interactive wizard or CLI flags without manually editing JSON:
-- **Interactive Wizard**: `python3 skills/logistics-automation/tools/manage_environments.py --interactive`
-- **Command-line Registration**:
-  ```bash
-  python3 skills/logistics-automation/tools/manage_environments.py --add \
-    --env-name "staging-posind-core" \
-    --app-url "https://staging-app.example.internal" \
-    --account-id "ops-admin" \
-    --login-method "standard-ui-form" \
-    --login-url "/login" \
-    --cred-var "POSIND_STAGING" \
-    --workflows "order-creation,service-catalog-creation"
-  ```
-- **List Environments**: `python3 skills/logistics-automation/tools/manage_environments.py --list`
+1. **Natural Language Request Dispatch**:
+   - Classifies intent (`single-order`, `batch-order`, `service-catalog-creation`).
+   - Resolves dynamic runtime specifications without generating new code files.
+2. **Generic Batch Execution**:
+   - `executeBatch({ specification, count: 5 })` or `executeBatch({ groups: [...] })`.
+   - Never creates transaction-specific JavaScript scripts for orders or batches.
+   - Independent error tracking and configurable retry-from-start per transaction.
+3. **Dynamic Specification Resolution & Granular Reuse**:
+   - Manages previous order specifications in `.sessions/previous_order_spec.json`.
+   - Reuses past values on a granular, field-by-field basis without hardcoding.
+   - Independent Pickup and Drop-off locations and PICs (`pic_manager.js`).
+   - Resets child location details (districts/subdistricts) when parent city changes.
+   - Displays pre-submission review tables tagging field origins (`[Provided]`, `[Reused]`, `[Generated Synthetic]`, `[UI Default]`).
+4. **Decoupled Payment Execution**:
+   - Extracts dedicated Virtual Account (VA) from the UI instructions screen.
+   - Extracts dynamic order amount from the UI.
+   - Executes payment exclusively through the Payment Sandbox web UI.
+   - Verifies updated status directly in OMS.
+5. **Non-Contract Ordering Policy (Temporary Global Policy)**:
+   - Always select **Order Without Contract / Non-Contract**.
+   - Never search, select, or input contracts.
+   - If no applicable Service Catalog exists, halts immediately without redirecting to Inquiry.
+6. **Headed Visual Execution by Default**:
+   - Setup, inspection, and manual review default to headed Chromium.
+   - Headless execution is opt-in upon request (`run it headless`).
 
 ---
+## Tools & Directory Structure
 
-## Dispatch Process Flow
+```text
+skills/logistics-automation/
+├── SKILL.md                                 # Skill definition & architecture documentation
+├── config/
+│   ├── environments.json                   # Active environment configurations
+│   └── environments.template.json          # Template environment registry
+├── docs/
+│   ├── auth-and-credentials.md             # UI auth and session management rules
+│   ├── oms-international-order-ui.md       # International UI structure reference
+│   └── order-specification-template.md     # Natural language order specification guide
+└── tools/
+    ├── batch_executor.js                   # Generic batch executor (sequential, retries)
+    ├── browser_manager.js                  # Playwright lifecycle (headed default)
+    ├── inspect_ui.js                       # Non-destructive UI inspector
+    ├── manage_environments.py              # Environment onboarding CLI tool
+    ├── order_executor.js                   # General order execution engine (Domestic & Intl)
+    ├── order_specification.js              # Dynamic specification resolution engine
+    ├── payment_executor.js                 # Decoupled payment & sandbox UI engine
+    ├── pic_manager.js                      # Synthetic realistic Indonesian PIC generator
+    ├── smoke_test.js                       # Playwright infrastructure smoke test
+    ├── test_engine.js                      # Reusable engine & batch verification test suite
+    └── test_specification.js               # Specification inheritance unit tests
+```
 
-### 1. Intent Classification
-Analyze the user request to determine the target workflow:
+---
+## Natural Language Dispatch Examples
 
-| User Request Pattern | Target Workflow | Reference Spec |
-| :--- | :--- | :--- |
-| "Create an order from [A] to [B] on [Date]" | Order Creation | `workflows/order-creation.md` |
-| "Create [N] orders using [routes/schedules]" | Batch Order Creation | `workflows/order-creation.md` |
-| "Create a service catalog from [A] to [B]" | Service Catalog Creation | `workflows/service-catalog-creation.md` |
-
-### 2. Environment Selection & Verification
-1. Identify target environment mentioned in user prompt or session context.
-2. If omitted or ambiguous:
-   - Halt execution.
-   - Ask user to select target environment and account from the available registry.
-3. Validate that the chosen environment supports the target workflow in its `supportedWorkflows` list.
-4. Resolve UI login credentials from designated environment variable references.
-5. If credentials are missing in the local environment, report the missing environment variable name without proceeding.
-
-### 3. Parameter Validation & Clarification
-1. Match extracted entities against mandatory workflow fields:
-   - **Order Creation**: Origin, Destination, Scheduled Date, Package Details.
-   - **Service Catalog**: Origin Node, Destination Node, Service Type / Transport Mode.
-2. If mandatory parameters are missing:
-   - Ask user targeted questions specifically for the missing items.
-   - Do NOT prompt for fields that have valid system defaults in the web form.
-
-### 4. Playwright UI Execution & DOM Verification
-1. Launch Playwright browser context (reusing saved session state if available).
-2. Authenticate through the browser login form if unauthenticated.
-3. Navigate to the relevant feature page via UI navigation menus.
-4. Populate form controls using robust locators:
-   - Select dropdown/combobox options for origins, destinations, and services.
-   - Interact with date picker widgets.
-   - Fill text, numeric, and textarea inputs.
-5. Submit form and verify completion directly in the UI:
-   - Wait for confirmation toast/banner or redirect to detail/table page.
-   - Extract generated ID, status, and tracking code from the DOM.
-
-### 5. Standardized Output Format
-Return execution result to user:
+### 1. Single Domestic Order
 ```markdown
-- **Operation**: [Order Creation | Service Catalog Creation]
-- **Environment**: [Environment Name]
-- **Account**: [Account ID]
-- **Status**: [SUCCESS | FAILED]
-- **Entity ID**: [Created ID extracted from UI]
-- **Tracking / Route Code**: [Code extracted from UI]
-- **Execution Method**: Browser UI (Playwright)
-- **Details**: [Summary of route, dates, and parameters]
+User: "Create a domestic order from Tebet, Jakarta Selatan to Gubeng, Surabaya on 19 November 2026 at 10:00."
+Agent:
+1. Resolves specification using `resolveSpecification()`.
+2. Displays formatted specification review table with field origins.
+3. Asks user for confirmation before submission.
+4. Calls `executeOrder(spec, { headless })`.
+5. Calls `executeOrderPayment()` to pay via Payment Sandbox UI.
+6. Reports Order ID, VA number, payment status, and verification.
+```
+
+### 2. Batch Domestic Orders (Quantity N or Multiple Groups)
+```markdown
+User: "Create 5 domestic orders from Tebet to Gubeng at 08:00, and 6 orders from Kesambi to Adiwerna at 10:00 on 1 Dec 2026. Run it headless."
+Agent:
+1. Constructs runtime specification groups (Group A count 5, Group B count 6).
+2. Displays consolidated review table for the batch.
+3. Obtains confirmation before submitting real transactions.
+4. Calls `executeBatch({ groups: [...] }, { headless: true, autoPay: true, maxRetries: 2 })`.
+5. Does NOT generate any new script.
+6. Reports breakdown of succeeded and failed orders with independent IDs and VAs.
+```
+
+### 3. Partial Update with Previous Value Reuse
+```markdown
+User: "Create another domestic order, but change drop-off to Bandung and generate a new drop-off PIC. Keep everything else."
+Agent:
+1. Reuses pickup, cargo, and schedule from `.sessions/previous_order_spec.json`.
+2. Updates dropoff city to Bandung and resets child district fields.
+3. Synthesizes a new PIC profile via `pic_manager.js`.
+4. Shows review table tagging reused vs generated fields.
+5. Executes order upon confirmation.
 ```

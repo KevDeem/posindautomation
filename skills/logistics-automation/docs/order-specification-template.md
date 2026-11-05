@@ -119,3 +119,13 @@ Before any order is finalized in the UI, the automation presents a complete reso
 > *"Run this order headlessly."*
 
 - **Result**: Playwright runs in headless mode. (Default is headed mode so you can watch execution).
+
+### Example E: Batch Orders (Quantity N)
+> *"Create 5 domestic orders from Tebet to Gubeng at 08:00 on 1 Dec 2026. Run it headless."*
+
+- **Result**: Generates 5 independent runtime order specifications. Submits each sequentially through the general order engine, executes payment via sandbox UI for each order, and reports individual Order IDs, VAs, and statuses. Zero transaction-specific scripts generated.
+
+### Example F: Multi-Group Batch Orders
+> *"Create 5 domestic orders from Tebet to Gubeng at 08:00, and 6 orders from Kesambi to Adiwerna at 10:00 on 1 Dec 2026. Pay them separately and retry failed orders up to twice."*
+
+- **Result**: Normalizes into 11 batch transactions across 2 route groups. Executes sequentially with independent retry tracking per transaction.

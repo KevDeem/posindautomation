@@ -30,9 +30,9 @@ function runTests() {
   console.log('  -> Generated Sample Pickup PIC:', pic1.name, `(${pic1.company})`, pic1.email, pic1.phone);
   console.log('  [PASS] Realistic PIC generation verified.');
 
-  // 2. Test Baseline Resolution
+  // 2. Test Baseline Resolution against clean DEFAULT_SPECIFICATION
   console.log('\n[Test 2] Testing baseline specification resolution...');
-  const res1 = resolveSpecification({});
+  const res1 = resolveSpecification({}, { previousSpec: DEFAULT_SPECIFICATION });
   assert.strictEqual(res1.resolvedSpec.pickup.city, 'Jakarta Selatan');
   assert.strictEqual(res1.sources.pickup.city, 'reused');
   assert.strictEqual(res1.missingMandatory.length, 0);
@@ -47,7 +47,7 @@ function runTests() {
       district: 'Bekasi Barat',
       address: 'Jl. Ahmad Yani No. 12',
     }
-  });
+  }, { previousSpec: DEFAULT_SPECIFICATION });
   // Pickup should be provided
   assert.strictEqual(res2.resolvedSpec.pickup.city, 'Kota Bekasi');
   assert.strictEqual(res2.sources.pickup.city, 'provided');
@@ -68,7 +68,7 @@ function runTests() {
         phone: '081234998877',
       }
     }
-  });
+  }, { previousSpec: DEFAULT_SPECIFICATION });
   assert.strictEqual(res3.resolvedSpec.dropoff.pic.name, 'Budi Santoso');
   assert.strictEqual(res3.sources.dropoff.pic.name, 'provided');
   assert.strictEqual(res3.sources.dropoff.pic.phone, 'provided');
@@ -82,7 +82,7 @@ function runTests() {
 
   // 5. Test Dynamic PIC Generation request
   console.log('\n[Test 5] Testing synthetic PIC generation request...');
-  const res4 = resolveSpecification({}, { generatePickupPic: true, generateDropoffPic: true });
+  const res4 = resolveSpecification({}, { generatePickupPic: true, generateDropoffPic: true, previousSpec: DEFAULT_SPECIFICATION });
   assert.strictEqual(res4.sources.pickup.pic.name, 'generated');
   assert.strictEqual(res4.sources.dropoff.pic.name, 'generated');
   assert(res4.resolvedSpec.pickup.pic.name !== 'Kevin', 'Generated name should differ from static default');
