@@ -278,7 +278,7 @@ async function executeBatch(batchInput, options = {}) {
               orderRecord.error = null;
             } else {
               orderRecord.success = false;
-              orderRecord.overallStatus = 'FAILED';
+              orderRecord.overallStatus = 'ORDER_CREATED_PAYMENT_PENDING';
               orderRecord.error = payResult.error || `Payment incomplete: ${payResult.paymentStatus}`;
               console.warn(`[BatchExecutor] Payment simulation did not verify SUCCESS for Order ${orderRecord.orderId}: ${payResult.paymentStatus}`);
             }

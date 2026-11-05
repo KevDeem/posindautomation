@@ -238,31 +238,23 @@ async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', aut
   console.log('              TRANSACTION EXECUTION REPORT            ');
   console.log('======================================================');
   const o = batchResult.orders[0] || {};
-  console.log(`Order Status:      ${o.orderStatus || (o.orderId ? 'SUCCESS' : 'FAILED')}`);
-  console.log(`Order ID:          ${o.orderId || '-'}`);
-  console.log(`Shipment ID:       ${o.shipmentId || '-'}`);
-  console.log(`Service Catalog:   ${o.serviceCatalog || '-'}`);
+  console.log(`Order ID:               ${o.orderId || '-'}`);
+  console.log(`Shipment ID:            ${o.shipmentId || '-'}`);
+  console.log(`Service Catalog:        ${o.serviceCatalog || '-'}`);
   if (isPaymentRequested) {
-    console.log('');
-    console.log(`Payment Status:    ${o.paymentStatus === 'PAYMENT_VERIFIED' ? 'VERIFIED' : (o.paymentStatus || 'FAILED')}`);
-    console.log(`Payment Method:    ${o.paymentMethod || 'POSPAY'}`);
-    console.log(`VA Number:        ${o.vaNumber || '-'}`);
-    console.log(`Payment Amount:   ${formatRupiah(o.amount)}`);
-    console.log(`Sandbox Status:    ${o.sandboxPayment || '-'}`);
-    console.log(`OMS Status:        ${o.omsStatus || '-'}`);
-    console.log('');
-    const paymentSuccess = o.orderStatus === 'SUCCESS' && o.paymentStatus === 'PAYMENT_VERIFIED' && o.overallStatus === 'SUCCESS';
-    console.log(`Overall Status:    ${paymentSuccess ? 'SUCCESS' : 'FAILED'}`);
+    console.log(`VA Number:              ${o.vaNumber || '-'}`);
+    console.log(`Payment Amount:         ${formatRupiah(o.amount)}`);
+    console.log(`Sandbox Payment Status: ${o.sandboxPayment === 'SUCCESS' ? 'Payment Successful!' : (o.sandboxPayment || 'FAILED')}`);
+    const isSuccess = o.orderStatus === 'SUCCESS' && o.vaNumber && o.sandboxPayment === 'SUCCESS' && o.overallStatus === 'SUCCESS';
+    console.log(`Overall Status:         ${isSuccess ? 'SUCCESS' : (o.orderId ? 'ORDER_CREATED_PAYMENT_PENDING' : 'FAILED')}`);
   } else {
-    console.log('');
-    console.log(`Payment Status:    ORDER_CREATED (Not Requested)`);
-    console.log('');
-    console.log(`Overall Status:    ${o.orderStatus === 'SUCCESS' ? 'SUCCESS (Order Created - Payment Not Requested)' : 'FAILED'}`);
+    console.log(`Payment Status:         ORDER_CREATED (Not Requested)`);
+    console.log(`Overall Status:         ${o.orderStatus === 'SUCCESS' ? 'SUCCESS (Order Created - Payment Not Requested)' : 'FAILED'}`);
   }
   if (o.error) {
-    console.log(`Error Blocker:     ${o.error}`);
+    console.log(`Error Blocker:          ${o.error}`);
   }
-  console.log(`Saved Record ID:   ${savedRecord.id}`);
+  console.log(`Saved Record ID:        ${savedRecord.id}`);
   console.log('======================================================\n');
 }
 
@@ -341,13 +333,15 @@ async function handleBatchOrderFlow(rl, config, { autoPay = false } = {}) {
   console.log('                 BATCH EXECUTION REPORT               ');
   console.log('======================================================');
   console.log(`Total: ${batchResult.total} | Succeeded: ${batchResult.succeeded} | Failed: ${batchResult.failed}`);
-  console.log(`Total Amount Paid: Rp${batchResult.totalAmountPaid}`);
+  console.log(`Total Amount Paid: ${formatRupiah(batchResult.totalAmountPaid)}`);
   console.log('------------------------------------------------------');
   batchResult.orders.forEach(o => {
     if (isPaymentRequested) {
-      console.log(`[#${o.index}] ${o.label}: ${o.overallStatus || (o.success ? 'SUCCESS' : 'FAILED')} | Order: ${o.orderId || '-'} | VA: ${o.vaNumber || '-'} | Payment: ${o.paymentStatus || '-'} | OMS: ${o.omsStatus || '-'}`);
+      const isSuccess = o.orderStatus === 'SUCCESS' && o.vaNumber && o.sandboxPayment === 'SUCCESS' && o.overallStatus === 'SUCCESS';
+      const statusText = isSuccess ? 'SUCCESS' : (o.orderId ? 'ORDER_CREATED_PAYMENT_PENDING' : 'FAILED');
+      console.log(`[#${o.index}] ${o.label}: ${statusText} | Order: ${o.orderId || '-'} | Shipment: ${o.shipmentId || '-'} | VA: ${o.vaNumber || '-'} | Amount: ${formatRupiah(o.amount)} | Sandbox: ${o.sandboxPayment === 'SUCCESS' ? 'Payment Successful!' : (o.sandboxPayment || 'FAILED')}`);
     } else {
-      console.log(`[#${o.index}] ${o.label}: ${o.orderStatus || (o.success ? 'SUCCESS' : 'FAILED')} | Order: ${o.orderId || '-'} | Status: ORDER_CREATED (Payment Not Requested)`);
+      console.log(`[#${o.index}] ${o.label}: ${o.orderStatus === 'SUCCESS' ? 'SUCCESS' : 'FAILED'} | Order: ${o.orderId || '-'} | Shipment: ${o.shipmentId || '-'} | Status: ORDER_CREATED (Payment Not Requested)`);
     }
   });
   console.log(`Saved Record ID: ${savedRecord.id}`);

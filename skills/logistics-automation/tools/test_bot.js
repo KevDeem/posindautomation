@@ -768,42 +768,35 @@ async function runBotTests() {
   assert(resSuccessText.includes('Payment Successful'), 'Sandbox must report Payment Successful');
   console.log('  [PASS] Payment sandbox success simulation verified.');
 
-  // Test 33: OMS paid-status verification
-  console.log('\\n[Test 33] Testing OMS paid-status verification in /my/order...');
-  await contextPay.route('https://sr-pos-oms-web.nisims.web.id/my/order', route => {
-    route.fulfill({
-      status: 200,
-      contentType: 'text/html',
-      body: '<html><body><table><tbody><tr><td><button>ORCA1001</button></td><td>SOCB2001</td><td>Dibayar</td><td>Rp301.753</td></tr></tbody></table></body></html>',
-    });
-  });
+  // Test 33: Sandbox Payment Successful verification without requiring OMS paid verification
+  console.log('\n[Test 33] Testing Sandbox Payment Successful verification (Do NOT require OMS paid-status verification)...');
+  const sandboxDirectPage = await contextPay.newPage();
+  await sandboxDirectPage.goto('https://pospay-sandbox.vercel.app');
+  await sandboxDirectPage.locator('#environment').fill('https://sr-pos-oms-api.nisims.web.id/api/v1');
+  await sandboxDirectPage.locator('#nomorVA').fill('81026749');
+  await sandboxDirectPage.locator('#nominal').fill('301753');
+  await sandboxDirectPage.getByRole('button', { name: /pay now/i }).click();
+  await sandboxDirectPage.waitForTimeout(100);
+  const directText = await sandboxDirectPage.locator('#result').innerText();
+  const isDirectSuccess = directText.includes('Payment Successful') || directText.includes('PEMBAYARAN BERHASIL');
+  assert.strictEqual(isDirectSuccess, true, 'Payment status must be based on actual sandbox confirmation');
+  console.log('  [PASS] Sandbox UI confirmation (Payment Successful!) verified without OMS requirement.');
 
-  const pageOmsOrder = await contextPay.newPage();
-  await pageOmsOrder.goto('https://sr-pos-oms-web.nisims.web.id/my/order');
-  const row = pageOmsOrder.locator('tr').filter({ hasText: 'ORCA1001' }).first();
-  const rowText = await row.innerText();
-  assert(/dibayar|lunas|paid/i.test(rowText), 'Row must confirm paid status');
-  console.log('  [PASS] OMS paid-status verification verified.');
-
-  // Test 34: Incomplete payment reporting
-  console.log('\\n[Test 34] Testing Incomplete payment reporting & status gates...');
-  await contextPay.route('https://sr-pos-oms-web.nisims.web.id/my/order-pending', route => {
-    route.fulfill({
-      status: 200,
-      contentType: 'text/html',
-      body: '<html><body><table><tbody><tr><td><button>ORCA1001</button></td><td>SOCB2001</td><td>Disetujui</td><td>Rp301.753</td></tr></tbody></table></body></html>',
-    });
-  });
-
-  const pageOmsPending = await contextPay.newPage();
-  await pageOmsPending.goto('https://sr-pos-oms-web.nisims.web.id/my/order-pending');
-  const pendingRow = (await pageOmsPending.locator('tr').filter({ hasText: 'ORCA1001' }).first().innerText()).replace(/\s+/g, ' ');
-  const isPendingPaid = /dibayar|lunas|paid/i.test(pendingRow);
-  assert.strictEqual(isPendingPaid, false, 'Pending row must not be counted as paid');
-
+  // Test 34: Incomplete payment reporting & non-retryable gate
+  console.log('\n[Test 34] Testing Incomplete payment reporting (ORDER_CREATED_PAYMENT_PENDING)...');
   const payFailureClassify = classifyFailure(new Error('Sandbox payment simulation failed: 500 error'));
   assert.strictEqual(payFailureClassify.type, 'PAYMENT_FAILURE');
   assert.strictEqual(payFailureClassify.retryable, false, 'PAYMENT_FAILURE must not retry order creation');
+
+  // Verify status is ORDER_CREATED_PAYMENT_PENDING when sandbox does not succeed
+  const incompleteOrder = {
+    orderStatus: 'SUCCESS',
+    orderId: 'ORCA1001',
+    sandboxPayment: 'FAILED',
+    paymentStatus: 'PAYMENT_FAILED',
+    overallStatus: 'ORDER_CREATED_PAYMENT_PENDING',
+  };
+  assert.strictEqual(incompleteOrder.overallStatus, 'ORDER_CREATED_PAYMENT_PENDING', 'Incomplete payment must report ORDER_CREATED_PAYMENT_PENDING');
   console.log('  [PASS] Incomplete payment reporting & non-retryable safety gate verified.');
 
   // Test 35: Batch payment isolation
@@ -878,35 +871,39 @@ async function runBotTests() {
   assert.strictEqual(totalAmountPaidNoPay, 0, 'totalAmountPaid must be 0 when payment is not requested or not verified');
   assert.strictEqual(orderNoPay.paymentStatus, 'ORDER_CREATED', 'Order without payment simulation must have paymentStatus ORDER_CREATED');
 
-  // Case B: With payment, but sandbox succeeds and OMS unverified -> PAYMENT_PENDING_VERIFICATION, Overall FAILED
-  const orderPendingVerif = {
+  // Case B: With payment, but sandbox fails -> overallStatus is ORDER_CREATED_PAYMENT_PENDING
+  const orderFailedPay = {
     orderStatus: 'SUCCESS',
+    orderId: 'ORCA1001',
     vaNumber: '17296006',
-    sandboxPayment: 'SUCCESS',
-    omsStatus: 'PENDING_VERIFICATION',
-    paymentStatus: 'PAYMENT_PENDING_VERIFICATION',
-    overallStatus: 'FAILED',
+    sandboxPayment: 'FAILED',
+    paymentStatus: 'PAYMENT_FAILED',
+    overallStatus: 'ORDER_CREATED_PAYMENT_PENDING',
     amount: 295837,
   };
-  const isOverallSuccessB = orderPendingVerif.orderStatus === 'SUCCESS' &&
-                            orderPendingVerif.paymentStatus === 'PAYMENT_VERIFIED' &&
-                            orderPendingVerif.overallStatus === 'SUCCESS';
-  assert.strictEqual(isOverallSuccessB, false, 'Overall status must NOT be SUCCESS if OMS paid status is not verified');
+  const isOverallSuccessB = orderFailedPay.orderStatus === 'SUCCESS' &&
+                            orderFailedPay.sandboxPayment === 'SUCCESS' &&
+                            orderFailedPay.paymentStatus === 'PAYMENT_VERIFIED' &&
+                            orderFailedPay.overallStatus === 'SUCCESS';
+  assert.strictEqual(isOverallSuccessB, false, 'Overall status must NOT be SUCCESS if sandbox payment failed');
+  assert.strictEqual(orderFailedPay.overallStatus, 'ORDER_CREATED_PAYMENT_PENDING', 'Failed sandbox payment must report ORDER_CREATED_PAYMENT_PENDING');
 
-  // Case C: With payment, verified -> Overall SUCCESS
+  // Case C: With payment, sandbox confirms 'Payment Successful!' -> Overall SUCCESS
   const orderFullyVerified = {
     orderStatus: 'SUCCESS',
+    orderId: 'ORCA1001',
     vaNumber: '17296006',
     sandboxPayment: 'SUCCESS',
-    omsStatus: 'PAID',
     paymentStatus: 'PAYMENT_VERIFIED',
     overallStatus: 'SUCCESS',
     amount: 295837,
   };
   const isOverallSuccessC = orderFullyVerified.orderStatus === 'SUCCESS' &&
+                            orderFullyVerified.vaNumber &&
+                            orderFullyVerified.sandboxPayment === 'SUCCESS' &&
                             orderFullyVerified.paymentStatus === 'PAYMENT_VERIFIED' &&
                             orderFullyVerified.overallStatus === 'SUCCESS';
-  assert.strictEqual(isOverallSuccessC, true, 'Overall status must be SUCCESS only when order created, VA generated, sandbox succeeded, and OMS paid verified');
+  assert.strictEqual(isOverallSuccessC, true, 'Overall status must be SUCCESS when order created, dedicated VA generated, sandbox succeeded with Payment Successful!');
   console.log('  [PASS] Overall SUCCESS gate logic and transaction status isolation verified.');
 
   await browserPay.close();

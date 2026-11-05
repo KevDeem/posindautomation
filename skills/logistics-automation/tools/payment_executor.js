@@ -143,12 +143,8 @@ async function executeOrderPayment(page, context, orderResult = {}, options = {}
       await page.waitForSelector('text=pospay, #radio-container, input[type="radio"], input#PTMI1765081604728', { state: 'visible', timeout: 25000 });
 
       // Click pospay radio or container
-      const pospayRadio = page.locator('#radio-container, input#PTMI1765081604728, input[type="radio"]').first();
-      if (await pospayRadio.isVisible().catch(() => false)) {
-        await pospayRadio.click();
-      } else {
-        await page.locator('button:has-text("pospay"), div:has-text("pospay"), text=/pospay/i').first().click();
-      }
+      const pospayRadio = page.locator('#radio-container, button:has-text("pospay"), div:has-text("pospay"), input#PTMI1765081604728, input[type="radio"], text=/pospay/i').first();
+      await pospayRadio.click();
       await page.waitForTimeout(1000);
 
       // Click "Simpan Metode Pembayaran"
@@ -168,17 +164,14 @@ async function executeOrderPayment(page, context, orderResult = {}, options = {}
     // Step C: Generate and Extract Dedicated VA
     // -------------------------------------------------------------
     console.log(`[Payment:Step C] Locating dedicated Virtual Account (VA) on payment instruction screen...`);
-    const vaSpan = page.locator('span:has-text("VA :"), div:has-text("VA :"), p:has-text("VA :")').first();
-    await vaSpan.waitFor({ state: 'visible', timeout: 25000 });
-    const vaSpanText = await vaSpan.innerText();
-    const vaMatch = vaSpanText.match(/VA\s*:\s*([0-9]+)/i);
+    const vaSpan = page.locator('text=/VA\\s*:\\s*[0-9]+/, span:has-text("VA :"), div:has-text("VA :"), p:has-text("VA :")').first();
+    await vaSpan.waitFor({ state: 'visible', timeout: 30000 });
 
-    if (vaMatch && vaMatch[1]) {
-      paymentResult.vaNumber = vaMatch[1].trim();
-    } else {
-      const paymentBodyText = await page.locator('body').innerText();
-      const bodyMatch = paymentBodyText.match(/(?:VA|Virtual Account)\s*:\s*([0-9]{6,20})/i);
-      if (bodyMatch) paymentResult.vaNumber = bodyMatch[1].trim();
+    const paymentBodyText = await page.locator('body').innerText();
+    const bodyMatch = paymentBodyText.match(/(?:VA|Virtual Account)\s*:\s*([0-9]{6,20})/i) ||
+                      (await vaSpan.innerText()).match(/VA\s*:\s*([0-9]+)/i);
+    if (bodyMatch && bodyMatch[1]) {
+      paymentResult.vaNumber = bodyMatch[1].trim();
     }
 
     if (!paymentResult.vaNumber) {
@@ -249,59 +242,26 @@ async function executeOrderPayment(page, context, orderResult = {}, options = {}
 
     if (isSandboxSuccess) {
       paymentResult.sandboxResult = 'SUCCESS';
-      paymentResult.paymentStatus = 'PAYMENT_SIMULATED';
-      console.log(`[Payment:Step D] Sandbox payment confirmed SUCCESS for VA ${paymentResult.vaNumber}`);
+      paymentResult.paymentStatus = 'PAYMENT_VERIFIED';
+      paymentResult.overallStatus = 'SUCCESS';
+      console.log(`[Payment:Step D] Sandbox payment confirmed SUCCESS ('Payment Successful!') for VA ${paymentResult.vaNumber}`);
     } else {
       console.warn(`[Payment:Step D] Sandbox payment simulation failed:`, sandboxResponseText.slice(0, 300));
       paymentResult.sandboxResult = 'FAILED';
       paymentResult.paymentStatus = 'PAYMENT_FAILED';
-      paymentResult.error = `Sandbox error: ${sandboxResponseText.slice(0, 150)}`;
+      paymentResult.overallStatus = 'ORDER_CREATED_PAYMENT_PENDING';
+      paymentResult.error = `Sandbox did not display 'Payment Successful!': ${sandboxResponseText.slice(0, 150)}`;
       await sandboxPage.close().catch(() => {});
       return paymentResult;
     }
     await sandboxPage.close().catch(() => {});
-
-    // -------------------------------------------------------------
-    // Step E: Verify Payment Completion in OMS (/my/order)
-    // -------------------------------------------------------------
-    console.log(`[Payment:Step E] Verifying order payment status in OMS /my/order...`);
-    await page.goto('https://sr-pos-oms-web.nisims.web.id/my/order', { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForTimeout(4000);
-
-    const orderRow = page.locator('tr').filter({ hasText: orderId }).first();
-    if (await orderRow.isVisible().catch(() => false)) {
-      const rowText = (await orderRow.innerText()).replace(/\s+/g, ' ').trim();
-      console.log(`[Payment:Step E] OMS Order Row text: ${rowText}`);
-
-      const isPaid = /dibayar|lunas|paid/i.test(rowText);
-      if (isPaid) {
-        paymentResult.omsPaymentStatus = 'PAID';
-        paymentResult.paymentStatus = 'PAYMENT_VERIFIED';
-        paymentResult.overallStatus = 'SUCCESS';
-        console.log(`[Payment:Step E] OMS status confirmed: PAID for Order ${orderId}`);
-      } else {
-        // Sandbox succeeded, but OMS does not yet show paid
-        paymentResult.omsPaymentStatus = 'PENDING_VERIFICATION';
-        paymentResult.paymentStatus = 'PAYMENT_PENDING_VERIFICATION';
-        paymentResult.overallStatus = 'FAILED';
-        paymentResult.error = `Sandbox payment succeeded, but OMS row status does not confirm paid (${rowText}).`;
-        console.warn(`[Payment:Step E] WARNING: ${paymentResult.error}`);
-      }
-    } else {
-      // Order row not visible on first page of /my/order
-      paymentResult.omsPaymentStatus = 'ROW_NOT_FOUND';
-      paymentResult.paymentStatus = 'PAYMENT_PENDING_VERIFICATION';
-      paymentResult.overallStatus = 'FAILED';
-      paymentResult.error = `Sandbox payment succeeded, but order row ${orderId} was not found on OMS /my/order for verification.`;
-      console.warn(`[Payment:Step E] WARNING: ${paymentResult.error}`);
-    }
 
   } catch (err) {
     console.error(`[Payment] Error executing payment for Order ${orderId}:`, err.message);
     if (!paymentResult.paymentStatus || paymentResult.paymentStatus === 'ORDER_CREATED_PAYMENT_PENDING') {
       paymentResult.paymentStatus = 'PAYMENT_FAILED';
     }
-    paymentResult.overallStatus = 'FAILED';
+    paymentResult.overallStatus = 'ORDER_CREATED_PAYMENT_PENDING';
     paymentResult.error = err.message;
   }
 
