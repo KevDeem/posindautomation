@@ -1,0 +1,86 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "environments": {
+    "staging-posind-core": {
+      "name": "staging-posind-core",
+      "description": "Primary staging environment for core logistics services.",
+      "applicationUrl": "https://staging-app.example.internal",
+      "apiUrl": "https://staging-api.example.internal",
+      "defaultAccount": "ops-admin",
+      "accounts": {
+        "ops-admin": {
+          "accountId": "ops-admin",
+          "displayName": "Operations Admin",
+          "authMethod": "bearer-token",
+          "credentialRef": {
+            "type": "env",
+            "tokenVar": "POSIND_STAGING_TOKEN",
+            "usernameVar": "POSIND_STAGING_USERNAME",
+            "passwordVar": "POSIND_STAGING_PASSWORD"
+          },
+          "roles": ["order_creator", "catalog_manager"]
+        },
+        "dispatcher-user": {
+          "accountId": "dispatcher-user",
+          "displayName": "Dispatch Staff",
+          "authMethod": "browser-session",
+          "credentialRef": {
+            "type": "env",
+            "usernameVar": "POSIND_DISPATCH_USERNAME",
+            "passwordVar": "POSIND_DISPATCH_PASSWORD"
+          },
+          "roles": ["order_creator"]
+        }
+      },
+      "supportedWorkflows": [
+        "order-creation",
+        "service-catalog-creation"
+      ],
+      "environmentSpecificConfig": {
+        "timeoutMs": 30000,
+        "defaultHeaders": {
+          "X-Client-App": "posind-automation"
+        },
+        "flags": {
+          "enableApiDirect": true,
+          "enableUiFallback": true,
+          "strictRouteValidation": true
+        }
+      }
+    },
+    "uat-posind-partner": {
+      "name": "uat-posind-partner",
+      "description": "User Acceptance Testing environment for partner logistics flows.",
+      "applicationUrl": "https://uat-app.example.internal",
+      "apiUrl": "https://uat-api.example.internal",
+      "defaultAccount": "uat-partner-admin",
+      "accounts": {
+        "uat-partner-admin": {
+          "accountId": "uat-partner-admin",
+          "displayName": "Partner Admin UAT",
+          "authMethod": "oauth2-client-credentials",
+          "credentialRef": {
+            "type": "env",
+            "clientIdVar": "POSIND_UAT_CLIENT_ID",
+            "clientSecretVar": "POSIND_UAT_CLIENT_SECRET"
+          },
+          "roles": ["order_creator", "catalog_manager"]
+        }
+      },
+      "supportedWorkflows": [
+        "order-creation"
+      ],
+      "environmentSpecificConfig": {
+        "timeoutMs": 45000,
+        "defaultHeaders": {
+          "X-Client-App": "posind-automation"
+        },
+        "flags": {
+          "enableApiDirect": true,
+          "enableUiFallback": false,
+          "strictRouteValidation": false
+        }
+      }
+    }
+  }
+}
