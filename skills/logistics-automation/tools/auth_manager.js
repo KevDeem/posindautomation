@@ -50,8 +50,8 @@ async function captureScreenshot(page, prefix = 'auth_error') {
  */
 async function performFreshLogin(page, context, options = {}) {
   const omsUrl = (options.omsUrl || 'https://sr-pos-oms-web.nisims.web.id').replace(/\/+$/, '');
-  const username = options.username || process.env.OMS_USERNAME || 'kevin.d.imas@gmail.com';
-  const password = options.password || process.env.OMS_PASSWORD || '@Admin123!';
+  const username = options.username || process.env.OMS_USERNAME || 'kev.indimas@gmail.com';
+  const password = options.password || process.env.OMS_PASSWORD || '@Admin123.';
   const sessionPath = options.sessionPath;
 
   console.log('[Authentication] Starting fresh OMS login...');

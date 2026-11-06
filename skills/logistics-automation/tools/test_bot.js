@@ -2346,6 +2346,76 @@ async function runBotTests() {
 
   await pageMockDate.close();
 
+  // Test 69: Ant Design DatePicker 'Baik' Confirmation Button Click
+  console.log('\n[Test 69] Testing DatePicker "Baik" confirmation button clicking and date commitment...');
+  const pageMockBaik = await browserPay.newPage();
+  await pageMockBaik.setContent(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/antd/5.12.5/antd.min.css">
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/dayjs/1.11.10/dayjs.min.js"></script>
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/antd/5.12.5/antd.min.js"></script>
+    </head>
+    <body>
+      <div id="root" style="padding: 40px;"></div>
+      <script>
+        const { DatePicker } = antd;
+        ReactDOM.render(React.createElement(DatePicker, {
+          showTime: true,
+          id: "pickup_date_baik",
+          locale: {
+            lang: {
+              locale: 'id_ID',
+              today: 'Hari ini',
+              now: 'Sekarang',
+              backToToday: 'Kembali ke hari ini',
+              ok: 'Baik',
+              timeSelect: 'Pilih waktu',
+              dateSelect: 'Pilih tanggal',
+              monthSelect: 'Pilih bulan',
+              yearSelect: 'Pilih tahun',
+              decadeSelect: 'Pilih dekade',
+              yearFormat: 'YYYY',
+              dateFormat: 'D/M/YYYY',
+              dayFormat: 'D',
+              dateTimeFormat: 'D/M/YYYY HH:mm:ss',
+              monthBeforeYear: false,
+              previousMonth: 'Bulan sebelumnya (PageUp)',
+              nextMonth: 'Bulan selanjutnya (PageDown)',
+              previousYear: 'Tahun lalu (Control + left)',
+              nextYear: 'Tahun selanjutnya (Control + right)',
+              previousDecade: 'Dekade lalu',
+              nextDecade: 'Dekade selanjutnya',
+              previousCentury: 'Abad lalu',
+              nextCentury: 'Abad selanjutnya'
+            },
+            timePickerLocale: {
+              placeholder: 'Pilih waktu'
+            }
+          },
+          onChange: (date, dateString) => {
+            window.__confirmedDate = dateString;
+          }
+        }), document.getElementById("root"));
+      </script>
+    </body>
+    </html>
+  `);
+
+  await pageMockBaik.waitForSelector('#pickup_date_baik', { state: 'visible', timeout: 10000 });
+
+  const resBaik = await selectAntDatePicker(pageMockBaik, '#pickup_date_baik', '2026-11-25', '10:00', 'Test 69 (Baik Confirmation)');
+  assert.strictEqual(resBaik.success, true, 'Navigation must succeed');
+  assert(resBaik.finalValue.includes('2026-11-25'), `Input value "${resBaik.finalValue}" must contain "2026-11-25"`);
+
+  const confirmedOnPage = await pageMockBaik.evaluate(() => window.__confirmedDate);
+  assert(confirmedOnPage && confirmedOnPage.includes('2026-11-25'), 'Date must be committed via onChange upon clicking "Baik"');
+  console.log('  [PASS] DatePicker "Baik" confirmation button successfully clicked and date committed.');
+  await pageMockBaik.close();
+
   await pageMockCatalog.close();
   await pageMockPic.close();
   await pageMockAuto.close();

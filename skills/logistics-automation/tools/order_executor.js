@@ -832,17 +832,62 @@ async function selectAntDatePicker(page, inputSelectorOrLocator, scheduledDate, 
       }
     }
 
-    // Click OK button if present
-    const okBtn = dropdown.locator('.ant-picker-ok button, button.ant-btn-primary').filter({ hasText: /ok|simpan|terapkan/i }).first();
-    if (await okBtn.isVisible().catch(() => false)) {
-      await okBtn.click();
+    // 8. Confirmation ("Baik" / "OK" / "Simpan" / "Terapkan")
+    // Ant Design in Indonesian locale renders the confirmation button as "Baik" inside .ant-picker-ok
+    // Without clicking this confirmation button, showTime pickers will not commit the chosen date into the input field.
+    const confirmButtonCandidates = [
+      dropdown.locator('.ant-picker-ok button'),
+      dropdown.locator('button').filter({ hasText: /^(baik|ok|simpan|terapkan|pilih|selesai)$/i }),
+      dropdown.locator('.ant-picker-footer button.ant-btn-primary, .ant-picker-ranges .ant-picker-ok button'),
+      page.locator('.ant-picker-dropdown:not(.ant-picker-dropdown-hidden) .ant-picker-ok button'),
+      page.locator('.ant-picker-dropdown:not(.ant-picker-dropdown-hidden) button').filter({ hasText: /^(baik|ok)$/i }),
+    ];
+
+    let confirmBtn = null;
+    for (const cand of confirmButtonCandidates) {
+      if (await cand.first().isVisible().catch(() => false)) {
+        confirmBtn = cand.first();
+        break;
+      }
+    }
+
+    if (confirmBtn) {
+      const btnText = (await confirmBtn.innerText().catch(() => 'Baik/OK')).trim();
+      console.log(`[${name}] [DatePicker] Confirmation button found ("${btnText}"). Clicking to confirm date...`);
+      await confirmBtn.scrollIntoViewIfNeeded().catch(() => {});
+      await confirmBtn.click({ force: true });
+
+      // Wait for dropdown to hide or input to update
+      await page.waitForTimeout(400);
+
+      // If button or dropdown still visible, retry click
+      if (await confirmBtn.isVisible().catch(() => false)) {
+        console.log(`[${name}] [DatePicker] Confirmation button ("${btnText}") still visible, re-clicking...`);
+        await confirmBtn.click({ force: true }).catch(() => {});
+        await page.waitForTimeout(300);
+      }
+    } else {
+      // Check if .ant-picker-ranges or footer exists with any primary button
+      const footerPrimary = dropdown.locator('.ant-picker-footer button, .ant-picker-ranges button').filter({ hasText: /baik|ok|simpan/i }).first();
+      if (await footerPrimary.isVisible().catch(() => false)) {
+        const btnText = (await footerPrimary.innerText().catch(() => 'Baik')).trim();
+        console.log(`[${name}] [DatePicker] Clicking footer confirmation button ("${btnText}")...`);
+        await footerPrimary.click({ force: true });
+        await page.waitForTimeout(400);
+      }
     }
 
     // Wait for dropdown to close or input value to update
     await page.waitForTimeout(300);
 
     // 9. Verify the final date in the input field
-    const finalVal = await inputLocator.inputValue().catch(() => '');
+    let finalVal = await inputLocator.inputValue().catch(() => '');
+    if (!finalVal && confirmBtn && (await confirmBtn.isVisible().catch(() => false))) {
+      console.warn(`[${name}] [DatePicker] Input value empty after confirmation click. Dispatching DOM click on confirmation button...`);
+      await confirmBtn.evaluate(b => b.click()).catch(() => {});
+      await page.waitForTimeout(400);
+      finalVal = await inputLocator.inputValue().catch(() => '');
+    }
     console.log(`[${name}] [DatePicker] Input field value after selection: "${finalVal}"`);
 
     const hasYear = finalVal.includes(targetYearStr);
