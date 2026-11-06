@@ -26,6 +26,30 @@ const { performFreshLogin } = require('./auth_manager');
 const DEFAULT_SESSION_PATH = path.resolve(__dirname, '../../../.sessions/staging-oms_kevin_d_imas_gmail_com_session.json');
 
 /**
+ * Helper to prepare batch item spec, ensuring non-user-supplied PICs
+ * are cleared so each batch item gets a fresh randomized library selection.
+ */
+function prepareBatchSpec(rawSpec) {
+  const spec = JSON.parse(JSON.stringify(rawSpec || {}));
+  if (spec._sources) {
+    if (spec.pickup && spec._sources.pickup?.pic?.name && spec._sources.pickup.pic.name !== 'provided') {
+      delete spec.pickup.pic;
+    }
+    if (spec.dropoff && spec._sources.dropoff?.pic?.name && spec._sources.dropoff.pic.name !== 'provided') {
+      delete spec.dropoff.pic;
+    }
+    if (spec.cargo && spec._sources.cargo?.itemName && spec._sources.cargo.itemName !== 'provided') {
+      delete spec.cargo.itemName;
+    }
+    if (spec.cargo && spec._sources.cargo?.weightKg && spec._sources.cargo.weightKg !== 'provided') {
+      delete spec.cargo.weightKg;
+    }
+    delete spec._sources;
+  }
+  return spec;
+}
+
+/**
  * Normalize diverse batch inputs into a uniform array of specification items.
  */
 function normalizeBatchInput(batchInput) {
@@ -35,7 +59,7 @@ function normalizeBatchInput(batchInput) {
     for (let i = 0; i < batchInput.length; i++) {
       items.push({
         label: `Order #${i + 1}`,
-        spec: batchInput[i],
+        spec: prepareBatchSpec(batchInput[i]),
       });
     }
     return items;
@@ -45,7 +69,7 @@ function normalizeBatchInput(batchInput) {
     for (let i = 0; i < batchInput.specifications.length; i++) {
       items.push({
         label: `Order #${i + 1}`,
-        spec: batchInput.specifications[i],
+        spec: prepareBatchSpec(batchInput.specifications[i]),
       });
     }
     return items;
@@ -59,7 +83,7 @@ function normalizeBatchInput(batchInput) {
       for (let i = 0; i < count; i++) {
         items.push({
           label: `${groupName} #${i + 1} (Total #${orderNum++})`,
-          spec: group.spec || group.specification || {},
+          spec: prepareBatchSpec(group.spec || group.specification || {}),
         });
       }
     }
@@ -72,7 +96,7 @@ function normalizeBatchInput(batchInput) {
     for (let i = 0; i < count; i++) {
       items.push({
         label: `Order #${i + 1} of ${count}`,
-        spec: baseSpec,
+        spec: prepareBatchSpec(baseSpec),
       });
     }
     return items;
@@ -97,7 +121,7 @@ function classifyFailure(err) {
   }
 
   // 1. Deterministic catalog failure: no service catalog exists for route
-  if (msg.includes('No applicable Service Catalog found') || msg.includes('no inquiry fallback') || msg.includes('Service Catalog selection could not be confirmed')) {
+  if (msg.includes('No applicable Service Catalog') || msg.includes('no inquiry fallback') || msg.includes('Service Catalog selection could not be confirmed') || msg.includes('No selectable Service Catalog')) {
     return {
       type: 'CATALOG_NOT_FOUND',
       retryable: false,
@@ -223,6 +247,10 @@ async function executeBatch(batchInput, options = {}) {
         error: null,
       };
 
+      // Resolve specification once for this batch item before execution/retry loop to lock generated values
+      const resolvedItem = resolveSpecification(item.spec);
+      item.spec = resolvedItem.resolvedSpec;
+
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         orderRecord.attempts = attempt;
         if (attempt > 1) {
@@ -240,7 +268,12 @@ async function executeBatch(batchInput, options = {}) {
 
           if (!createResult.success) {
             orderRecord.orderStatus = 'ORDER_FAILED';
-            throw new Error(createResult.error || 'Order creation failed');
+            if (createResult.diagnostic) {
+              orderRecord.diagnostic = createResult.diagnostic;
+            }
+            const err = new Error(createResult.error || 'Order creation failed');
+            if (createResult.diagnostic) err.diagnostic = createResult.diagnostic;
+            throw err;
           }
 
           orderRecord.orderId = createResult.orderId;
@@ -293,6 +326,9 @@ async function executeBatch(batchInput, options = {}) {
           break; // Order created, exit retry loop (never retry creation)
 
         } catch (err) {
+          if (err.diagnostic && !orderRecord.diagnostic) {
+            orderRecord.diagnostic = err.diagnostic;
+          }
           const classification = classifyFailure(err);
           console.error(`[BatchExecutor] ${orderLabel} attempt ${attempt} failed [${classification.type}]:`, err.message);
           orderRecord.error = `${classification.type}: ${err.message}`;

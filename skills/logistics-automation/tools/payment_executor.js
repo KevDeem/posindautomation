@@ -91,25 +91,42 @@ async function executeOrderPayment(page, context, orderResult = {}, options = {}
     // Step A: Order Summary & Navigation to Payment Selection
     // -------------------------------------------------------------
     console.log(`[Payment:Step A] Checking current OMS screen for Order ${orderId}...`);
-    
+
+    // Check if session redirected to login
+    if (page.url().includes('login') || await page.locator('input[type="password"]').isVisible().catch(() => false)) {
+      throw new Error(`[Payment:Step A] OMS session unauthenticated or redirected to login: ${page.url()}`);
+    }
+
     // Check if we are on the order confirmation / summary screen with "Proses Pembayaran"
     const prosesPembayaranBtn = page.getByRole('button', { name: /proses pembayaran/i })
       .or(page.locator('button:has-text("Proses Pembayaran")')).first();
 
-    if (await prosesPembayaranBtn.isVisible({ timeout: 4000 }).catch(() => false)) {
+    if (await prosesPembayaranBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
       console.log(`[Payment:Step A] Clicking 'Proses Pembayaran' for Order ${orderId}...`);
+      await page.screenshot({ path: '.artifacts/screenshots/before_proses_pembayaran.png' }).catch(() => {});
       await prosesPembayaranBtn.click();
-      await page.waitForTimeout(3000);
+      await page.waitForTimeout(4000);
+      await page.screenshot({ path: '.artifacts/screenshots/after_proses_pembayaran.png' }).catch(() => {});
+      console.log(`[Payment:Step A] URL after click: ${page.url()}`);
     }
 
     // Ensure we transition to complete-payment / payment method screen
     const currentUrl = page.url();
-    const pospayLocator = page.locator('text=pospay, #radio-container, input#PTMI1765081604728, input[type="radio"]');
+    const bodyTextStage = await page.locator('body').innerText().catch(() => '');
+    const isStage3Payment = bodyTextStage.includes('3 dari 3 tahap') ||
+                            bodyTextStage.includes('metode pembayaran') ||
+                            bodyTextStage.includes('SELESAIKAN PEMBAYARAN PESANAN') ||
+                            bodyTextStage.includes('Pembayaran');
+
+    const pospayLocator = page.locator('button#radio-container').filter({ hasText: /pospay/i })
+      .or(page.locator('#radio-container'))
+      .or(page.locator('button').filter({ hasText: /pospay/i }));
     const vaSpanLocator = page.locator('span:has-text("VA :"), div:has-text("VA :"), p:has-text("VA :")');
 
     const reachedPaymentScreen = currentUrl.includes('complete-payment') ||
-      (await pospayLocator.first().isVisible({ timeout: 2500 }).catch(() => false)) ||
-      (await vaSpanLocator.first().isVisible({ timeout: 2500 }).catch(() => false));
+      isStage3Payment ||
+      (await pospayLocator.first().isVisible({ timeout: 4000 }).catch(() => false)) ||
+      (await vaSpanLocator.first().isVisible({ timeout: 4000 }).catch(() => false));
 
     if (!reachedPaymentScreen) {
       console.log(`[Payment:Step A] Payment method screen not reached after clicking 'Proses Pembayaran'. Navigating directly to complete-payment/${orderId}...`);
@@ -120,8 +137,24 @@ async function executeOrderPayment(page, context, orderResult = {}, options = {}
       await page.waitForTimeout(3000);
     }
 
+    // Check for authentication redirect after navigation
+    if (page.url().includes('login') || await page.locator('input[type="password"]').isVisible().catch(() => false)) {
+      throw new Error(`[Payment:Step A] Navigation redirected to login for Order ${orderId}: ${page.url()}`);
+    }
+
+    // Check if order is already paid
+    const pageTextInitial = await page.locator('body').innerText().catch(() => '');
+    if (pageTextInitial.includes('PEMBAYARAN BERHASIL') || pageTextInitial.includes('Pesanan Dibayar')) {
+      console.log(`[Payment:Step A] Order ${orderId} is already paid (PEMBAYARAN BERHASIL).`);
+      paymentResult.orderStatus = 'SUCCESS';
+      paymentResult.paymentStatus = 'PAYMENT_VERIFIED';
+      paymentResult.sandboxResult = 'SUCCESS';
+      paymentResult.omsPaymentStatus = 'PAID';
+      paymentResult.overallStatus = 'SUCCESS';
+      return paymentResult;
+    }
+
     // Extract dynamic amount from the page if not already known
-    const pageTextInitial = await page.locator('body').innerText();
     const amountMatchInitial = pageTextInitial.match(/Total\s*(?:Tagihan|Biaya|Pembayaran)?\s*:?\s*Rp\s*([0-9.,]+)/i) ||
                                pageTextInitial.match(/Rp\s*([0-9]{1,3}(?:\.[0-9]{3})+)/i);
     if (amountMatchInitial && amountMatchInitial[1]) {
@@ -135,20 +168,60 @@ async function executeOrderPayment(page, context, orderResult = {}, options = {}
     console.log(`[Payment:Step B] Checking payment method selection screen...`);
 
     // Check if payment instructions (VA) are ALREADY visible (skip selection if so)
-    const existingVaSpan = page.locator('span:has-text("VA :"), div:has-text("VA :"), p:has-text("VA :")').first();
-    const hasExistingVa = await existingVaSpan.isVisible({ timeout: 2500 }).catch(() => false);
+    const checkText = await page.locator('body').innerText().catch(() => '');
+    let hasExistingVa = /VA\s*:\s*[0-9]+/i.test(checkText);
+    if (!hasExistingVa) {
+      const existingVaSpan = page.locator('span:has-text("VA :"), div:has-text("VA :"), p:has-text("VA :")').first();
+      hasExistingVa = await existingVaSpan.isVisible({ timeout: 3000 }).catch(() => false);
+    }
 
     if (!hasExistingVa) {
-      console.log(`[Payment:Step B] Selecting Pospay payment channel...`);
-      await page.waitForSelector('text=pospay, #radio-container, input[type="radio"], input#PTMI1765081604728', { state: 'visible', timeout: 25000 });
+      console.log(`[Payment:Step B] Waiting for payment method screen readiness...`);
+      // Wait for payment section heading or container
+      const paymentHeading = page.getByText(/pilih metode pembayaran/i)
+        .or(page.getByText(/selesaikan pembayaran pesanan/i))
+        .or(page.locator('#radio-container'))
+        .first();
+      await paymentHeading.waitFor({ state: 'visible', timeout: 25000 }).catch(() => {});
 
-      // Click pospay radio or container
-      const pospayRadio = page.locator('#radio-container, button:has-text("pospay"), div:has-text("pospay"), input#PTMI1765081604728, input[type="radio"], text=/pospay/i').first();
-      await pospayRadio.click();
-      await page.waitForTimeout(1000);
+      console.log(`[Payment:Step B] Locating visible Pospay payment channel container...`);
+      // From live inspection: <button id="radio-container"><input type="radio" ...> ... pospay ...</button>
+      const pospayOption = page.locator('button#radio-container').filter({ hasText: /pospay/i })
+        .or(page.getByRole('button').filter({ hasText: /pospay/i }))
+        .or(page.locator('#radio-container').filter({ hasText: /pospay/i }))
+        .or(page.locator('#radio-container'))
+        .or(page.locator('button:has-text("pospay")'))
+        .first();
 
-      // Click "Simpan Metode Pembayaran"
-      const simpanMetodeBtn = page.locator('button:has-text("Simpan Metode Pembayaran"), button[type="submit"]:has-text("Simpan Metode Pembayaran")').first();
+      try {
+        await pospayOption.waitFor({ state: 'visible', timeout: 25000 });
+      } catch (waitErr) {
+        // Capture diagnostic snapshot
+        const errPath = path.join(path.resolve(__dirname, '../../..'), `.artifacts/screenshots/pospay_locator_timeout_${orderId}.png`);
+        await page.screenshot({ path: errPath, fullPage: true }).catch(() => {});
+        const domSnippet = (await page.locator('body').innerText().catch(() => '')).slice(0, 500);
+        console.error(`[Payment:Step B] Pospay option locator timed out on ${page.url()}:\n${domSnippet}`);
+        throw new Error(`Pospay payment option not found or visible on ${page.url()}: ${waitErr.message}`);
+      }
+
+      console.log(`[Payment:Step B] Clicking Pospay payment option container...`);
+      await pospayOption.click();
+      await page.waitForTimeout(800);
+
+      // Verify Pospay selection
+      const radioInput = pospayOption.locator('input[type="radio"]').or(page.locator('input[type="radio"]')).first();
+      const isRadioChecked = await radioInput.isChecked().catch(() => false);
+      const containerClass = (await pospayOption.getAttribute('class').catch(() => '')) || '';
+      const isSelected = isRadioChecked || containerClass.includes('border-main');
+
+      if (!isSelected) {
+        console.warn(`[Payment:Step B] Pospay radio not checked after click. Clicking radio directly...`);
+        await radioInput.click({ force: true }).catch(() => {});
+        await page.waitForTimeout(500);
+      }
+
+      const simpanMetodeBtn = page.getByRole('button', { name: /simpan metode pembayaran/i })
+        .or(page.locator('button:has-text("Simpan Metode Pembayaran")')).first();
       await simpanMetodeBtn.waitFor({ state: 'visible', timeout: 15000 });
       console.log(`[Payment:Step B] Clicking 'Simpan Metode Pembayaran'...`);
       await simpanMetodeBtn.click();
@@ -164,23 +237,42 @@ async function executeOrderPayment(page, context, orderResult = {}, options = {}
     // Step C: Generate and Extract Dedicated VA
     // -------------------------------------------------------------
     console.log(`[Payment:Step C] Locating dedicated Virtual Account (VA) on payment instruction screen...`);
-    const vaSpan = page.locator('text=/VA\\s*:\\s*[0-9]+/, span:has-text("VA :"), div:has-text("VA :"), p:has-text("VA :")').first();
-    await vaSpan.waitFor({ state: 'visible', timeout: 30000 });
-
-    const paymentBodyText = await page.locator('body').innerText();
-    const bodyMatch = paymentBodyText.match(/(?:VA|Virtual Account)\s*:\s*([0-9]{6,20})/i) ||
-                      (await vaSpan.innerText()).match(/VA\s*:\s*([0-9]+)/i);
-    if (bodyMatch && bodyMatch[1]) {
-      paymentResult.vaNumber = bodyMatch[1].trim();
+    let extractedVa = null;
+    for (let poll = 0; poll < 25; poll++) {
+      const paymentBodyText = await page.locator('body').innerText().catch(() => '');
+      const bodyMatch = paymentBodyText.match(/(?:VA|Virtual Account)\s*:\s*([0-9]{6,20})/i);
+      if (bodyMatch && bodyMatch[1]) {
+        extractedVa = bodyMatch[1].trim();
+        break;
+      }
+      await page.waitForTimeout(1000);
     }
 
-    if (!paymentResult.vaNumber) {
+    if (!extractedVa) {
+      const vaSpan = page.locator('span:has-text("VA :"), div:has-text("VA :"), p:has-text("VA :")').first();
+      if (await vaSpan.isVisible({ timeout: 5000 }).catch(() => false)) {
+        const spanText = await vaSpan.innerText();
+        const m = spanText.match(/VA\s*:\s*([0-9]+)/i);
+        if (m && m[1]) extractedVa = m[1].trim();
+      }
+    }
+
+    if (extractedVa) {
+      paymentResult.vaNumber = extractedVa;
+    } else {
+      const failPath = path.join(path.resolve(__dirname, '../../..'), `.artifacts/screenshots/va_not_generated_${orderId}.png`);
+      await page.screenshot({ path: failPath, fullPage: true }).catch(() => {});
+      const domText = (await page.locator('body').innerText().catch(() => '')).slice(0, 500);
+      console.error(`[Payment:Step C] VA not found in payment instructions:\n${domText}`);
       throw new Error(`Dedicated VA Number could not be extracted from payment instructions for Order ${orderId}.`);
     }
 
     // Strict validation: Dedicated VA must NOT match Order ID or Shipment ID
     if (paymentResult.vaNumber === orderId || paymentResult.vaNumber === shipmentId) {
       throw new Error(`Forbidden: Dedicated VA matched Order/Shipment ID (${paymentResult.vaNumber}).`);
+    }
+    if (!/^[0-9]{6,20}$/.test(paymentResult.vaNumber)) {
+      throw new Error(`Invalid Dedicated VA format: '${paymentResult.vaNumber}'. Expected 6-20 numeric digits.`);
     }
 
     // Extract dynamic payment amount from payment instruction screen
@@ -205,11 +297,16 @@ async function executeOrderPayment(page, context, orderResult = {}, options = {}
 
     // -------------------------------------------------------------
     // Step D: Payment Sandbox Simulation
+    // CRITICAL SAFEGUARD: Never open sandbox before VA is verified
     // -------------------------------------------------------------
+    if (!paymentResult.vaNumber) {
+      throw new Error(`[Payment:Step D] Safeguard violation: Attempted to navigate to sandbox without verified dedicated VA.`);
+    }
+
     console.log(`[Payment:Step D] Opening Payment Sandbox UI: ${sandboxUrl}...`);
     const sandboxPage = await context.newPage();
     await sandboxPage.goto(sandboxUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await sandboxPage.waitForTimeout(2000);
+    await sandboxPage.waitForTimeout(1500);
 
     // Configure Sandbox Endpoint
     const envInput = sandboxPage.locator('#environment, input[placeholder*="https://"], input[name="endpoint"]').first();
@@ -230,9 +327,27 @@ async function executeOrderPayment(page, context, orderResult = {}, options = {}
     await sandboxPage.waitForTimeout(500);
     const payBtn = sandboxPage.getByRole('button', { name: /pay now/i });
     await payBtn.click();
-    await sandboxPage.waitForTimeout(4000);
+    console.log(`[Payment:Step D] Waiting for sandbox response (Payment Successful!)...`);
 
-    const sandboxResponseText = await sandboxPage.locator('body').innerText();
+    // Wait up to 20 seconds for "Payment Successful!" or completion of "Processing..."
+    const successLocator = sandboxPage.getByText(/payment successful/i)
+      .or(sandboxPage.getByText(/pembayaran berhasil/i))
+      .or(sandboxPage.locator('div:has-text("Payment Successful!")'))
+      .first();
+    await successLocator.waitFor({ state: 'visible', timeout: 20000 }).catch(() => {});
+
+    let sandboxResponseText = await sandboxPage.locator('body').innerText();
+    for (let poll = 0; poll < 10; poll++) {
+      if (sandboxResponseText.includes('Payment Successful') || sandboxResponseText.includes('PEMBAYARAN BERHASIL')) {
+        break;
+      }
+      if (!sandboxResponseText.includes('Processing')) {
+        break;
+      }
+      await sandboxPage.waitForTimeout(1500);
+      sandboxResponseText = await sandboxPage.locator('body').innerText();
+    }
+
     const isSandboxSuccess =
       sandboxResponseText.includes('Payment Successful') ||
       sandboxResponseText.includes('PEMBAYARAN BERHASIL') ||

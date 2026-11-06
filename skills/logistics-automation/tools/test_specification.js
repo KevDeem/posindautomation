@@ -53,7 +53,7 @@ function runTests() {
   assert.strictEqual(res2.sources.pickup.city, 'provided');
   assert.strictEqual(res2.sources.pickup.address, 'provided');
   // Drop-off must remain completely preserved from previous specification
-  assert.strictEqual(res2.resolvedSpec.dropoff.city, 'Surabaya');
+  assert.strictEqual(res2.resolvedSpec.dropoff.city, 'Kota Surabaya');
   assert.strictEqual(res2.sources.dropoff.city, 'reused');
   assert.strictEqual(res2.resolvedSpec.dropoff.pic.name, 'Aldin');
   assert.strictEqual(res2.sources.dropoff.pic.name, 'reused');
@@ -73,7 +73,7 @@ function runTests() {
   assert.strictEqual(res3.sources.dropoff.pic.name, 'provided');
   assert.strictEqual(res3.sources.dropoff.pic.phone, 'provided');
   // Dropoff city remains reused
-  assert.strictEqual(res3.resolvedSpec.dropoff.city, 'Surabaya');
+  assert.strictEqual(res3.resolvedSpec.dropoff.city, 'Kota Surabaya');
   assert.strictEqual(res3.sources.dropoff.city, 'reused');
   // Pickup PIC remains reused
   assert.strictEqual(res3.resolvedSpec.pickup.pic.name, 'Kevin');

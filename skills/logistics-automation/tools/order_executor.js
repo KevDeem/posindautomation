@@ -31,8 +31,39 @@ const {
   navigateToShippingPage,
   captureScreenshot,
 } = require('./auth_manager');
+const {
+  matchLocationOption,
+  validateAndMatchDistrict,
+  extractAdminPrefix,
+  normalizeIncoterm,
+} = require('./location_matcher');
+const {
+  getPicLibrary,
+  setPicLibrary,
+  selectRandomPIC,
+  generateRealisticPIC,
+  validatePIC,
+  normalizeCountry,
+} = require('./pic_manager');
 
 const DEFAULT_SESSION_PATH = path.resolve(__dirname, '../../../.sessions/staging-oms_kevin_d_imas_gmail_com_session.json');
+const DEFAULT_INTL_PIC_ATTACHMENT_PATH = '/Users/kevin/Downloads/WhatsApp Image 2026-05-29 at 15.30.23.jpeg';
+
+/**
+ * Resolve and verify international PIC attachment file path
+ */
+function resolveInternationalPicAttachment(customPath) {
+  const targetPath = customPath || DEFAULT_INTL_PIC_ATTACHMENT_PATH;
+  const resolved = path.isAbsolute(targetPath) ? targetPath : path.resolve(process.cwd(), targetPath);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`[OrderExecutor] International PIC attachment file not found at: "${resolved}". File verification failed before upload.`);
+  }
+  return resolved;
+}
+
+function escapeRegex(string) {
+  return String(string).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 /**
  * Normalize location search term (strip formal administrative prefixes for Ant Design search)
@@ -107,11 +138,31 @@ async function selectAntLocationOption(page, dialog, fieldId, searchTerm, matchR
 
   // 6. Select matching option
   let targetOption;
-  if (matchRegex) {
+  let selectedOptionText = null;
+
+  const available = await dropdown.locator('.ant-select-item-option').evaluateAll(els => els.map(e => e.innerText.trim()));
+  const isCityField = options.fieldType === 'city' || fieldId.includes('city');
+  const isDistrictField = options.fieldType === 'district' || fieldId.includes('district');
+
+  if (isCityField && searchTerm) {
+    const match = matchLocationOption(available, searchTerm);
+    if (match.error) {
+      throw new Error(`[Location Selection Error] City selection failed on #${fieldId}: ${match.error}`);
+    }
+    selectedOptionText = match.matchedOption;
+    targetOption = dropdown.locator('.ant-select-item-option').filter({ hasText: new RegExp(`^\\s*${escapeRegex(selectedOptionText)}\\s*$`, 'i') }).first();
+  } else if (isDistrictField && searchTerm) {
+    const parentCity = options.parentCity || '';
+    const match = validateAndMatchDistrict(available, searchTerm, parentCity);
+    if (match.error) {
+      throw new Error(`[Location Selection Error] District selection failed on #${fieldId}: ${match.error}`);
+    }
+    selectedOptionText = match.matchedDistrict;
+    targetOption = dropdown.locator('.ant-select-item-option').filter({ hasText: new RegExp(`^\\s*${escapeRegex(selectedOptionText)}\\s*$`, 'i') }).first();
+  } else if (matchRegex) {
     targetOption = dropdown.locator('.ant-select-item-option').filter({ hasText: matchRegex }).first();
     const count = await targetOption.count();
     if (count === 0) {
-      const available = await dropdown.locator('.ant-select-item-option').evaluateAll(els => els.map(e => e.innerText.trim()));
       if (options.fallbackFirst && available.length > 0) {
         console.warn(`[OrderExecutor] Exact match for ${matchRegex} not found on #${fieldId}, using first available: "${available[0]}"`);
         targetOption = dropdown.locator('.ant-select-item-option').first();
@@ -123,7 +174,9 @@ async function selectAntLocationOption(page, dialog, fieldId, searchTerm, matchR
     targetOption = dropdown.locator('.ant-select-item-option').first();
   }
 
-  const selectedOptionText = (await targetOption.innerText()).trim();
+  if (!selectedOptionText) {
+    selectedOptionText = (await targetOption.innerText()).trim();
+  }
   await targetOption.click();
   await page.waitForTimeout(500);
 
@@ -153,10 +206,21 @@ async function selectAntOption(page, containerLocator, rawText, matchRegex) {
   await dropdown.waitFor({ state: 'visible', timeout: 10000 });
 
   let option;
-  if (matchRegex) {
-    option = dropdown.locator('.ant-select-item-option').filter({ hasText: matchRegex }).first();
-  } else {
-    option = dropdown.locator('.ant-select-item-option').first();
+  const available = await dropdown.locator('.ant-select-item-option').evaluateAll(els => els.map(e => e.innerText.trim()));
+
+  if (rawText && available.length > 0) {
+    const match = matchLocationOption(available, rawText);
+    if (match.matchedOption) {
+      option = dropdown.locator('.ant-select-item-option').filter({ hasText: new RegExp(`^\\s*${escapeRegex(match.matchedOption)}\\s*$`, 'i') }).first();
+    }
+  }
+
+  if (!option || (await option.count() === 0)) {
+    if (matchRegex) {
+      option = dropdown.locator('.ant-select-item-option').filter({ hasText: matchRegex }).first();
+    } else {
+      option = dropdown.locator('.ant-select-item-option').first();
+    }
   }
 
   await option.waitFor({ state: 'visible', timeout: 10000 });
@@ -165,7 +229,803 @@ async function selectAntOption(page, containerLocator, rawText, matchRegex) {
 }
 
 /**
+ * Match an autocomplete option text against the requested locality and administrative context.
+ * 
+ * Rules:
+ * 1. Locality (e.g. "Benda") must match the option's locality part (e.g. "Benda, Kota Tangerang, Banten")
+ *    and NOT match unintended prefix substrings like "Bendahara, Kabupaten Aceh Tamiang".
+ * 2. Administrative context (e.g. "Kota Tangerang" or "Kota Tangerang, Banten") must be satisfied.
+ *    Administrative prefixes ("Kota" vs "Kabupaten") are strictly preserved.
+ */
+function matchesLocationContext(optionText, localityQuery, adminContext) {
+  if (!optionText || !localityQuery) return false;
+  const cleanOption = optionText.trim().replace(/\s+/g, ' ');
+  const cleanLocality = localityQuery.trim().replace(/\s+/g, ' ');
+
+  // Split option into comma-delimited tokens: [Locality, City/Kabupaten, Province, ...]
+  const parts = cleanOption.split(',').map(p => p.trim());
+  const firstPart = parts[0] || '';
+
+  // 1. Locality Match:
+  // Must match firstPart exactly or as a whole word boundary
+  const exactFirstPart = firstPart.toLowerCase() === cleanLocality.toLowerCase();
+  const wordBoundaryFirstPart = new RegExp(`(^|[^a-zA-Z0-9])${escapeRegex(cleanLocality)}([^a-zA-Z0-9]|$)`, 'i').test(firstPart);
+
+  if (!exactFirstPart && !wordBoundaryFirstPart) {
+    // If not matching first token, check if full option contains locality with word boundaries
+    const wordBoundaryFull = new RegExp(`(^|[^a-zA-Z0-9])${escapeRegex(cleanLocality)}([^a-zA-Z0-9]|$)`, 'i').test(cleanOption);
+    if (!wordBoundaryFull) return false;
+  }
+
+  // 2. Administrative Context Match:
+  if (adminContext && adminContext.trim()) {
+    const ctxParts = adminContext.split(',').map(p => p.trim()).filter(Boolean);
+    const remainingText = parts.length > 1 ? parts.slice(1).join(', ') : cleanOption;
+
+    for (const ctxPart of ctxParts) {
+      const adminParsed = extractAdminPrefix(ctxPart);
+      if (adminParsed.prefix) {
+        // Strict admin prefix check (e.g. "Kota Tangerang" cannot match "Kabupaten Tangerang")
+        const strictAdminRegex = new RegExp(`(^|[^a-zA-Z0-9])${escapeRegex(adminParsed.fullName)}([^a-zA-Z0-9]|$)`, 'i');
+        if (!strictAdminRegex.test(remainingText)) {
+          return false;
+        }
+      } else {
+        // Base name check with word boundary
+        const baseRegex = new RegExp(`(^|[^a-zA-Z0-9])${escapeRegex(ctxPart)}([^a-zA-Z0-9]|$)`, 'i');
+        if (!baseRegex.test(remainingText) && !remainingText.toLowerCase().includes(ctxPart.toLowerCase())) {
+          return false;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Helper to select options from Ant Design autocomplete with virtual list scrolling.
+ * Supports searching by locality/district only (e.g. "Benda" or "Bandung Wetan")
+ * and selecting the match that corresponds to parentContext (e.g. "Kota Tangerang" or "Kota Bandung").
+ * 
+ * Key guarantees:
+ * 1. Searches using only the locality name (never combined "Benda, Kota Tangerang").
+ * 2. Inspects currently rendered options.
+ * 3. Scrolls the dropdown's actual virtual list holder (.rc-virtual-list-holder).
+ * 4. Detects end of scroll and prevents infinite scrolling loops.
+ * 5. Requires complete location context match before selection (no first partial match).
+ * 6. Verifies selected location in input field.
+ * 7. If unresolved, halts and throws without silent substitution.
+ */
+async function selectAntAutocompleteOption(page, containerLocator, searchTerm, parentContext) {
+  // Normalize search query: ensure search uses ONLY the locality name
+  let localityQuery = (searchTerm || '').trim();
+  let adminContext = (parentContext || '').trim();
+
+  if (localityQuery.includes(',')) {
+    const parts = localityQuery.split(',').map(s => s.trim()).filter(Boolean);
+    localityQuery = parts[0] || '';
+    if (!adminContext && parts.length > 1) {
+      adminContext = parts.slice(1).join(', ');
+    }
+  }
+
+  await containerLocator.click();
+  await page.waitForTimeout(300);
+
+  const input = containerLocator.locator('input');
+  if (localityQuery && await input.count() > 0) {
+    await input.click();
+    await input.fill('');
+    await input.pressSequentially(localityQuery, { delay: 60 });
+    // Wait for dropdown rendering / debounce
+    await page.waitForTimeout(1000);
+  }
+
+  const dropdown = page.locator('.ant-select-dropdown:not(.ant-select-dropdown-hidden)').filter({
+    has: page.locator('.ant-select-item-option')
+  }).last();
+  await dropdown.waitFor({ state: 'visible', timeout: 10000 });
+
+  // Locate the scroll container (.rc-virtual-list-holder or [role="listbox"])
+  const holder = dropdown.locator('.rc-virtual-list-holder, [role="listbox"]').first();
+  const hasHolder = await holder.count() > 0;
+
+  let matchedOption = null;
+  let matchedText = '';
+  const maxScrollAttempts = 60;
+  let consecutiveStagnantScrolls = 0;
+
+  for (let attempt = 0; attempt < maxScrollAttempts; attempt++) {
+    // 1. Inspect all currently rendered options
+    const optionLocators = dropdown.locator('.ant-select-item-option');
+    const count = await optionLocators.count();
+
+    for (let i = 0; i < count; i++) {
+      const opt = optionLocators.nth(i);
+      const isVis = await opt.isVisible().catch(() => false);
+      if (!isVis) continue;
+
+      const text = (await opt.innerText().catch(() => '')).trim();
+      if (matchesLocationContext(text, localityQuery, adminContext)) {
+        matchedOption = opt;
+        matchedText = text;
+        break;
+      }
+    }
+
+    if (matchedOption) {
+      break;
+    }
+
+    // 2. Scroll dropdown downward if match not currently rendered
+    if (hasHolder) {
+      const scrollResult = await holder.evaluate(el => {
+        const prev = el.scrollTop;
+        const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+        if (maxScroll <= 0 || prev >= maxScroll - 2) {
+          return { reachedEnd: true, prev, newScrollTop: prev, maxScroll };
+        }
+        const step = Math.max(150, Math.floor(el.clientHeight * 0.8));
+        el.scrollTop = Math.min(maxScroll, prev + step);
+        el.dispatchEvent(new Event('scroll'));
+        return {
+          reachedEnd: el.scrollTop >= maxScroll - 2,
+          prev,
+          newScrollTop: el.scrollTop,
+          maxScroll
+        };
+      }).catch(() => null);
+
+      if (!scrollResult) {
+        await page.keyboard.press('PageDown');
+      } else {
+        if (scrollResult.prev === scrollResult.newScrollTop) {
+          consecutiveStagnantScrolls++;
+        } else {
+          consecutiveStagnantScrolls = 0;
+        }
+
+        // Check if reached end of list and scroll position is unchanged
+        if (scrollResult.reachedEnd && consecutiveStagnantScrolls >= 1) {
+          // Final inspection pass across visible items
+          const finalCount = await optionLocators.count();
+          for (let i = 0; i < finalCount; i++) {
+            const opt = optionLocators.nth(i);
+            const text = (await opt.innerText().catch(() => '')).trim();
+            if (matchesLocationContext(text, localityQuery, adminContext)) {
+              matchedOption = opt;
+              matchedText = text;
+              break;
+            }
+          }
+          break; // Reached end of scroll container
+        }
+      }
+    } else {
+      await page.keyboard.press('PageDown');
+    }
+
+    await page.waitForTimeout(200);
+  }
+
+  // 3. Halt if no exact match found; NEVER fallback to first partial match
+  if (!matchedOption) {
+    throw new Error(
+      `[OrderExecutor] Unresolved location: No autocomplete option found matching "${localityQuery}" ` +
+      `with context "${adminContext}". Reached end of dropdown options without match. ` +
+      `Stopped per policy (no silent substitution).`
+    );
+  }
+
+  // 4. Select the matched option
+  if (!await matchedOption.isVisible().catch(() => false)) {
+    await matchedOption.scrollIntoViewIfNeeded().catch(() => {});
+  }
+  await matchedOption.click();
+  await page.waitForTimeout(500);
+
+  // 5. Verify the selected location in the input field
+  const selectedDisplay = await containerLocator.evaluate(el => {
+    const item = el.querySelector('.ant-select-selection-item');
+    const input = el.querySelector('input');
+    return (item ? item.innerText : '') || (input ? input.value : '') || el.innerText || '';
+  }).catch(() => '');
+
+  console.log(`[OrderExecutor] Autocomplete selected: "${matchedText.replace(/\n/g, ' ')}" for query "${localityQuery}" (context: "${adminContext}", display: "${selectedDisplay.replace(/\n/g, ' ').trim()}")`);
+  return matchedText.trim();
+}
+
+/**
+ * Port dropdown helper for International Order UI
+ */
+async function selectAntPortOption(page, containerLocator, portSearch) {
+  await containerLocator.click();
+  await page.waitForTimeout(400);
+
+  const input = containerLocator.locator('input');
+  if (portSearch && await input.count() > 0) {
+    await input.fill(portSearch);
+    await page.waitForTimeout(800);
+  }
+
+  const dropdown = page.locator('.ant-select-dropdown:not(.ant-select-dropdown-hidden)').filter({ has: page.locator('.ant-select-item-option') }).last();
+  await dropdown.waitFor({ state: 'visible', timeout: 10000 });
+
+  const cleanSearch = portSearch.replace(/\b(?:port|airport|pelabuhan|bandara)\b/gi, '').trim();
+  const searchPattern = cleanSearch ? new RegExp(escapeRegex(cleanSearch), 'i') : null;
+
+  let target = searchPattern ? dropdown.locator('.ant-select-item-option').filter({ hasText: searchPattern }).first() : dropdown.locator('.ant-select-item-option').first();
+  if (await target.count() === 0) {
+    target = dropdown.locator('.ant-select-item-option').first();
+  }
+
+  await target.waitFor({ state: 'visible', timeout: 5000 });
+  const text = await target.innerText();
+  await target.click();
+  await page.waitForTimeout(500);
+  console.log(`[OrderExecutor] Port selected: "${text.replace(/\n/g, ' ')}"`);
+  return text.trim();
+}
+
+const DATEPICKER_MONTH_REGEXES = [
+  /^(Jan|Januari|January)$/i,
+  /^(Feb|Februari|February)$/i,
+  /^(Mar|Maret|March)$/i,
+  /^(Apr|April)$/i,
+  /^(Mei|May)$/i,
+  /^(Jun|Juni|June)$/i,
+  /^(Jul|Juli|July)$/i,
+  /^(Agt|Aug|Agustus|August)$/i,
+  /^(Sep|September)$/i,
+  /^(Okt|Oct|Oktober|October)$/i,
+  /^(Nov|November)$/i,
+  /^(Des|Dec|Desember|December)$/i,
+];
+
+/**
+ * Capture diagnostic details when Ant Design DatePicker navigation fails
+ */
+async function captureDatePickerDiagnostics(page, name, reason, targetInfo, context = {}) {
+  const ts = Date.now();
+  let screenshotPath = null;
+  try {
+    screenshotPath = await captureScreenshot(page, `datepicker_failure_${ts}`);
+  } catch (e) {}
+
+  const state = await page.evaluate(() => {
+    const dropdown = document.querySelector('.ant-picker-dropdown:not(.ant-picker-dropdown-hidden)');
+    if (!dropdown) {
+      return {
+        view: 'closed',
+        headerText: '',
+        visibleCells: [],
+        panelClasses: [],
+        domSnapshot: document.body.innerHTML.substring(0, 3000),
+      };
+    }
+
+    let view = 'unknown';
+    if (dropdown.querySelector('.ant-picker-decade-panel:not(.ant-picker-panel-hidden)')) {
+      view = 'decade';
+    } else if (dropdown.querySelector('.ant-picker-year-panel:not(.ant-picker-panel-hidden)')) {
+      view = 'year';
+    } else if (dropdown.querySelector('.ant-picker-month-panel:not(.ant-picker-panel-hidden)')) {
+      view = 'month';
+    } else if (dropdown.querySelector('.ant-picker-date-panel:not(.ant-picker-panel-hidden)') || dropdown.querySelector('.ant-picker-datetime-panel')) {
+      view = 'date';
+    }
+
+    const header = dropdown.querySelector('.ant-picker-header');
+    const headerText = header ? header.innerText.replace(/\n+/g, ' ').trim() : '';
+    const visibleCells = Array.from(dropdown.querySelectorAll('.ant-picker-cell-in-view'))
+      .map(c => ({
+        text: c.innerText.trim(),
+        title: c.getAttribute('title') || '',
+        className: c.className,
+      }));
+
+    const panelClasses = Array.from(dropdown.querySelectorAll('.ant-picker-panel, .ant-picker-panel > div'))
+      .map(el => el.className);
+
+    return {
+      view,
+      headerText,
+      visibleCells,
+      panelClasses,
+      domSnapshot: dropdown.outerHTML.substring(0, 3000),
+    };
+  }).catch(e => ({ error: `Failed to evaluate picker state: ${e.message}` }));
+
+  const diag = {
+    reason,
+    target: targetInfo,
+    currentPickerView: state.view || 'unknown',
+    headerText: state.headerText || '',
+    visibleCells: (state.visibleCells || []).map(c => c.text),
+    visibleCellDetails: state.visibleCells || [],
+    screenshotPath,
+    ...context,
+  };
+
+  console.error(`[${name}] [DIAGNOSTIC] DatePicker Navigation Failure (${reason}):\n`, JSON.stringify(diag, null, 2));
+  page._lastDiagnostic = diag;
+  return diag;
+}
+
+/**
+ * Get current view and state of the Ant Design DatePicker dropdown
+ */
+async function getAntDatePickerState(page) {
+  return await page.evaluate(() => {
+    const dropdown = document.querySelector('.ant-picker-dropdown:not(.ant-picker-dropdown-hidden)');
+    if (!dropdown) return { view: 'closed', headerText: '', cells: [], visibleCellTexts: [] };
+
+    let view = 'unknown';
+    if (dropdown.querySelector('.ant-picker-decade-panel:not(.ant-picker-panel-hidden)')) {
+      view = 'decade';
+    } else if (dropdown.querySelector('.ant-picker-year-panel:not(.ant-picker-panel-hidden)')) {
+      view = 'year';
+    } else if (dropdown.querySelector('.ant-picker-month-panel:not(.ant-picker-panel-hidden)')) {
+      view = 'month';
+    } else if (dropdown.querySelector('.ant-picker-date-panel:not(.ant-picker-panel-hidden)') || dropdown.querySelector('.ant-picker-datetime-panel')) {
+      view = 'date';
+    }
+
+    const header = dropdown.querySelector('.ant-picker-header');
+    const headerText = header ? header.innerText.replace(/\n+/g, ' ').trim() : '';
+    const cells = Array.from(dropdown.querySelectorAll('.ant-picker-cell-in-view:not(.ant-picker-cell-disabled)'))
+      .map(c => ({
+        text: c.innerText.trim(),
+        title: c.getAttribute('title') || '',
+      }));
+
+    return {
+      view,
+      headerText,
+      cells,
+      visibleCellTexts: cells.map(c => c.text),
+    };
+  });
+}
+
+/**
+ * State-Aware Ant Design DatePicker Navigation Helper
+ * 
+ * 1. Open the date picker.
+ * 2. Identify whether the current view is year, month, or date selection.
+ * 3. Select target year when year picker is displayed (handling multi-year/decade navigation).
+ * 4. Verify year selected -> wait for month picker to appear.
+ * 5. In month picker, select target month.
+ * 6. Verify month selected -> wait for date picker to appear.
+ * 7. In date picker, select target day.
+ * 8. Set time (if applicable) and confirm.
+ * 9. Verify final date in input field.
+ */
+async function selectAntDatePicker(page, inputSelectorOrLocator, scheduledDate, scheduledTime = '10:00', name = 'Order') {
+  if (!scheduledDate) {
+    throw new Error(`[${name}] Cannot navigate DatePicker: scheduledDate is undefined or empty.`);
+  }
+
+  const dateParts = scheduledDate.split('-');
+  if (dateParts.length !== 3) {
+    throw new Error(`[${name}] Invalid scheduledDate format: "${scheduledDate}". Expected YYYY-MM-DD.`);
+  }
+
+  const targetYearStr = dateParts[0];
+  const targetYearNum = parseInt(targetYearStr, 10);
+  const targetMonthNum = parseInt(dateParts[1], 10); // 1-indexed (1..12)
+  const targetMonthIdx = targetMonthNum - 1; // 0-indexed (0..11)
+  const targetMonthStr = String(targetMonthNum).padStart(2, '0');
+  const targetDayNum = parseInt(dateParts[2], 10);
+  const targetDayStr = String(targetDayNum);
+
+  const targetMonthRegex = DATEPICKER_MONTH_REGEXES[targetMonthIdx] || /^(Nov|November)$/i;
+
+  const targetInfo = {
+    targetYear: targetYearNum,
+    targetMonth: targetMonthNum,
+    targetDay: targetDayNum,
+    scheduledDate,
+    scheduledTime,
+  };
+
+  console.log(`[${name}] [DatePicker] Navigating DatePicker to ${scheduledDate} (Time: ${scheduledTime})...`);
+
+  // 1. Locate and click date input
+  const inputLocator = typeof inputSelectorOrLocator === 'string'
+    ? page.locator(inputSelectorOrLocator).first()
+    : inputSelectorOrLocator.first();
+
+  await inputLocator.waitFor({ state: 'visible', timeout: 15000 });
+  await inputLocator.scrollIntoViewIfNeeded().catch(() => {});
+  await inputLocator.click();
+
+  // Wait for dropdown
+  const dropdown = page.locator('.ant-picker-dropdown:not(.ant-picker-dropdown-hidden)').last();
+  try {
+    await dropdown.waitFor({ state: 'visible', timeout: 10000 });
+  } catch (err) {
+    await captureDatePickerDiagnostics(page, name, 'DROPDOWN_NOT_VISIBLE', targetInfo);
+    throw new Error(`DatePicker popup dropdown failed to open for input: ${err.message}`);
+  }
+
+  // Helper to wait for specific picker view
+  async function waitForPickerView(expectedView, timeoutMs = 8000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const state = await getAntDatePickerState(page);
+      if (state.view === expectedView) {
+        return state;
+      }
+      await page.waitForTimeout(150);
+    }
+    const finalState = await getAntDatePickerState(page);
+    return finalState;
+  }
+
+  try {
+    // 2. Identify initial view
+    let state = await getAntDatePickerState(page);
+    console.log(`[${name}] [DatePicker] Initial view: "${state.view}" (Header: "${state.headerText}")`);
+
+    // If initial view is date, transition to month view then year view
+    if (state.view === 'date') {
+      const monthBtn = dropdown.locator('.ant-picker-month-btn').first();
+      if (await monthBtn.isVisible().catch(() => false)) {
+        console.log(`[${name}] [DatePicker] Transitioning from date view to month view...`);
+        await monthBtn.click();
+        state = await waitForPickerView('month', 5000);
+      }
+    }
+
+    // From month view, navigate to year view
+    if (state.view === 'month') {
+      const yearBtn = dropdown.locator('.ant-picker-year-btn').first();
+      if (await yearBtn.isVisible().catch(() => false)) {
+        console.log(`[${name}] [DatePicker] Transitioning from month view to year view...`);
+        await yearBtn.click();
+        state = await waitForPickerView('year', 5000);
+      }
+    } else if (state.view === 'date') {
+      // Fallback: If monthBtn wasn't available, try year button directly from date view
+      const yearBtn = dropdown.locator('.ant-picker-year-btn').first();
+      if (await yearBtn.isVisible().catch(() => false)) {
+        console.log(`[${name}] [DatePicker] Transitioning directly to year view via year button...`);
+        await yearBtn.click();
+        state = await waitForPickerView('year', 5000);
+      }
+    }
+
+    // 3. Select Target Year when Year Picker is displayed
+    if (state.view === 'year') {
+      console.log(`[${name}] [DatePicker] Year picker active. Selecting year ${targetYearStr}...`);
+
+      // Ensure target year is within visible decade
+      let yearCell = dropdown.locator('.ant-picker-cell-in-view').filter({ hasText: new RegExp(`^${targetYearStr}$`) }).first();
+      let navAttempts = 0;
+      while (!await yearCell.isVisible().catch(() => false) && navAttempts < 15) {
+        navAttempts++;
+        const currentYears = state.visibleCellTexts.map(Number).filter(n => !isNaN(n));
+        const minYear = currentYears.length > 0 ? Math.min(...currentYears) : targetYearNum;
+        const maxYear = currentYears.length > 0 ? Math.max(...currentYears) : targetYearNum;
+
+        if (targetYearNum < minYear) {
+          const superPrev = dropdown.locator('.ant-picker-header-super-prev-btn').first();
+          await superPrev.click();
+        } else if (targetYearNum > maxYear) {
+          const superNext = dropdown.locator('.ant-picker-header-super-next-btn').first();
+          await superNext.click();
+        } else {
+          break;
+        }
+        await page.waitForTimeout(200);
+        state = await getAntDatePickerState(page);
+        yearCell = dropdown.locator('.ant-picker-cell-in-view').filter({ hasText: new RegExp(`^${targetYearStr}$`) }).first();
+      }
+
+      if (!await yearCell.isVisible().catch(() => false)) {
+        const diag = await captureDatePickerDiagnostics(page, name, 'YEAR_NOT_FOUND', targetInfo, { navAttempts });
+        const err = new Error(`Target year "${targetYearStr}" could not be found in Year Picker.`);
+        err.diagnostic = diag;
+        throw err;
+      }
+
+      await yearCell.click();
+
+      // 4. Verify year selected -> wait for month picker to appear
+      console.log(`[${name}] [DatePicker] Year ${targetYearStr} clicked. Waiting for Month picker...`);
+      // Wait until year panel is no longer active
+      await page.waitForFunction(() => {
+        const d = document.querySelector('.ant-picker-dropdown:not(.ant-picker-dropdown-hidden)');
+        return d && !d.querySelector('.ant-picker-year-panel:not(.ant-picker-panel-hidden)');
+      }, { timeout: 8000 }).catch(() => {});
+
+      state = await getAntDatePickerState(page);
+
+      // If Ant Design transitioned back to date panel instead of month panel, click month button
+      if (state.view === 'date') {
+        const monthBtn = dropdown.locator('.ant-picker-month-btn').first();
+        if (await monthBtn.isVisible().catch(() => false)) {
+          await monthBtn.click();
+          state = await waitForPickerView('month', 5000);
+        }
+      }
+
+      if (state.view !== 'month') {
+        const diag = await captureDatePickerDiagnostics(page, name, 'MONTH_PICKER_NOT_VISIBLE', targetInfo, {
+          actualViewAfterYearSelect: state.view,
+        });
+        const err = new Error(`Year ${targetYearStr} was selected, but Month picker did not appear (current view: "${state.view}").`);
+        err.diagnostic = diag;
+        throw err;
+      }
+    }
+
+    // 5. Select Target Month when Month Picker is displayed
+    if (state.view === 'month') {
+      console.log(`[${name}] [DatePicker] Month picker active. Selecting month ${targetMonthStr} (matching ${targetMonthRegex})...`);
+
+      // Match month cell by regex, title attribute, or index
+      const monthCell = dropdown.locator('.ant-picker-cell-in-view').filter({ hasText: targetMonthRegex }).first()
+        .or(dropdown.locator(`.ant-picker-cell-in-view[title*="-${targetMonthStr}"]`).first())
+        .or(dropdown.locator('.ant-picker-cell-in-view').nth(targetMonthIdx));
+
+      if (!await monthCell.isVisible().catch(() => false)) {
+        const diag = await captureDatePickerDiagnostics(page, name, 'MONTH_CELL_NOT_FOUND', targetInfo);
+        const err = new Error(`Target month "${targetMonthStr}" could not be found in Month Picker.`);
+        err.diagnostic = diag;
+        throw err;
+      }
+
+      await monthCell.click();
+
+      // 6. Verify month selected -> wait for date picker to appear
+      console.log(`[${name}] [DatePicker] Month ${targetMonthStr} clicked. Waiting for Date picker...`);
+      state = await waitForPickerView('date', 8000);
+
+      if (state.view !== 'date') {
+        const diag = await captureDatePickerDiagnostics(page, name, 'DATE_PICKER_NOT_VISIBLE', targetInfo, {
+          actualViewAfterMonthSelect: state.view,
+        });
+        const err = new Error(`Month was selected, but Date picker did not appear (current view: "${state.view}").`);
+        err.diagnostic = diag;
+        throw err;
+      }
+    }
+
+    // 7. Select Target Day when Date Picker is displayed
+    if (state.view === 'date') {
+      console.log(`[${name}] [DatePicker] Date picker active. Selecting day ${targetDayStr}...`);
+
+      const dayCell = dropdown.locator(`.ant-picker-cell-in-view:not(.ant-picker-cell-disabled)[title*="${scheduledDate}"]`).first()
+        .or(dropdown.locator('.ant-picker-cell-in-view:not(.ant-picker-cell-disabled)').filter({ hasText: new RegExp(`^${targetDayStr}$`) }).first());
+
+      if (!await dayCell.isVisible().catch(() => false)) {
+        const diag = await captureDatePickerDiagnostics(page, name, 'DAY_CELL_NOT_FOUND', targetInfo);
+        const err = new Error(`Target day "${targetDayStr}" could not be found in Date Picker for ${scheduledDate}.`);
+        err.diagnostic = diag;
+        throw err;
+      }
+
+      await dayCell.click();
+    }
+
+    // 8. Time Selection (if time panel is present)
+    const timeParts = (scheduledTime || '10:00').split(':');
+    const hourStr = timeParts[0];
+    const minStr = timeParts[1] || '00';
+
+    const hourColumn = dropdown.locator('.ant-picker-time-panel-column').first();
+    if (await hourColumn.isVisible().catch(() => false)) {
+      const hourCell = hourColumn.locator('.ant-picker-time-panel-cell').filter({ hasText: new RegExp(`^${hourStr}$`) }).first();
+      if (await hourCell.isVisible().catch(() => false)) {
+        await hourCell.click();
+      }
+    }
+
+    const minColumn = dropdown.locator('.ant-picker-time-panel-column').nth(1);
+    if (await minColumn.isVisible().catch(() => false)) {
+      const minCell = minColumn.locator('.ant-picker-time-panel-cell').filter({ hasText: new RegExp(`^${minStr}$`) }).first();
+      if (await minCell.isVisible().catch(() => false)) {
+        await minCell.click();
+      }
+    }
+
+    // Click OK button if present
+    const okBtn = dropdown.locator('.ant-picker-ok button, button.ant-btn-primary').filter({ hasText: /ok|simpan|terapkan/i }).first();
+    if (await okBtn.isVisible().catch(() => false)) {
+      await okBtn.click();
+    }
+
+    // Wait for dropdown to close or input value to update
+    await page.waitForTimeout(300);
+
+    // 9. Verify the final date in the input field
+    const finalVal = await inputLocator.inputValue().catch(() => '');
+    console.log(`[${name}] [DatePicker] Input field value after selection: "${finalVal}"`);
+
+    const hasYear = finalVal.includes(targetYearStr);
+    const hasDay = finalVal.includes(targetDayStr.padStart(2, '0')) || finalVal.includes(targetDayStr);
+    const hasMonth = finalVal.includes(targetMonthStr) || targetMonthRegex.test(finalVal);
+
+    if (!hasYear || !hasDay || !hasMonth) {
+      if (!finalVal.includes(scheduledDate)) {
+        console.warn(`[${name}] [DatePicker] Final input verification warning: "${finalVal}" may use custom format for "${scheduledDate}".`);
+      }
+    }
+
+    return {
+      success: true,
+      scheduledDate,
+      scheduledTime,
+      finalValue: finalVal,
+    };
+
+  } catch (err) {
+    if (!err.diagnostic) {
+      await captureDatePickerDiagnostics(page, name, 'NAVIGATION_EXCEPTION', targetInfo, { error: err.message });
+    }
+    throw err;
+  }
+}
+
+/**
+ * Select and verify international transportation mode and service type.
+ * Ensures the service type component finishes dynamic loading, button is interactable,
+ * selection is verified active, and no validation error ('Pilih Tipe Layanan') persists.
+ */
+async function selectInternationalServiceType(page, spec, name = 'International Order') {
+  const mode = spec.transportationMode || 'Air';
+  let requestedServiceType = spec.serviceType;
+  if (!requestedServiceType) {
+    if (/sea/i.test(mode)) {
+      requestedServiceType = 'FCL';
+    } else if (/air/i.test(mode)) {
+      requestedServiceType = 'Cargo';
+    }
+  }
+
+  console.log(`[${name}] Setting transportation mode: "${mode}"...`);
+
+  // 1. Select Transportation Mode
+  const modeContainer = page.locator('#transportation_type');
+  await modeContainer.waitFor({ state: 'visible', timeout: 20000 });
+
+  let modeRegex;
+  if (/sea/i.test(mode)) {
+    modeRegex = /\b(?:Sea Freight|Sea)\b/i;
+  } else if (/land/i.test(mode)) {
+    modeRegex = /\bLand\b/i;
+  } else {
+    modeRegex = /\bAir\b/i;
+  }
+
+  const modeItem = modeContainer.locator('.ant-segmented-item').filter({ hasText: modeRegex }).first();
+  await modeItem.waitFor({ state: 'visible', timeout: 10000 });
+  await modeItem.click();
+
+  // Verify mode selection
+  await page.waitForFunction(
+    (rgxStr) => {
+      const rgx = new RegExp(rgxStr, 'i');
+      const selected = document.querySelector('#transportation_type .ant-segmented-item-selected');
+      return selected && rgx.test(selected.innerText || '');
+    },
+    modeRegex.source,
+    { timeout: 8000 }
+  );
+  console.log(`[${name}] Transportation mode confirmed active: "${mode}".`);
+
+  // Land mode has no secondary service type
+  if (/land/i.test(mode)) {
+    return;
+  }
+
+  // 2. Wait for Service Type Component to finish dynamic loading
+  console.log(`[${name}] Waiting for service type component to load and render "${requestedServiceType}"...`);
+  const serviceContainer = page.locator('#service_type');
+
+  try {
+    await serviceContainer.waitFor({ state: 'visible', timeout: 20000 });
+    // Ensure loading skeletons/spinners inside service type detach
+    await serviceContainer.locator('.ant-skeleton, .ant-spin-spinning').waitFor({ state: 'detached', timeout: 10000 }).catch(() => {});
+  } catch (err) {
+    await captureServiceTypeDiagnostics(page, name, 'CONTAINER_TIMEOUT', requestedServiceType);
+    throw new Error(`Service type component (#service_type) failed to load for transportation mode "${mode}": ${err.message}`);
+  }
+
+  // 3. Match requested service type button
+  const sTypePattern = new RegExp(`\\b${escapeRegex(requestedServiceType)}\\b`, 'i');
+  const serviceItem = serviceContainer.locator('.ant-segmented-item').filter({ hasText: sTypePattern }).first();
+
+  try {
+    await serviceItem.waitFor({ state: 'visible', timeout: 15000 });
+  } catch (err) {
+    const available = await serviceContainer.locator('.ant-segmented-item').allInnerTexts().catch(() => []);
+    await captureServiceTypeDiagnostics(page, name, 'OPTION_UNAVAILABLE', requestedServiceType);
+    throw new Error(`Requested service type "${requestedServiceType}" is unavailable under "${mode}". Available options: [${available.join(', ')}]. Stopped per policy (no silent substitution).`);
+  }
+
+  // 4. Click and verify active selection state with retry
+  let isSelected = false;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await serviceItem.click({ force: true });
+    await page.waitForTimeout(400);
+
+    isSelected = await page.evaluate(({ requestedText }) => {
+      const items = Array.from(document.querySelectorAll('#service_type .ant-segmented-item'));
+      const rgx = new RegExp(`^${requestedText}$`, 'i');
+      const item = items.find(it => rgx.test(it.innerText.trim()));
+      if (!item) return false;
+      const isClassSelected = item.classList.contains('ant-segmented-item-selected');
+      const isInputChecked = item.querySelector('input')?.checked === true;
+      return isClassSelected || isInputChecked;
+    }, { requestedText: requestedServiceType });
+
+    if (isSelected) break;
+    console.warn(`[${name}] Service type selection retry ${attempt}/3 for "${requestedServiceType}"...`);
+    await page.waitForTimeout(500);
+  }
+
+  if (!isSelected) {
+    await captureServiceTypeDiagnostics(page, name, 'SELECTION_NOT_REGISTERED', requestedServiceType);
+    throw new Error(`Failed to activate service type "${requestedServiceType}". Selection was not registered by OMS.`);
+  }
+
+  // 5. Verify absence of validation error
+  const validationError = page.locator('.ant-form-item-explain-error, [role="alert"]')
+    .filter({ hasText: /pilih tipe layanan/i })
+    .first();
+
+  const hasValidationError = await validationError.isVisible().catch(() => false);
+  if (hasValidationError) {
+    await captureServiceTypeDiagnostics(page, name, 'VALIDATION_ERROR_PERSISTS', requestedServiceType);
+    throw new Error(`Service type "${requestedServiceType}" was clicked but validation error 'Pilih Tipe Layanan' persists.`);
+  }
+
+  console.log(`[${name}] Service type confirmed active: "${requestedServiceType}". No validation errors.`);
+}
+
+/**
+ * Capture diagnostic details when service type selection fails
+ */
+async function captureServiceTypeDiagnostics(page, name, reason, targetType) {
+  const ts = Date.now();
+  await captureScreenshot(page, `service_type_failure_${ts}`).catch(() => null);
+
+  const diag = await page.evaluate(({ target }) => {
+    const serviceCont = document.querySelector('#service_type');
+    const items = serviceCont ? Array.from(serviceCont.querySelectorAll('.ant-segmented-item')).map(it => ({
+      text: it.innerText.trim(),
+      className: it.className,
+      selected: it.classList.contains('ant-segmented-item-selected'),
+      inputChecked: it.querySelector('input')?.checked,
+      disabled: it.classList.contains('ant-segmented-item-disabled'),
+      attributes: Array.from(it.attributes).map(a => `${a.name}="${a.value}"`).join(' '),
+    })) : [];
+
+    const validationAlerts = Array.from(document.querySelectorAll('.ant-form-item-explain-error, [role="alert"], .ant-form-item-explain'))
+      .filter(el => /pilih tipe layanan/i.test(el.innerText || ''))
+      .map(el => el.innerText.trim());
+
+    return {
+      currentUrl: window.location.href,
+      targetType: target,
+      containerFound: Boolean(serviceCont),
+      containerLoading: Boolean(serviceCont && serviceCont.querySelector('.ant-skeleton, .ant-spin-spinning')),
+      containerHTML: serviceCont ? serviceCont.outerHTML.substring(0, 1000) : null,
+      segmentedItems: items,
+      validationAlerts,
+    };
+  }, { target: targetType }).catch(() => ({ error: 'Evaluation failed' }));
+
+  console.error(`[${name}] [DIAGNOSTIC] Service Type Selection Failure (${reason}):\n`, JSON.stringify(diag, null, 2));
+}
+
+/**
  * Step 3: Service Catalog Discovery & Selection
+
  * 
  * Handles State A (Selectable service cards available) and State B (Explicit unavailable notice).
  * Verifies workflow advancement to Step 4.
@@ -344,55 +1204,7 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
   await page.waitForTimeout(400);
 
   // 1. Pickup Date & Time
-  const dateParts = spec.scheduledDate.split('-'); // [YYYY, MM, DD]
-  const yearStr = dateParts[0];
-  const dayStr = String(parseInt(dateParts[2], 10));
-  const monthRegexes = [
-    /^(Jan|Januari|January)$/i,
-    /^(Feb|Februari|February)$/i,
-    /^(Mar|Maret|March)$/i,
-    /^(Apr|April)$/i,
-    /^(Mei|May)$/i,
-    /^(Jun|Juni|June)$/i,
-    /^(Jul|Juli|July)$/i,
-    /^(Agt|Aug|Agustus|August)$/i,
-    /^(Sep|September)$/i,
-    /^(Okt|Oct|Oktober|October)$/i,
-    /^(Nov|November)$/i,
-    /^(Des|Dec|Desember|December)$/i,
-  ];
-  const monthRegex = monthRegexes[parseInt(dateParts[1], 10) - 1] || /^(Des|Dec)$/i;
-
-  const timeParts = (spec.scheduledTime || '10:00').split(':');
-  const hourStr = timeParts[0];
-  const minStr = timeParts[1] || '00';
-
-  console.log(`[${name}] Setting date: ${spec.scheduledDate} ${spec.scheduledTime}...`);
-  await page.locator('#pickup_date').click();
-  await page.waitForTimeout(500);
-
-  const yearBtn = page.locator('.ant-picker-year-btn').first();
-  if (await yearBtn.isVisible()) {
-    await yearBtn.click();
-    await page.waitForTimeout(300);
-    await page.locator('.ant-picker-cell-in-view').filter({ hasText: new RegExp(`^${yearStr}$`) }).first().click();
-    await page.waitForTimeout(300);
-    await page.locator('.ant-picker-cell-in-view').filter({ hasText: monthRegex }).first().click();
-    await page.waitForTimeout(300);
-  }
-
-  await page.locator('.ant-picker-cell-in-view:not(.ant-picker-cell-disabled)').filter({ hasText: new RegExp(`^${dayStr}$`) }).first().click();
-  await page.waitForTimeout(300);
-
-  const hourCell = page.locator('.ant-picker-time-panel-column').first().locator('.ant-picker-time-panel-cell').filter({ hasText: new RegExp(`^${hourStr}$`) });
-  if (await hourCell.count() > 0) await hourCell.first().click();
-
-  const minCell = page.locator('.ant-picker-time-panel-column').nth(1).locator('.ant-picker-time-panel-cell').filter({ hasText: new RegExp(`^${minStr}$`) });
-  if (await minCell.count() > 0) await minCell.first().click();
-
-  const okBtn = page.locator('.ant-picker-ok button').first();
-  if (await okBtn.isVisible()) await okBtn.click();
-  await page.waitForTimeout(500);
+  await selectAntDatePicker(page, '#pickup_date', spec.scheduledDate, spec.scheduledTime || '10:00', name);
 
   // 2. Pickup Location Modal
   console.log(`[${name}] Filling Pickup Point...`);
@@ -407,11 +1219,11 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
 
   // City
   const cityQuery = spec.pickup.city || 'Jakarta Selatan';
-  await selectAntLocationOption(page, pDialog, 'customer_city', cityQuery, new RegExp(getSearchTerm(cityQuery), 'i'));
+  await selectAntLocationOption(page, pDialog, 'customer_city', cityQuery, new RegExp(getSearchTerm(cityQuery), 'i'), { fieldType: 'city' });
 
   // District
   const distQuery = spec.pickup.district || 'Tebet';
-  await selectAntLocationOption(page, pDialog, 'customer_district', distQuery, new RegExp(getSearchTerm(distQuery), 'i'));
+  await selectAntLocationOption(page, pDialog, 'customer_district', distQuery, new RegExp(getSearchTerm(distQuery), 'i'), { fieldType: 'district', parentCity: cityQuery });
 
   // Subdistrict
   const subQuery = spec.pickup.subdistrict || '';
@@ -445,12 +1257,12 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
   await selectAntLocationOption(page, dDialog, 'recipient_province', dProvQuery, new RegExp(getSearchTerm(dProvQuery), 'i'));
 
   // City
-  const dCityQuery = spec.dropoff.city || 'Surabaya';
-  await selectAntLocationOption(page, dDialog, 'recipient_city', dCityQuery, new RegExp(getSearchTerm(dCityQuery), 'i'));
+  const dCityQuery = spec.dropoff.city || 'Kota Surabaya';
+  await selectAntLocationOption(page, dDialog, 'recipient_city', dCityQuery, new RegExp(getSearchTerm(dCityQuery), 'i'), { fieldType: 'city' });
 
   // District
   const dDistQuery = spec.dropoff.district || 'Gubeng';
-  await selectAntLocationOption(page, dDialog, 'recipient_district', dDistQuery, new RegExp(getSearchTerm(dDistQuery), 'i'));
+  await selectAntLocationOption(page, dDialog, 'recipient_district', dDistQuery, new RegExp(getSearchTerm(dDistQuery), 'i'), { fieldType: 'district', parentCity: dCityQuery });
 
   // Subdistrict
   const dSubQuery = spec.dropoff.subdistrict || '';
@@ -670,47 +1482,94 @@ async function executeInternationalOrderUI(page, spec, options = {}) {
   await page.waitForSelector('#origin_country', { state: 'visible', timeout: 30000 });
   await page.waitForTimeout(500);
 
-  // Transportation Mode & Service Type (Air -> Cargo)
-  console.log(`[${name}] Setting transportation: Air Cargo...`);
-  const airBtn = page.locator('button:has-text("Air")').first();
-  if (await airBtn.isVisible()) {
-    await airBtn.click();
-    await page.waitForTimeout(500);
-  }
-
-  const cargoSegment = page.locator('.ant-segmented-item').filter({ hasText: /Cargo/i }).first();
-  if (await cargoSegment.isVisible()) {
-    await cargoSegment.click();
-    await page.waitForTimeout(500);
-  }
+  // Transportation Mode & Service Type Selection with Verification
+  await selectInternationalServiceType(page, spec, name);
 
   // Origin Location
-  await page.locator('label').filter({ hasText: new RegExp(`^${spec.pickup.locationType || 'Door'}$`, 'i') }).first().click();
-  await page.waitForTimeout(300);
+  const pickupType = (spec.pickup.locationType || 'Door').toLowerCase() === 'port' ? 'Port' : 'Door';
+  console.log(`[${name}] Origin location type: ${pickupType}...`);
+  const originMethod = page.locator('#origin_pickup_method label, label').filter({ hasText: new RegExp(`^${pickupType}$`, 'i') }).first();
+  if (await originMethod.isVisible()) {
+    await originMethod.click();
+    await page.waitForTimeout(400);
+  }
 
   const originCountry = page.locator('.ant-select').filter({ has: page.locator('#origin_country') }).first();
   await selectAntOption(page, originCountry, spec.pickup.country || 'Indonesia', null);
+  await page.waitForTimeout(800);
 
-  const originCity = page.locator('.ant-select').filter({ has: page.locator('#origin_city') }).first();
-  await selectAntOption(page, originCity, spec.pickup.city || 'Tangerang', null);
+  if (pickupType === 'Port') {
+    const originPort = page.locator('.ant-select').filter({ has: page.locator('#origin_port') }).first();
+    const portQuery = spec.pickup.searchQuery || spec.pickup.locality || spec.pickup.city || 'Soekarno-Hatta';
+    await selectAntPortOption(page, originPort, portQuery);
+  } else {
+    const originCity = page.locator('.ant-select').filter({ has: page.locator('#origin_city') }).first();
+    const cityQuery = spec.pickup.searchQuery || spec.pickup.locality || spec.pickup.city || 'Tangerang';
+    const parentQuery = spec.pickup.parentContext || spec.pickup.city || '';
+    await selectAntAutocompleteOption(page, originCity, cityQuery, parentQuery);
+  }
 
-  await page.locator('input[placeholder="Masukkan kode pos"]').first().fill(spec.pickup.postalCode || '15111');
+  const originPostal = page.locator('input[placeholder*="kode pos"]').first();
+  if (await originPostal.isVisible()) {
+    await originPostal.fill(spec.pickup.postalCode || '15111');
+  }
 
   // Destination Location
-  await page.locator('label').filter({ hasText: new RegExp(`^${spec.dropoff.locationType || 'Door'}$`, 'i') }).nth(1).click();
-  await page.waitForTimeout(300);
+  const dropoffType = (spec.dropoff.locationType || 'Door').toLowerCase() === 'port' ? 'Port' : 'Door';
+  console.log(`[${name}] Destination location type: ${dropoffType}...`);
+  const destMethod = page.locator('#destination_pickup_method label, label').filter({ hasText: new RegExp(`^${dropoffType}$`, 'i') }).nth(1)
+    .or(page.locator('#destination_pickup_method label').filter({ hasText: new RegExp(`^${dropoffType}$`, 'i') })).first();
+  if (await destMethod.isVisible()) {
+    await destMethod.click();
+    await page.waitForTimeout(400);
+  }
 
   const destCountry = page.locator('.ant-select').filter({ has: page.locator('#destination_country') }).first();
   await selectAntOption(page, destCountry, spec.dropoff.country || 'Singapore', null);
+  await page.waitForTimeout(800);
 
-  const destCity = page.locator('.ant-select').filter({ has: page.locator('#destination_city') }).first();
-  await selectAntOption(page, destCity, spec.dropoff.city || 'Singapore', null);
+  if (dropoffType === 'Port') {
+    const destPort = page.locator('.ant-select').filter({ has: page.locator('#destination_port') }).first();
+    const portQuery = spec.dropoff.searchQuery || spec.dropoff.locality || spec.dropoff.city || 'Haneda';
+    await selectAntPortOption(page, destPort, portQuery);
+  } else {
+    const destCity = page.locator('.ant-select').filter({ has: page.locator('#destination_city') }).first();
+    const cityQuery = spec.dropoff.searchQuery || spec.dropoff.locality || spec.dropoff.city || 'Singapore';
+    const parentQuery = spec.dropoff.parentContext || spec.dropoff.country || '';
+    await selectAntAutocompleteOption(page, destCity, cityQuery, parentQuery);
+  }
 
-  await page.locator('input[placeholder="Masukkan kode pos"]').nth(1).fill(spec.dropoff.postalCode || '238801');
+  const destPostal = page.locator('input[placeholder*="kode pos"]').nth(1);
+  if (await destPostal.isVisible()) {
+    await destPostal.fill(spec.dropoff.postalCode || '238801');
+  }
 
-  // Incoterm
-  const incotermContainer = page.locator('.ant-select').filter({ has: page.locator('#incoterm') }).first();
-  await selectAntOption(page, incotermContainer, null, new RegExp(spec.incoterm || 'Delivered Duty Paid', 'i'));
+  // Incoterm Selection
+  console.log(`[${name}] Selecting Incoterm...`);
+  const incotermInput = page.locator('#incoterm');
+  const incotermContainer = page.locator('.ant-select').filter({ has: incotermInput }).first();
+  await incotermContainer.scrollIntoViewIfNeeded();
+
+  for (let i = 0; i < 20; i++) {
+    const isLoading = await incotermContainer.evaluate(el => el.classList.contains('ant-select-loading')).catch(() => false);
+    if (!isLoading) break;
+    await page.waitForTimeout(400);
+  }
+
+  await incotermContainer.click();
+  await page.waitForTimeout(500);
+
+  const activeDropdown = page.locator('.ant-select-dropdown:not(.ant-select-dropdown-hidden)').filter({ has: page.locator('.ant-select-item-option') }).last();
+  await activeDropdown.waitFor({ state: 'visible', timeout: 10000 });
+
+  const targetIncoterm = normalizeIncoterm(spec.incoterm || 'Delivered Duty Paid');
+  const incotermOption = activeDropdown.locator('.ant-select-item-option').filter({ hasText: new RegExp(escapeRegex(targetIncoterm), 'i') }).first();
+  await incotermOption.waitFor({ state: 'visible', timeout: 5000 });
+  await incotermOption.click();
+  await page.waitForTimeout(500);
+
+  const incotermText = await incotermContainer.innerText();
+  console.log(`[${name}] Incoterm selected: "${targetIncoterm}" (display: "${incotermText.replace(/\n/g, ' ')}")`);
 
   // Karakteristik & Description
   const prodCharContainer = page.locator('.ant-select').filter({ has: page.locator('#product_characteristic') }).first();
@@ -719,42 +1578,7 @@ async function executeInternationalOrderUI(page, spec, options = {}) {
   await page.locator('#description').fill(`${spec.cargo.commodity || 'General'} - ${spec.cargo.itemName || 'Cargo Item'}`);
 
   // Pickup Date
-  const dateParts = spec.scheduledDate.split('-');
-  const yearStr = dateParts[0];
-  const dayStr = String(parseInt(dateParts[2], 10));
-  const monthRegexes = [
-    /^(Jan|Januari|January)$/i,
-    /^(Feb|Februari|February)$/i,
-    /^(Mar|Maret|March)$/i,
-    /^(Apr|April)$/i,
-    /^(Mei|May)$/i,
-    /^(Jun|Juni|June)$/i,
-    /^(Jul|Juli|July)$/i,
-    /^(Agt|Aug|Agustus|August)$/i,
-    /^(Sep|September)$/i,
-    /^(Okt|Oct|Oktober|October)$/i,
-    /^(Nov|November)$/i,
-    /^(Des|Dec|Desember|December)$/i,
-  ];
-  const monthRegex = monthRegexes[parseInt(dateParts[1], 10) - 1] || /^(Des|Dec)$/i;
-
-  await page.locator('#pickup_date').click();
-  await page.waitForTimeout(500);
-  const yearBtn = page.locator('.ant-picker-year-btn').first();
-  if (await yearBtn.isVisible()) {
-    await yearBtn.click();
-    await page.waitForTimeout(300);
-    await page.locator('.ant-picker-cell-in-view').filter({ hasText: new RegExp(`^${yearStr}$`) }).first().click();
-    await page.waitForTimeout(300);
-    await page.locator('.ant-picker-cell-in-view').filter({ hasText: monthRegex }).first().click();
-    await page.waitForTimeout(300);
-  }
-  await page.locator('.ant-picker-cell-in-view:not(.ant-picker-cell-disabled)').filter({ hasText: new RegExp(`^${dayStr}$`) }).first().click();
-  await page.waitForTimeout(400);
-
-  const okBtn = page.locator('.ant-picker-ok button').first();
-  if (await okBtn.isVisible()) await okBtn.click();
-  await page.waitForTimeout(500);
+  await selectAntDatePicker(page, '#pickup_date', spec.scheduledDate, spec.scheduledTime || '10:00', name);
 
   // Add Kemasan
   await page.getByRole('button', { name: /tambah kemasan/i }).first().click();
@@ -783,28 +1607,670 @@ async function executeInternationalOrderUI(page, spec, options = {}) {
   await page.waitForTimeout(1500);
 
   // Submit Step 1
-  await page.getByRole('button', { name: /simpan detail pengiriman/i }).click();
-  await page.waitForTimeout(5000);
+  await page.getByRole('button', { name: /simpan detail pengiriman/i }).first().click();
+  await page.waitForTimeout(1000);
 
-  // Inspect Step 2: Service Catalog
-  const step2Text = await page.locator('body').innerText();
-  if (step2Text.includes('Ajukan Inquiry Layanan') || step2Text.includes('Harga terbaik sedang kami sesuaikan')) {
-    throw new Error(`No applicable Service Catalog exists on staging OMS for International route ${spec.pickup.city} -> ${spec.dropoff.city}. Stopped per policy (no inquiry fallback).`);
+  // Step 2: Service Catalog Discovery & Selection
+  await handleInternationalServiceCatalogStep2(page, spec, name, result);
+
+  // Step 3: Informasi Shipper & Consignee (PIC insertion & attachment upload & verification)
+  await fillInternationalPicAndAttachment(page, spec, name, options);
+
+  // Advance from Step 3 to Step 4: Ringkasan Pengiriman
+  console.log(`[${name}] Submitting Shipper & Consignee details (Step 3)...`);
+  const simpanDetailShipmentBtn = page.getByRole('button', { name: /simpan detail pengiriman/i }).last()
+    .or(page.locator('button.primary-btn').filter({ hasText: /simpan detail pengiriman/i }))
+    .or(page.getByRole('button', { name: /simpan|selanjutnya/i })).first();
+
+  await simpanDetailShipmentBtn.waitFor({ state: 'visible', timeout: 10000 });
+
+  for (let i = 0; i < 20; i++) {
+    const isDisabled = await simpanDetailShipmentBtn.isDisabled().catch(() => false);
+    if (!isDisabled) break;
+    await page.waitForTimeout(300);
   }
 
-  // If service catalog cards exist, select one
-  const anyServiceCard = page.locator('.ant-card-hoverable, .ant-card:has-text("Air Cargo")').first();
-  if (await anyServiceCard.isVisible().catch(() => false)) {
-    await anyServiceCard.click();
-    result.serviceCatalog = (await anyServiceCard.innerText()).split('\n')[0];
-    await page.getByRole('button', { name: /simpan|selanjutnya/i }).first().click();
+  await simpanDetailShipmentBtn.click();
+  console.log(`[${name}] Step 3 submit clicked. Waiting for Step 4 (Ringkasan Pengiriman)...`);
+
+  // Step 4: Ringkasan Pengiriman (Summary)
+  const step4Indicator = page.locator('text=/Ringkasan Pengiriman/i')
+    .or(page.locator('.custom-steps'))
+    .or(page.locator('text=/Total Biaya|Total Tagihan|Total Price|Estimasi Tiba/i'))
+    .first();
+  await step4Indicator.waitFor({ state: 'visible', timeout: 25000 }).catch(() => {});
+
+  const summaryText = await page.locator('body').innerText().catch(() => '');
+  const priceMatch = summaryText.match(/Total\s*(?:Biaya|Tagihan|Price)?\s*:?\s*Rp\s*([0-9.,]+)/i);
+  if (priceMatch && priceMatch[1]) {
+    result.amount = parseInt(priceMatch[1].replace(/[^0-9]/g, ''), 10);
+  }
+
+  console.log(`[${name}] Confirming Step 4 Ringkasan Pengiriman...`);
+  const simpanStep4Btn = page.getByRole('button', { name: /simpan detail pengiriman|simpan shipment|simpan informasi pesanan|buat pesanan|konfirmasi/i }).first()
+    .or(page.locator('button.primary-btn').filter({ hasNotText: /kembali/i })).first();
+  if (await simpanStep4Btn.isVisible().catch(() => false)) {
+    await simpanStep4Btn.click();
     await page.waitForTimeout(3000);
-  } else {
-    throw new Error(`No selectable Service Catalog cards found for International route ${spec.pickup.city} -> ${spec.dropoff.city}.`);
   }
 
-  result.status = 'CATALOG_SELECTED';
+  const confirmModalBtn = page.getByRole('button', { name: /iya|ya,\s*simpan|konfirmasi/i }).first();
+  if (await confirmModalBtn.isVisible().catch(() => false)) {
+    await confirmModalBtn.click();
+    await page.waitForTimeout(3000);
+  }
+
+  console.log(`[${name}] Extracting Order ID and Shipment ID...`);
+  const orderPageText = await page.locator('body').innerText().catch(() => '');
+  const orderIdMatch = orderPageText.match(/ORCA\d+|ORCB\d+/);
+  const shipmentIdMatch = orderPageText.match(/SOCB\d+|SOCM\d+/);
+
+  result.orderId = orderIdMatch ? orderIdMatch[0] : null;
+  result.shipmentId = shipmentIdMatch ? shipmentIdMatch[0] : null;
+
+  if (!result.amount) {
+    const finalCostMatch = orderPageText.match(/Rp\s*([0-9]{1,3}(?:\.[0-9]{3})+)/i);
+    if (finalCostMatch && finalCostMatch[1]) {
+      result.amount = parseInt(finalCostMatch[1].replace(/[^0-9]/g, ''), 10);
+    }
+  }
+
+  if (!result.orderId) {
+    const parentSubmitBtn = page.getByRole('button', { name: /simpan informasi pesanan|buat pesanan/i }).first();
+    if (await parentSubmitBtn.isVisible().catch(() => false)) {
+      await parentSubmitBtn.click();
+      await page.waitForTimeout(4000);
+      const postText = await page.locator('body').innerText().catch(() => '');
+      const oMatch = postText.match(/ORCA\d+|ORCB\d+/);
+      if (oMatch) result.orderId = oMatch[0];
+      const sMatch = postText.match(/SOCB\d+|SOCM\d+/);
+      if (sMatch) result.shipmentId = sMatch[0];
+    }
+  }
+
+  if (result.orderId) {
+    result.status = 'CREATED';
+    console.log(`[${name}] International Order successfully created: ${result.orderId} (Shipment: ${result.shipmentId || 'N/A'}, Amount: Rp${result.amount || 'N/A'})`);
+  } else {
+    result.status = 'ORDER_CONFIRMED';
+    console.log(`[${name}] International Order confirmed through Step 4 summary.`);
+  }
+
   return result;
+}
+
+/**
+ * Capture diagnostic details when international service catalog detection or selection fails
+ */
+async function captureInternationalCatalogDiagnostics(page, name, reason, context = {}) {
+  const ts = Date.now();
+  const screenshotName = `intl_catalog_failure_${ts}`;
+  let screenshotPath = null;
+  try {
+    screenshotPath = await captureScreenshot(page, screenshotName);
+  } catch (e) {
+    // Ignore screenshot error
+  }
+
+  const diag = await page.evaluate(({ reason, targetServiceType, targetMode }) => {
+    // 1. Loading indicators
+    const loadingElements = Array.from(document.querySelectorAll('.animate-pulse, .ant-spin, .ant-spin-spinning, .ant-skeleton'))
+      .map(el => ({
+        selector: el.className,
+        tagName: el.tagName.toLowerCase(),
+        visible: el.offsetParent !== null || window.getComputedStyle(el).display !== 'none',
+      }));
+    const isLoading = loadingElements.some(l => l.visible);
+
+    // 2. Candidate catalog cards
+    const cardCandidates = Array.from(document.querySelectorAll('button.best-option-title, button.another-option-title, button[class*="option-title"], button:has(p.text-xl), section button'))
+      .filter(el => {
+        const text = el.innerText || '';
+        return text.includes('Rp') || text.includes('IDR') || text.includes('Estimasi') || el.classList.contains('best-option-title') || el.classList.contains('another-option-title');
+      })
+      .map((el, i) => {
+        const lines = (el.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
+        return {
+          index: i,
+          tagName: el.tagName.toLowerCase(),
+          className: el.className,
+          attributes: Array.from(el.attributes).map(a => `${a.name}="${a.value}"`).join(' '),
+          disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+          isSelected: el.classList.contains('border-main') || !el.classList.contains('border-gray'),
+          textLines: lines,
+          fullText: el.innerText.trim(),
+        };
+      });
+
+    // 3. Visible service names
+    const visibleServiceNames = Array.from(document.querySelectorAll('h1, h2, h3, h4, p, span, div'))
+      .map(el => el.innerText ? el.innerText.trim() : '')
+      .filter(t => /Air Cargo|Cargo|Express|Sea Freight|Land Freight|LCL|FCL/i.test(t) && t.length < 50);
+
+    // 4. Buttons and controls in section
+    const buttonsAndControls = Array.from(document.querySelectorAll('button, input, [role="radio"], [role="button"]'))
+      .map(el => ({
+        tag: el.tagName.toLowerCase(),
+        type: el.getAttribute('type'),
+        role: el.getAttribute('role'),
+        text: (el.innerText || el.getAttribute('value') || el.getAttribute('aria-label') || '').trim().substring(0, 80),
+        className: el.className,
+        disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+      }))
+      .filter(c => c.text.length > 0 || c.tag === 'input');
+
+    // 5. Inquiry elements
+    const inquiryElements = Array.from(document.querySelectorAll('button, p, h1, div'))
+      .filter(el => /inquiry|harga terbaik|quotation/i.test(el.innerText || ''))
+      .map(el => el.innerText.trim().substring(0, 150))
+      .filter((v, i, a) => a.indexOf(v) === i);
+
+    // 6. DOM snapshot of catalog section
+    const catalogContainer = document.querySelector('section.flex.flex-col, .custom-steps, body');
+    const domSnapshot = catalogContainer ? catalogContainer.outerHTML.substring(0, 4000) : null;
+
+    return {
+      currentUrl: window.location.href,
+      reason,
+      targetServiceType,
+      targetMode,
+      isLoading,
+      loadingElements,
+      candidateCardsCount: cardCandidates.length,
+      candidateCards: cardCandidates,
+      visibleServiceNames: Array.from(new Set(visibleServiceNames)),
+      buttonsAndControls: buttonsAndControls.slice(0, 25),
+      inquiryElements,
+      domSnapshot,
+    };
+  }, {
+    reason,
+    targetServiceType: context.serviceType || 'Cargo',
+    targetMode: context.transportationMode || 'Air',
+  }).catch(e => ({ error: `Diagnostic evaluation failed: ${e.message}` }));
+
+  diag.screenshotPath = screenshotPath;
+  console.error(`[${name}] [DIAGNOSTIC] International Catalog Detection Failure (${reason}):\n`, JSON.stringify(diag, null, 2));
+  page._lastDiagnostic = diag;
+  return diag;
+}
+
+/**
+ * Step 2: International Service Catalog Discovery & Selection
+ * 
+ * Waits for catalog query to resolve, distinguishes State A (Selectable options) 
+ * from State B (Explicit Inquiry / Unavailable), matches and clicks the appropriate 
+ * service card, verifies selection state, and clicks the confirmation button to advance to Step 3.
+ * 
+ * @param {import('playwright').Page} page
+ * @param {Object} spec
+ * @param {string} [name='International Order']
+ * @param {Object} [result={}]
+ */
+async function handleInternationalServiceCatalogStep2(page, spec, name = 'International Order', result = {}) {
+  console.log(`[${name}] [ServiceCatalog] Entering Step 2: Pilih Layanan (International)...`);
+
+  const pickupCity = spec?.pickup?.city || spec?.pickup?.locality || 'Origin';
+  const dropoffCity = spec?.dropoff?.city || spec?.dropoff?.locality || 'Destination';
+  const targetServiceType = spec?.serviceType || 'Cargo';
+  const targetMode = spec?.transportationMode || 'Air';
+
+  // 1. Wait for Step 2 page content or container to be visible
+  try {
+    await page.waitForLoadState('domcontentloaded');
+  } catch (e) {}
+
+  // 2. Poll for loading indicators (.animate-pulse, .ant-spin, .ant-skeleton) to finish
+  console.log(`[${name}] [ServiceCatalog] Waiting for international catalog query to complete...`);
+  const pollStart = Date.now();
+  const maxWaitMs = 15000;
+
+  // Candidate selectors for State A (Selectable Service Option Buttons)
+  const cardLocator = page.locator('button.best-option-title, button.another-option-title, button[class*="best-option-title"], button[class*="another-option-title"]')
+    .or(page.locator('button').filter({ hasText: /Rp|IDR/i }).filter({ hasText: /Estimasi/i }));
+
+  // Selectors for State B (Explicit Unavailable / Inquiry Only)
+  const inquiryNotice = page.locator('button').filter({ hasText: /ajukan inquiry/i })
+    .or(page.locator('text=/ajukan inquiry/i'))
+    .or(page.locator('text=/harga terbaik sedang kami sesuaikan/i'));
+
+  let detectedState = null; // 'AVAILABLE' | 'UNAVAILABLE'
+
+  while (Date.now() - pollStart < maxWaitMs) {
+    // Check if still pulsing/loading
+    const isPulsing = await page.locator('.animate-pulse, .ant-spin-spinning, .ant-skeleton').first().isVisible().catch(() => false);
+
+    // Check for State A: Option cards rendered
+    const cardFound = await cardLocator.first().isVisible().catch(() => false);
+    if (cardFound && !isPulsing) {
+      detectedState = 'AVAILABLE';
+      break;
+    }
+
+    // Check for State B: Inquiry / Unavailable rendered
+    const inquiryFound = await inquiryNotice.first().isVisible().catch(() => false);
+    if (inquiryFound && !isPulsing) {
+      detectedState = 'UNAVAILABLE';
+      break;
+    }
+
+    await page.waitForTimeout(400);
+  }
+
+  // If still no state detected, do one final check
+  if (!detectedState) {
+    const isPulsing = await page.locator('.animate-pulse, .ant-spin-spinning, .ant-skeleton').first().isVisible().catch(() => false);
+    const cardFound = await cardLocator.first().isVisible().catch(() => false);
+    const inquiryFound = await inquiryNotice.first().isVisible().catch(() => false);
+
+    if (cardFound && !isPulsing) detectedState = 'AVAILABLE';
+    else if (inquiryFound && !isPulsing) detectedState = 'UNAVAILABLE';
+  }
+
+  // Handle State B: Explicit Inquiry / Unavailable
+  if (detectedState === 'UNAVAILABLE') {
+    const diag = await captureInternationalCatalogDiagnostics(page, name, 'INQUIRY_ONLY', {
+      serviceType: targetServiceType,
+      transportationMode: targetMode,
+    });
+    const err = new Error(`No applicable Service Catalog exists on staging OMS for International route ${pickupCity} -> ${dropoffCity}. Staging OMS requires Inquiry: 'Ajukan Inquiry Layanan'. Stopped per policy (no inquiry fallback).`);
+    err.diagnostic = diag;
+    throw err;
+  }
+
+  // Handle Detection Failure / Timeout
+  if (detectedState !== 'AVAILABLE') {
+    const diag = await captureInternationalCatalogDiagnostics(page, name, 'TIMEOUT_OR_NOT_FOUND', {
+      serviceType: targetServiceType,
+      transportationMode: targetMode,
+    });
+    const err = new Error(`No selectable Service Catalog cards found for International route ${pickupCity} -> ${dropoffCity} (timeout waiting for catalog rendering).`);
+    err.diagnostic = diag;
+    throw err;
+  }
+
+  // State A: Catalog Options Available!
+  const cardCount = await cardLocator.count();
+  console.log(`[${name}] [ServiceCatalog] Detected ${cardCount} selectable international service option(s).`);
+
+  if (cardCount === 0) {
+    const diag = await captureInternationalCatalogDiagnostics(page, name, 'ZERO_OPTIONS_RETURNED', {
+      serviceType: targetServiceType,
+      transportationMode: targetMode,
+    });
+    const err = new Error(`No selectable Service Catalog cards found for International route ${pickupCity} -> ${dropoffCity}.`);
+    err.diagnostic = diag;
+    throw err;
+  }
+
+  // Inspect and parse each card
+  const cards = [];
+  for (let i = 0; i < cardCount; i++) {
+    const card = cardLocator.nth(i);
+    const text = await card.innerText().catch(() => '');
+    const className = await card.getAttribute('class').catch(() => '') || '';
+    const isSelected = className.includes('border-main') || !className.includes('border-gray');
+    const priceMatch = text.match(/(?:Rp|IDR)\s*[\d\.,]+/i);
+    const price = priceMatch ? priceMatch[0] : '';
+
+    cards.push({
+      index: i,
+      locator: card,
+      text,
+      className,
+      isSelected,
+      price,
+    });
+    console.log(`[${name}] [ServiceCatalog] [Option #${i + 1}] Price: ${price || 'N/A'}, Selected: ${isSelected}, Preview: "${text.replace(/\n+/g, ' | ').substring(0, 100)}"`);
+  }
+
+  // Selection Logic:
+  // Identify the target card based on user preference or requested serviceType
+  let selectedIndex = 0; // Default to best option (option 0)
+  const preference = (spec?.serviceCatalogPreference || 'auto').toLowerCase();
+
+  if (preference !== 'auto') {
+    const prefIdx = cards.findIndex(c => c.text.toLowerCase().includes(preference));
+    if (prefIdx !== -1) selectedIndex = prefIdx;
+  } else if (targetServiceType) {
+    const typeIdx = cards.findIndex(c => new RegExp(escapeRegex(targetServiceType), 'i').test(c.text));
+    if (typeIdx !== -1) selectedIndex = typeIdx;
+  }
+
+  const targetCard = cards[selectedIndex];
+  console.log(`[${name}] [ServiceCatalog] Selecting Option #${selectedIndex + 1} (matching "${targetServiceType || 'best'}"): "${targetCard.price}"...`);
+
+  // Click the selectable control
+  await targetCard.locator.scrollIntoViewIfNeeded().catch(() => {});
+  await targetCard.locator.click();
+  await page.waitForTimeout(500);
+
+  // Verify selection registered in UI:
+  // After clicking, verify that targetCard has 'border-main' or active state
+  let selectionConfirmed = false;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const updatedClass = await targetCard.locator.getAttribute('class').catch(() => '') || '';
+    if (updatedClass.includes('border-main') || cards.length === 1) {
+      selectionConfirmed = true;
+      break;
+    }
+    await page.waitForTimeout(300);
+  }
+
+  if (!selectionConfirmed) {
+    console.warn(`[${name}] [ServiceCatalog] Card active class verification pending, retrying click...`);
+    await targetCard.locator.click();
+    await page.waitForTimeout(500);
+  }
+
+  result.serviceCatalog = (targetCard.text.split('\n')[0] || `International ${targetMode} ${targetServiceType}`).trim();
+  if (targetCard.price) {
+    const numericAmount = parseInt(targetCard.price.replace(/[^\d]/g, ''), 10);
+    if (!isNaN(numericAmount) && numericAmount > 0) {
+      result.amount = numericAmount;
+    }
+  }
+  console.log(`[${name}] [ServiceCatalog] Selection confirmed: "${result.serviceCatalog}" (${targetCard.price})`);
+
+  // Confirmation Button to advance to Step 3:
+  // Look for the bottom primary button: textButton: d("save-service.label")
+  console.log(`[${name}] [ServiceCatalog] Advancing to Step 3 (Informasi Shipper & Consignee)...`);
+  const saveServiceBtn = page.locator('button.primary-btn').filter({ hasNotText: /ajukan inquiry|inquiry/i }).last()
+    .or(page.getByRole('button', { name: /simpan|pilih layanan|lanjutkan|save/i }).filter({ hasNotText: /inquiry/i }))
+    .first();
+
+  await saveServiceBtn.waitFor({ state: 'visible', timeout: 10000 });
+
+  // Wait until enabled (disabled: !ec || ec?.data?.length <= 0 || ep)
+  for (let i = 0; i < 20; i++) {
+    const isDisabled = await saveServiceBtn.isDisabled().catch(() => false);
+    if (!isDisabled) break;
+    await page.waitForTimeout(300);
+  }
+
+  await saveServiceBtn.click();
+  console.log(`[${name}] [ServiceCatalog] Confirmation button clicked. Awaiting Step 3 mount...`);
+
+  // Verify advancement: Step 3 ("Informasi Shipper & Consignee") must mount
+  const step3Indicator = page.locator('input[name="origin_pic_name"], #origin_pic_name, input[placeholder*="Nama PIC"]')
+    .or(page.locator('text=/Informasi Shipper & Consignee/i'))
+    .first();
+
+  try {
+    await step3Indicator.waitFor({ state: 'visible', timeout: 20000 });
+    console.log(`[${name}] [ServiceCatalog] Step 3 successfully mounted.`);
+  } catch (err) {
+    const diag = await captureInternationalCatalogDiagnostics(page, name, 'STEP3_ADVANCE_FAILED', {
+      serviceType: targetServiceType,
+      transportationMode: targetMode,
+    });
+    const error = new Error(`Failed to advance from Step 2 to Step 3 after selecting catalog option: ${err.message}`);
+    error.diagnostic = diag;
+    throw error;
+  }
+
+  return {
+    success: true,
+    catalog: result.serviceCatalog,
+    amount: result.amount,
+  };
+}
+
+/**
+ * Ensure coherent, country-aware PIC records for International Order
+ * - Pickup PIC country matches pickup country (e.g. Indonesia).
+ * - Destination PIC country matches destination country (e.g. Singapore, Malaysia, Japan).
+ * - Respects explicitly provided user fields.
+ * - Falls back to library or synthetic generator with auto-persistence.
+ */
+function ensureInternationalPicRecords(spec) {
+  if (!spec.pickup) spec.pickup = {};
+  if (!spec.dropoff) spec.dropoff = {};
+
+  const pickupCountry = spec.pickup.country || 'Indonesia';
+  const dropoffCountry = spec.dropoff.country || 'Singapore';
+
+  const normPickupCountry = normalizeCountry(pickupCountry);
+  const normDropoffCountry = normalizeCountry(dropoffCountry);
+
+  const inputPickupPic = spec.pickup.pic || {};
+  const inputDropoffPic = spec.dropoff.pic || {};
+
+  // Check country matching before resolution
+  if (inputPickupPic.country && normalizeCountry(inputPickupPic.country).code !== normPickupCountry.code) {
+    throw new Error(`[OrderExecutor] Pickup PIC country (${inputPickupPic.country}) does not match pickup country (${normPickupCountry.name}).`);
+  }
+  if (inputDropoffPic.country && normalizeCountry(inputDropoffPic.country).code !== normDropoffCountry.code) {
+    throw new Error(`[OrderExecutor] Destination PIC country (${inputDropoffPic.country}) does not match destination country (${normDropoffCountry.name}).`);
+  }
+
+  // Check if user explicitly provided an empty/invalid required field
+  for (const f of ['name', 'company', 'email', 'phone']) {
+    if (inputPickupPic[f] !== undefined && String(inputPickupPic[f]).trim() === '') {
+      throw new Error(`[OrderExecutor] Missing required Shipper PIC field: "${f}". PIC information cannot be skipped.`);
+    }
+    if (inputDropoffPic[f] !== undefined && String(inputDropoffPic[f]).trim() === '') {
+      throw new Error(`[OrderExecutor] Missing required Consignee PIC field: "${f}". PIC information cannot be skipped.`);
+    }
+  }
+
+  // 1. Pickup PIC (Shipper)
+  let pickupPic = null;
+
+  if (inputPickupPic.name && inputPickupPic.phone && inputPickupPic.email && inputPickupPic.company) {
+    pickupPic = { ...inputPickupPic };
+  } else {
+    const selection = selectRandomPIC({
+      country: normPickupCountry.name,
+      city: spec.pickup.city,
+      type: 'pickup',
+    });
+    let basePic = selection?.pic;
+    if (!basePic) {
+      basePic = generateRealisticPIC({
+        country: normPickupCountry.name,
+        city: spec.pickup.city,
+        type: 'pickup',
+      });
+      const lib = getPicLibrary();
+      lib.push(basePic);
+      setPicLibrary(lib);
+    }
+    pickupPic = {
+      ...basePic,
+      ...Object.fromEntries(Object.entries(inputPickupPic).filter(([_, v]) => v !== undefined && v !== null && String(v).trim() !== '')),
+    };
+  }
+  pickupPic.country = normPickupCountry.name;
+  pickupPic.countryCode = normPickupCountry.code;
+  pickupPic.phoneCountryCode = pickupPic.phoneCountryCode || normPickupCountry.phoneCode;
+  spec.pickup.pic = pickupPic;
+
+  // 2. Dropoff PIC (Consignee)
+  let dropoffPic = null;
+
+  if (inputDropoffPic.name && inputDropoffPic.phone && inputDropoffPic.email && inputDropoffPic.company) {
+    dropoffPic = { ...inputDropoffPic };
+  } else {
+    const selection = selectRandomPIC({
+      country: normDropoffCountry.name,
+      city: spec.dropoff.city,
+      type: 'dropoff',
+      excludeNames: [pickupPic.name],
+      excludePhones: [pickupPic.phone],
+    });
+    let basePic = selection?.pic;
+    if (!basePic) {
+      basePic = generateRealisticPIC({
+        country: normDropoffCountry.name,
+        city: spec.dropoff.city,
+        type: 'dropoff',
+      });
+      const lib = getPicLibrary();
+      lib.push(basePic);
+      setPicLibrary(lib);
+    }
+    dropoffPic = {
+      ...basePic,
+      ...Object.fromEntries(Object.entries(inputDropoffPic).filter(([_, v]) => v !== undefined && v !== null && String(v).trim() !== '')),
+    };
+  }
+  dropoffPic.country = normDropoffCountry.name;
+  dropoffPic.countryCode = normDropoffCountry.code;
+  dropoffPic.phoneCountryCode = dropoffPic.phoneCountryCode || normDropoffCountry.phoneCode;
+  spec.dropoff.pic = dropoffPic;
+
+  // Final completeness verification
+  const requiredPicFields = ['name', 'company', 'address', 'email', 'phone'];
+  for (const f of requiredPicFields) {
+    if (!spec.pickup.pic[f] && f !== 'address') {
+      throw new Error(`[OrderExecutor] Missing required Shipper PIC field: "${f}". PIC information cannot be skipped.`);
+    }
+    if (!spec.dropoff.pic[f] && f !== 'address') {
+      throw new Error(`[OrderExecutor] Missing required Consignee PIC field: "${f}". PIC information cannot be skipped.`);
+    }
+  }
+
+  return { pickupPic, dropoffPic };
+}
+
+/**
+ * Step 3: Fill Shipper (Origin) & Consignee (Destination) PIC details and upload PIC attachment
+ */
+async function fillInternationalPicAndAttachment(page, spec, name = 'International Order', options = {}) {
+  console.log(`[${name}] [Step 3] Entering Informasi Shipper & Consignee...`);
+
+  // Ensure country-aware PIC records are complete and coherent
+  ensureInternationalPicRecords(spec);
+
+  // 1. Origin (Shipper) PIC Information
+  console.log(`[${name}] [Shipper PIC] Filling Shipper details (${spec.pickup.pic.name} - ${spec.pickup.pic.country})...`);
+  const originNameInput = page.locator('input[name="origin_pic_name"], #origin_pic_name, input[placeholder*="Nama PIC"]').first();
+  if (await originNameInput.isVisible().catch(() => false)) {
+    await originNameInput.fill(spec.pickup.pic.name);
+  }
+
+  const originCompanyInput = page.locator('input[name="origin_company"], #origin_company, input[placeholder*="Perusahaan"]').first();
+  if (await originCompanyInput.isVisible().catch(() => false)) {
+    await originCompanyInput.fill(spec.pickup.pic.company);
+  }
+
+  const originAddressInput = page.locator('input[name="origin_address"], textarea[name="origin_address"], #origin_address, input[placeholder*="Alamat"]').first();
+  if (await originAddressInput.isVisible().catch(() => false)) {
+    const originAddress = spec.pickup.address || spec.pickup.pic.address || `${spec.pickup.district || ''} ${spec.pickup.city || ''}`.trim() || 'Origin Logistics Hub';
+    await originAddressInput.fill(originAddress);
+  }
+
+  const originEmailInput = page.locator('input[name="origin_email"], #origin_email, input[type="email"]').first();
+  if (await originEmailInput.isVisible().catch(() => false)) {
+    await originEmailInput.fill(spec.pickup.pic.email);
+  }
+
+  const originPhoneArea = page.locator('.ant-select').filter({ has: page.locator('#origin_phone_area, input[name="origin_phone_area"]') }).first();
+  if (await originPhoneArea.isVisible().catch(() => false)) {
+    await selectAntOption(page, originPhoneArea, null, new RegExp(escapeRegex(spec.pickup.pic.phoneCountryCode || '+62')));
+  }
+
+  const originPhoneInput = page.locator('input[name="origin_phone"], #origin_phone, input[type="number"], input[placeholder*="telepon"]').first();
+  if (await originPhoneInput.isVisible().catch(() => false)) {
+    const rawPhone = String(spec.pickup.pic.phone).replace(/^\+?62|^0/, '');
+    await originPhoneInput.fill(rawPhone);
+  }
+
+  // 2. Destination (Consignee) PIC Information
+  console.log(`[${name}] [Consignee PIC] Filling Consignee details (${spec.dropoff.pic.name} - ${spec.dropoff.pic.country})...`);
+  const destNameInput = page.locator('input[name="destination_pic_name"], #destination_pic_name').first()
+    .or(page.locator('input[placeholder*="Nama PIC"]').nth(1));
+  if (await destNameInput.isVisible().catch(() => false)) {
+    await destNameInput.fill(spec.dropoff.pic.name);
+  }
+
+  const destCompanyInput = page.locator('input[name="destination_company"], #destination_company').first()
+    .or(page.locator('input[placeholder*="Perusahaan"]').nth(1));
+  if (await destCompanyInput.isVisible().catch(() => false)) {
+    await destCompanyInput.fill(spec.dropoff.pic.company);
+  }
+
+  const destAddressInput = page.locator('input[name="destination_address"], textarea[name="destination_address"], #destination_address').first()
+    .or(page.locator('input[placeholder*="Alamat"]').nth(1));
+  if (await destAddressInput.isVisible().catch(() => false)) {
+    const destAddress = spec.dropoff.address || spec.dropoff.pic.address || `${spec.dropoff.district || ''} ${spec.dropoff.city || ''}`.trim() || 'Destination Distribution Center';
+    await destAddressInput.fill(destAddress);
+  }
+
+  const destEmailInput = page.locator('input[name="destination_email"], #destination_email').first()
+    .or(page.locator('input[type="email"]').nth(1));
+  if (await destEmailInput.isVisible().catch(() => false)) {
+    await destEmailInput.fill(spec.dropoff.pic.email);
+  }
+
+  const destPhoneArea = page.locator('.ant-select').filter({ has: page.locator('#destination_phone_area, input[name="destination_phone_area"]') }).first();
+  if (await destPhoneArea.isVisible().catch(() => false)) {
+    await selectAntOption(page, destPhoneArea, null, new RegExp(escapeRegex(spec.dropoff.pic.phoneCountryCode || '+65')));
+  }
+
+  const destPhoneInput = page.locator('input[name="destination_phone"], #destination_phone').first()
+    .or(page.locator('input[placeholder*="telepon"]').nth(1));
+  if (await destPhoneInput.isVisible().catch(() => false)) {
+    const phoneCountryDigits = (spec.dropoff.pic.phoneCountryCode || '').replace(/\D/g, '');
+    let rawDestPhone = String(spec.dropoff.pic.phone).replace(/^\+/, '');
+    if (phoneCountryDigits && rawDestPhone.startsWith(phoneCountryDigits)) {
+      rawDestPhone = rawDestPhone.slice(phoneCountryDigits.length);
+    }
+    rawDestPhone = rawDestPhone.replace(/^0/, '');
+    await destPhoneInput.fill(rawDestPhone);
+  }
+
+  // 3. Verify in DOM that input fields were filled
+  const verifyOriginName = await originNameInput.inputValue().catch(() => '');
+  const verifyOriginPhone = await originPhoneInput.inputValue().catch(() => '');
+  const verifyDestName = await destNameInput.inputValue().catch(() => '');
+  const verifyDestPhone = await destPhoneInput.inputValue().catch(() => '');
+
+  if (await originNameInput.isVisible().catch(() => false) && !verifyOriginName) {
+    throw new Error('[OrderExecutor] Origin PIC name was not populated in DOM.');
+  }
+  if (await originPhoneInput.isVisible().catch(() => false) && !verifyOriginPhone) {
+    throw new Error('[OrderExecutor] Origin PIC phone was not populated in DOM.');
+  }
+  if (await destNameInput.isVisible().catch(() => false) && !verifyDestName) {
+    throw new Error('[OrderExecutor] Destination PIC name was not populated in DOM.');
+  }
+  if (await destPhoneInput.isVisible().catch(() => false) && !verifyDestPhone) {
+    throw new Error('[OrderExecutor] Destination PIC phone was not populated in DOM.');
+  }
+
+  // 4. File Upload / PIC Attachment
+  const targetAttachmentPath = options.picAttachmentPath || spec?.picAttachmentPath || DEFAULT_INTL_PIC_ATTACHMENT_PATH;
+  console.log(`[${name}] [PIC Attachment] Resolving attachment file: "${targetAttachmentPath}"...`);
+  const resolvedPath = resolveInternationalPicAttachment(targetAttachmentPath);
+
+  console.log(`[${name}] [PIC Attachment] Uploading verified file via setInputFiles: "${resolvedPath}"...`);
+  const fileInput = page.locator('.ant-upload input[type="file"], input[type="file"]').first();
+  await fileInput.waitFor({ state: 'attached', timeout: 15000 });
+  await fileInput.setInputFiles(resolvedPath);
+
+  // 5. Wait for upload to complete and verify attachment is displayed
+  const fileName = path.basename(resolvedPath);
+  console.log(`[${name}] [PIC Attachment] Waiting for attachment "${fileName}" to be displayed...`);
+  const attachmentItem = page.locator('button, section, div, span, .ant-upload-list-item')
+    .filter({ hasText: fileName })
+    .first();
+
+  await attachmentItem.waitFor({ state: 'visible', timeout: 20000 });
+  const isDisplayed = await attachmentItem.isVisible().catch(() => false);
+  if (!isDisplayed) {
+    throw new Error(`[OrderExecutor] International PIC attachment "${fileName}" was uploaded but is not displayed in the UI.`);
+  }
+  console.log(`[${name}] [PIC Attachment] Confirmed displayed: "${fileName}".`);
+
+  return {
+    success: true,
+    attachmentPath: resolvedPath,
+    fileName,
+    shipperPic: spec.pickup.pic,
+    consigneePic: spec.dropoff.pic,
+  };
 }
 
 /**
@@ -877,6 +2343,7 @@ async function executeOrder(inputSpecification = {}, options = {}) {
       amount: null,
       status: 'FAILED',
       error: err.message,
+      diagnostic: err.diagnostic || page._lastDiagnostic || null,
       specification: resolvedSpec,
     };
   } finally {
@@ -893,6 +2360,20 @@ module.exports = {
   executeDomesticOrderUI,
   executeInternationalOrderUI,
   handleServiceCatalogStep3,
+  handleInternationalServiceCatalogStep2,
+  captureInternationalCatalogDiagnostics,
   formatSpecificationReview,
   selectAntLocationOption,
+  selectInternationalServiceType,
+  captureServiceTypeDiagnostics,
+  selectAntAutocompleteOption,
+  matchesLocationContext,
+  DEFAULT_INTL_PIC_ATTACHMENT_PATH,
+  resolveInternationalPicAttachment,
+  ensureInternationalPicRecords,
+  fillInternationalPicAndAttachment,
+  selectAntDatePicker,
+  captureDatePickerDiagnostics,
+  getAntDatePickerState,
+  DATEPICKER_MONTH_REGEXES,
 };

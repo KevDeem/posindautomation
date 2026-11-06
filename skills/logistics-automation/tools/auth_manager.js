@@ -51,7 +51,7 @@ async function captureScreenshot(page, prefix = 'auth_error') {
 async function performFreshLogin(page, context, options = {}) {
   const omsUrl = (options.omsUrl || 'https://sr-pos-oms-web.nisims.web.id').replace(/\/+$/, '');
   const username = options.username || process.env.OMS_USERNAME || 'kevin.d.imas@gmail.com';
-  const password = options.password || process.env.OMS_PASSWORD || '@Admin123.';
+  const password = options.password || process.env.OMS_PASSWORD || '@Admin123!';
   const sessionPath = options.sessionPath;
 
   console.log('[Authentication] Starting fresh OMS login...');
@@ -218,12 +218,11 @@ async function navigateToShippingPage(page, orderType = 'domestic', options = {}
   const formElement = isIntl ? page.locator('#origin_country') : page.locator('#pickup_date');
 
   let elementReady = false;
-  for (let i = 0; i < 5; i++) {
-    if (await shipmentBtn.isVisible().catch(() => false) || await formElement.isVisible().catch(() => false)) {
-      elementReady = true;
-      break;
-    }
-    await page.waitForTimeout(600);
+  try {
+    await shipmentBtn.or(formElement).first().waitFor({ state: 'visible', timeout: 15000 });
+    elementReady = true;
+  } catch (e) {
+    elementReady = false;
   }
 
   if (!elementReady) {

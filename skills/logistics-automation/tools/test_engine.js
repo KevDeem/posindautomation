@@ -82,7 +82,7 @@ function runVerificationTests() {
   assert.strictEqual(resChangeCity.resolvedSpec.pickup.city, 'Kota Bandung');
   assert.strictEqual(resChangeCity.resolvedSpec.pickup.district, '', 'Incompatible district from Jakarta should be reset');
   assert.strictEqual(resChangeCity.sources.pickup.district, 'reset_on_location_change');
-  assert.strictEqual(resChangeCity.resolvedSpec.dropoff.city, 'Surabaya', 'Drop-off city must remain intact');
+  assert.strictEqual(resChangeCity.resolvedSpec.dropoff.city, 'Kota Surabaya', 'Drop-off city must remain intact');
   console.log('  [PASS] Location change child-field reset verified.');
 
   // Test 5: International vs Domestic Dispatch Resolution
@@ -96,7 +96,7 @@ function runVerificationTests() {
   assert.strictEqual(resIntl.resolvedSpec.orderType, 'international');
   assert.strictEqual(resIntl.resolvedSpec.orderMode, 'non-contract');
   assert.strictEqual(resIntl.resolvedSpec.transportationMode, 'Air');
-  assert.strictEqual(resIntl.resolvedSpec.incoterm, 'Delivered Duty Paid (DDP)');
+  assert.strictEqual(resIntl.resolvedSpec.incoterm, 'Delivered Duty Paid');
   console.log('  [PASS] International specification isolated and resolved properly.');
 
   // Test 6: Currency parsing and dynamic amounts

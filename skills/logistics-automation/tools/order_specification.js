@@ -16,7 +16,19 @@
 
 const fs = require('fs');
 const path = require('path');
-const { generateRealisticPIC, validatePIC } = require('./pic_manager');
+const {
+  generateRealisticPIC,
+  validatePIC,
+  selectRandomPIC,
+  normalizeCountry,
+  getPicLibrary,
+} = require('./pic_manager');
+const {
+  extractAdminPrefix,
+  normalizeAdminCityName,
+  detectLocationType,
+  normalizeIncoterm,
+} = require('./location_matcher');
 
 const ROOT_DIR = path.resolve(__dirname, '../../..');
 const SESSIONS_DIR = path.join(ROOT_DIR, '.sessions');
@@ -50,7 +62,7 @@ const DEFAULT_SPECIFICATION = {
   dropoff: {
     locationType: 'Door',
     province: 'Jawa Timur',
-    city: 'Surabaya',
+    city: 'Kota Surabaya',
     district: 'Gubeng',
     subdistrict: 'Pucang Sewu',
     address: 'Gubeng',
@@ -77,6 +89,58 @@ const DEFAULT_SPECIFICATION = {
   },
   serviceCatalogPreference: 'LTL'
 };
+
+const REALISTIC_CARGO_ITEMS = [
+  'Kardus Pakaian',
+  'Peralatan Elektronik',
+  'Spare Part',
+  'Peralatan Rumah Tangga',
+  'Dokumen',
+  'Produk Makanan Kemasan',
+  'Komponen Mesin',
+  'Bahan Tekstil',
+  'Aksesoris Komputer',
+  'Alat Tulis Kantor',
+  'Perlengkapan Medis',
+  'Barang Cetakan',
+];
+
+let recentCargoItems = [];
+
+/**
+ * Generate a realistic Indonesian cargo item name, avoiding recently used items.
+ */
+function generateCargoItemName(options = {}) {
+  const exclude = new Set([...(options.excludeItems || []), ...recentCargoItems]);
+  let candidates = REALISTIC_CARGO_ITEMS.filter(item => !exclude.has(item));
+  if (candidates.length === 0) {
+    recentCargoItems = [];
+    candidates = REALISTIC_CARGO_ITEMS.filter(item => !(options.excludeItems || []).includes(item));
+    if (candidates.length === 0) candidates = REALISTIC_CARGO_ITEMS;
+  }
+  const chosen = candidates[Math.floor(Math.random() * candidates.length)];
+  recentCargoItems.push(chosen);
+  if (recentCargoItems.length > Math.min(6, REALISTIC_CARGO_ITEMS.length - 2)) {
+    recentCargoItems.shift();
+  }
+  return chosen;
+}
+
+/**
+ * Generate a random integer weight between min and max inclusive (default 50-100 kg).
+ */
+function generateCargoWeightKg(min = 50, max = 100) {
+  const low = Math.min(min, max);
+  const high = Math.max(min, max);
+  return Math.floor(Math.random() * (high - low + 1)) + low;
+}
+
+/**
+ * Reset cargo generator recent history (useful for test isolation).
+ */
+function resetCargoGenerator() {
+  recentCargoItems = [];
+}
 
 /**
  * Load the last saved order specification.
@@ -172,13 +236,13 @@ function resolveSpecification(inputSpec = {}, options = {}) {
 
   // 1c. Incoterm (e.g. DDP)
   if (inputSpec.incoterm) {
-    resolved.incoterm = inputSpec.incoterm;
+    resolved.incoterm = normalizeIncoterm(inputSpec.incoterm);
     sources.incoterm = 'provided';
   } else if (prev.incoterm && resolved.orderType === 'international' && !isTypeChanged) {
-    resolved.incoterm = prev.incoterm;
+    resolved.incoterm = normalizeIncoterm(prev.incoterm);
     sources.incoterm = 'reused';
   } else if (resolved.orderType === 'international') {
-    resolved.incoterm = 'Delivered Duty Paid (DDP)';
+    resolved.incoterm = 'Delivered Duty Paid';
     sources.incoterm = 'ui_default';
   }
 
@@ -220,14 +284,23 @@ function resolveSpecification(inputSpec = {}, options = {}) {
   const inputPickup = inputSpec.pickup || {};
   const prevPickup = (!isTypeChanged && prev.pickup) ? prev.pickup : {};
 
+  if (inputPickup.city) {
+    inputPickup.city = normalizeAdminCityName(inputPickup.city);
+  }
+
   // Check if pickup city or province was changed
   const isPickupLocationChanged = Boolean(
-    (inputPickup.city && prevPickup.city && inputPickup.city !== prevPickup.city) ||
-    (inputPickup.province && prevPickup.province && inputPickup.province !== prevPickup.province) ||
-    (inputPickup.country && prevPickup.country && inputPickup.country !== prevPickup.country)
+    (inputPickup.city && prevPickup.city && inputPickup.city.toLowerCase() !== prevPickup.city.toLowerCase()) ||
+    (inputPickup.province && prevPickup.province && inputPickup.province.toLowerCase() !== prevPickup.province.toLowerCase()) ||
+    (inputPickup.country && prevPickup.country && inputPickup.country.toLowerCase() !== prevPickup.country.toLowerCase())
   );
 
-  const pickupKeys = ['country', 'locationType', 'province', 'city', 'district', 'subdistrict', 'address', 'postalCode'];
+  // Check if pickup district was changed while city remained
+  const isPickupDistrictChanged = Boolean(
+    inputPickup.district && prevPickup.district && inputPickup.district.toLowerCase() !== prevPickup.district.toLowerCase()
+  );
+
+  const pickupKeys = ['country', 'locationType', 'province', 'city', 'district', 'subdistrict', 'address', 'postalCode', 'locality', 'searchQuery', 'parentContext'];
   for (const k of pickupKeys) {
     if (inputPickup[k] !== undefined && inputPickup[k] !== null && String(inputPickup[k]).trim() !== '') {
       resolved.pickup[k] = inputPickup[k];
@@ -236,6 +309,9 @@ function resolveSpecification(inputSpec = {}, options = {}) {
       // Incompatible child fields should not be blindly preserved from previous different city
       resolved.pickup[k] = '';
       sources.pickup[k] = 'reset_on_location_change';
+    } else if (isPickupDistrictChanged && ['subdistrict', 'postalCode'].includes(k)) {
+      resolved.pickup[k] = '';
+      sources.pickup[k] = 'reset_on_district_change';
     } else if (prevPickup[k] !== undefined) {
       resolved.pickup[k] = prevPickup[k];
       sources.pickup[k] = 'reused';
@@ -250,39 +326,71 @@ function resolveSpecification(inputSpec = {}, options = {}) {
     sources.pickup.locationType = 'ui_default';
   }
 
+  // Reuse policy: Only reuse previous PIC if explicitly requested or during edit/previous baseline update
+  const canReusePic = Boolean(
+    options.reusePic ||
+    options.isEdit ||
+    inputSpec.reusePic ||
+    inputSpec.reusePreviousPic ||
+    (options.previousSpec && options.reusePic !== false && options.isNewOrder !== true)
+  );
+
   // 5. Pickup PIC (Independent from drop-off PIC)
   resolved.pickup.pic = {};
   sources.pickup.pic = {};
-  const inputPickupPic = inputPickup.pic || {};
-  const prevPickupPic = prevPickup.pic || {};
+  const inputPickupPic = inputPickup.pic || inputSpec.pickupPic || {};
+  const prevPickupPic = (canReusePic && prevPickup.pic) ? prevPickup.pic : {};
   const shouldGenPickupPic = options.generatePickupPic === true || inputSpec.generatePickupPic === true;
 
+  const pickupCountry = resolved.pickup.country || 'Indonesia';
+  let pickupSelection;
   if (shouldGenPickupPic) {
-    resolved.pickup.pic = generateRealisticPIC({ type: 'pickup', city: resolved.pickup.city });
-    for (const k of ['name', 'company', 'address', 'email', 'phone']) {
-      sources.pickup.pic[k] = 'generated';
-    }
+    const gen = generateRealisticPIC({ country: pickupCountry, city: resolved.pickup.city, type: 'pickup' });
+    pickupSelection = { pic: gen, origin: 'generated' };
   } else {
-    for (const k of ['name', 'company', 'address', 'email', 'phone']) {
-      if (inputPickupPic[k]) {
-        resolved.pickup.pic[k] = inputPickupPic[k];
-        sources.pickup.pic[k] = 'provided';
-      } else if (prevPickupPic[k]) {
-        resolved.pickup.pic[k] = prevPickupPic[k];
-        sources.pickup.pic[k] = 'reused';
-      } else {
-        const gen = generateRealisticPIC({ type: 'pickup', city: resolved.pickup.city });
-        resolved.pickup.pic[k] = gen[k];
-        sources.pickup.pic[k] = 'generated';
-      }
+    pickupSelection = selectRandomPIC({
+      country: pickupCountry,
+      city: resolved.pickup.city,
+      type: 'pickup',
+    });
+  }
+
+  // If user explicitly provided name matching an entry in library, align baseline profile to it
+  if (inputPickupPic.name) {
+    const lib = getPicLibrary();
+    const matched = lib.find(p => p && String(p.name).trim().toLowerCase() === String(inputPickupPic.name).trim().toLowerCase());
+    if (matched) {
+      pickupSelection = { pic: JSON.parse(JSON.stringify(matched)), origin: 'library_random' };
     }
   }
+
+  const picFields = ['name', 'company', 'address', 'email', 'phone'];
+  for (const k of picFields) {
+    const val = inputPickupPic[k] !== undefined ? inputPickupPic[k] : (k === 'phone' ? (inputPickupPic.contact || inputPickup.contact || inputPickup.phone) : (k === 'company' ? inputPickup.company : null));
+    if (val !== undefined && val !== null && String(val).trim() !== '') {
+      resolved.pickup.pic[k] = String(val).trim();
+      sources.pickup.pic[k] = 'provided';
+    } else if (!shouldGenPickupPic && canReusePic && prevPickupPic[k] !== undefined && String(prevPickupPic[k]).trim() !== '') {
+      resolved.pickup.pic[k] = prevPickupPic[k];
+      sources.pickup.pic[k] = 'reused';
+    } else {
+      resolved.pickup.pic[k] = pickupSelection.pic[k];
+      sources.pickup.pic[k] = pickupSelection.origin;
+    }
+  }
+  resolved.pickup.pic.country = pickupSelection.pic.country || pickupCountry;
+  resolved.pickup.pic.countryCode = pickupSelection.pic.countryCode;
+  resolved.pickup.pic.phoneCountryCode = pickupSelection.pic.phoneCountryCode;
 
   // 6. Dropoff Location (Independent resolution, never overwrites Pickup)
   resolved.dropoff = {};
   sources.dropoff = {};
   const inputDropoff = inputSpec.dropoff || {};
   const prevDropoff = (!isTypeChanged && prev.dropoff) ? prev.dropoff : {};
+
+  if (inputDropoff.city) {
+    inputDropoff.city = normalizeAdminCityName(inputDropoff.city);
+  }
 
   const isExplicitDropoffRequested = Boolean(
     inputSpec._explicitDestinationProvided ||
@@ -310,12 +418,17 @@ function resolveSpecification(inputSpec = {}, options = {}) {
   } else {
     // Check if dropoff city or province was changed
     const isDropoffLocationChanged = Boolean(
-      (inputDropoff.city && prevDropoff.city && inputDropoff.city !== prevDropoff.city) ||
-      (inputDropoff.province && prevDropoff.province && inputDropoff.province !== prevDropoff.province) ||
-      (inputDropoff.country && prevDropoff.country && inputDropoff.country !== prevDropoff.country)
+      (inputDropoff.city && prevDropoff.city && inputDropoff.city.toLowerCase() !== prevDropoff.city.toLowerCase()) ||
+      (inputDropoff.province && prevDropoff.province && inputDropoff.province.toLowerCase() !== prevDropoff.province.toLowerCase()) ||
+      (inputDropoff.country && prevDropoff.country && inputDropoff.country.toLowerCase() !== prevDropoff.country.toLowerCase())
     );
 
-    const dropoffKeys = ['country', 'locationType', 'province', 'city', 'district', 'subdistrict', 'address', 'postalCode'];
+    // Check if dropoff district was changed while city remained
+    const isDropoffDistrictChanged = Boolean(
+      inputDropoff.district && prevDropoff.district && inputDropoff.district.toLowerCase() !== prevDropoff.district.toLowerCase()
+    );
+
+    const dropoffKeys = ['country', 'locationType', 'province', 'city', 'district', 'subdistrict', 'address', 'postalCode', 'locality', 'searchQuery', 'parentContext'];
     for (const k of dropoffKeys) {
       if (inputDropoff[k] !== undefined && inputDropoff[k] !== null && String(inputDropoff[k]).trim() !== '') {
         resolved.dropoff[k] = inputDropoff[k];
@@ -323,6 +436,9 @@ function resolveSpecification(inputSpec = {}, options = {}) {
       } else if (isDropoffLocationChanged && ['district', 'subdistrict', 'postalCode'].includes(k)) {
         resolved.dropoff[k] = '';
         sources.dropoff[k] = 'reset_on_location_change';
+      } else if (isDropoffDistrictChanged && ['subdistrict', 'postalCode'].includes(k)) {
+        resolved.dropoff[k] = '';
+        sources.dropoff[k] = 'reset_on_district_change';
       } else if (prevDropoff[k] !== undefined) {
         resolved.dropoff[k] = prevDropoff[k];
         sources.dropoff[k] = 'reused';
@@ -340,36 +456,65 @@ function resolveSpecification(inputSpec = {}, options = {}) {
   // 7. Dropoff PIC (Independent from pickup PIC)
   resolved.dropoff.pic = {};
   sources.dropoff.pic = {};
-  const inputDropoffPic = inputDropoff.pic || {};
-  const prevDropoffPic = prevDropoff.pic || {};
+  const inputDropoffPic = inputDropoff.pic || inputSpec.dropoffPic || {};
+  const prevDropoffPic = (canReusePic && prevDropoff.pic) ? prevDropoff.pic : {};
   const shouldGenDropoffPic = options.generateDropoffPic === true || inputSpec.generateDropoffPic === true;
 
+  const dropoffCountry = resolved.dropoff.country || (resolved.orderType === 'international' ? 'Singapore' : 'Indonesia');
+  let dropoffSelection;
   if (shouldGenDropoffPic) {
-    resolved.dropoff.pic = generateRealisticPIC({ type: 'dropoff', city: resolved.dropoff.city });
-    for (const k of ['name', 'company', 'address', 'email', 'phone']) {
-      sources.dropoff.pic[k] = 'generated';
-    }
+    const gen = generateRealisticPIC({ country: dropoffCountry, city: resolved.dropoff.city, type: 'dropoff' });
+    dropoffSelection = { pic: gen, origin: 'generated' };
   } else {
-    for (const k of ['name', 'company', 'address', 'email', 'phone']) {
-      if (inputDropoffPic[k]) {
-        resolved.dropoff.pic[k] = inputDropoffPic[k];
-        sources.dropoff.pic[k] = 'provided';
-      } else if (prevDropoffPic[k]) {
-        resolved.dropoff.pic[k] = prevDropoffPic[k];
-        sources.dropoff.pic[k] = 'reused';
-      } else {
-        const gen = generateRealisticPIC({ type: 'dropoff', city: resolved.dropoff.city });
-        resolved.dropoff.pic[k] = gen[k];
-        sources.dropoff.pic[k] = 'generated';
-      }
+    dropoffSelection = selectRandomPIC({
+      country: dropoffCountry,
+      city: resolved.dropoff.city,
+      type: 'dropoff',
+      excludeNames: [resolved.pickup.pic.name],
+      excludePhones: [resolved.pickup.pic.phone],
+    });
+  }
+
+  // If user explicitly provided name matching an entry in library, align baseline profile to it
+  if (inputDropoffPic.name) {
+    const lib = getPicLibrary();
+    const matched = lib.find(p => p && String(p.name).trim().toLowerCase() === String(inputDropoffPic.name).trim().toLowerCase());
+    if (matched) {
+      dropoffSelection = { pic: JSON.parse(JSON.stringify(matched)), origin: 'library_random' };
     }
   }
+
+  for (const k of picFields) {
+    const val = inputDropoffPic[k] !== undefined ? inputDropoffPic[k] : (k === 'phone' ? (inputDropoffPic.contact || inputDropoff.contact || inputDropoff.phone) : (k === 'company' ? inputDropoff.company : null));
+    if (val !== undefined && val !== null && String(val).trim() !== '') {
+      resolved.dropoff.pic[k] = String(val).trim();
+      sources.dropoff.pic[k] = 'provided';
+    } else if (!shouldGenDropoffPic && canReusePic && prevDropoffPic[k] !== undefined && String(prevDropoffPic[k]).trim() !== '') {
+      resolved.dropoff.pic[k] = prevDropoffPic[k];
+      sources.dropoff.pic[k] = 'reused';
+    } else {
+      resolved.dropoff.pic[k] = dropoffSelection.pic[k];
+      sources.dropoff.pic[k] = dropoffSelection.origin;
+    }
+  }
+  resolved.dropoff.pic.country = dropoffSelection.pic.country || dropoffCountry;
+  resolved.dropoff.pic.countryCode = dropoffSelection.pic.countryCode;
+  resolved.dropoff.pic.phoneCountryCode = dropoffSelection.pic.phoneCountryCode;
 
   // 8. Cargo & Package Details
   resolved.cargo = {};
   sources.cargo = {};
   const inputCargo = inputSpec.cargo || {};
   const prevCargo = prev.cargo || {};
+
+  // Reuse policy: Only reuse previous cargo if explicitly requested, during edit, or when previousSpec explicitly provided without isNewOrder
+  const canReuseCargo = Boolean(
+    options.reuseCargo ||
+    options.isEdit ||
+    inputSpec.reuseCargo ||
+    inputSpec.reusePreviousCargo ||
+    (options.previousSpec && options.reuseCargo !== false && options.isNewOrder !== true && !options.generateCargo && !inputSpec.generateCargo)
+  );
 
   const cargoKeys = [
     'characteristics', 'commodity', 'itemName', 'weightKg',
@@ -378,11 +523,23 @@ function resolveSpecification(inputSpec = {}, options = {}) {
 
   for (const k of cargoKeys) {
     if (inputCargo[k] !== undefined && inputCargo[k] !== null && String(inputCargo[k]).trim() !== '') {
-      resolved.cargo[k] = inputCargo[k];
-      sources.cargo[k] = 'provided';
+      resolved.cargo[k] = k === 'weightKg' ? Number(inputCargo[k]) : inputCargo[k];
+      sources.cargo[k] = inputSpec._sources?.cargo?.[k] || 'provided';
+    } else if (canReuseCargo && prevCargo[k] !== undefined && String(prevCargo[k]).trim() !== '') {
+      resolved.cargo[k] = prevCargo[k];
+      sources.cargo[k] = 'reused';
+    } else if (k === 'itemName') {
+      resolved.cargo.itemName = generateCargoItemName();
+      sources.cargo.itemName = 'generated';
+    } else if (k === 'weightKg') {
+      resolved.cargo.weightKg = generateCargoWeightKg(50, 100);
+      sources.cargo.weightKg = 'generated';
     } else if (prevCargo[k] !== undefined) {
       resolved.cargo[k] = prevCargo[k];
       sources.cargo[k] = 'reused';
+    } else if (DEFAULT_SPECIFICATION.cargo && DEFAULT_SPECIFICATION.cargo[k] !== undefined) {
+      resolved.cargo[k] = DEFAULT_SPECIFICATION.cargo[k];
+      sources.cargo[k] = 'ui_default';
     } else {
       sources.cargo[k] = 'missing';
     }
@@ -424,6 +581,8 @@ function formatSpecificationReview(resolvedSpec, sources) {
     switch (src) {
       case 'provided': return '[Provided]';
       case 'reused': return '[Reused]';
+      case 'library_random':
+      case 'randomized_library': return '[Randomized from Library]';
       case 'generated': return '[Generated Synthetic]';
       case 'ui_default': return '[UI Default]';
       case 'policy_enforced': return '[Policy Enforced]';
@@ -434,6 +593,9 @@ function formatSpecificationReview(resolvedSpec, sources) {
     }
   }
 
+  const pickupPoint = [resolvedSpec.pickup.district || resolvedSpec.pickup.locality, resolvedSpec.pickup.city, resolvedSpec.pickup.province].filter(Boolean).join(', ');
+  const dropoffPoint = [resolvedSpec.dropoff.district || resolvedSpec.dropoff.locality, resolvedSpec.dropoff.city, resolvedSpec.dropoff.province].filter(Boolean).join(', ');
+
   const lines = [
     '### Order Specification Review Before Submission',
     '',
@@ -441,13 +603,18 @@ function formatSpecificationReview(resolvedSpec, sources) {
     '| :--- | :--- | :--- |',
     `| **Order Type** | ${resolvedSpec.orderType} | ${badge(sources.orderType)} |`,
     `| **Order Mode** | NON-CONTRACT (Policy Enforced) | ${badge(sources.orderMode)} |`,
-    `| **Transportation Mode** | ${resolvedSpec.transportationMode} ${resolvedSpec.serviceType ? `(${resolvedSpec.serviceType})` : ''} | ${badge(sources.transportationMode)} |`,
+    `| **Transportation Mode** | ${resolvedSpec.transportationMode} | ${badge(sources.transportationMode)} |`,
+    `| **Service Type** | ${resolvedSpec.serviceType || 'Standard'} | ${badge(sources.serviceType || 'ui_default')} |`,
     `| **Pickup Date & Time** | ${resolvedSpec.scheduledDate} ${resolvedSpec.scheduledTime} | ${badge(sources.scheduledDate)} |`,
-    `| **Pickup Point** | ${[resolvedSpec.pickup.district, resolvedSpec.pickup.city, resolvedSpec.pickup.province, resolvedSpec.pickup.country].filter(Boolean).join(', ')} (${resolvedSpec.pickup.postalCode || '-'}) | ${badge(sources.pickup.city)} |`,
+    `| **Pickup Country** | ${resolvedSpec.pickup.country || 'Indonesia'} | ${badge(sources.pickup.country || 'ui_default')} |`,
+    `| **Pickup Point** | ${pickupPoint} (${resolvedSpec.pickup.postalCode || '-'}) | ${badge(sources.pickup.city)} |`,
+    `| **Pickup Location Type** | ${resolvedSpec.pickup.locationType || 'Door'} | ${badge(sources.pickup.locationType || 'ui_default')} |`,
     `| **Pickup Address** | ${resolvedSpec.pickup.address || '-'} | ${badge(sources.pickup.address)} |`,
     `| **Pickup PIC** | ${resolvedSpec.pickup.pic.name} (${resolvedSpec.pickup.pic.company}) | ${badge(sources.pickup.pic.name)} |`,
     `| **Pickup Contact** | ${resolvedSpec.pickup.pic.phone} / ${resolvedSpec.pickup.pic.email} | ${badge(sources.pickup.pic.phone)} |`,
-    `| **Drop-off Point** | ${[resolvedSpec.dropoff.district, resolvedSpec.dropoff.city, resolvedSpec.dropoff.province, resolvedSpec.dropoff.country].filter(Boolean).join(', ')} (${resolvedSpec.dropoff.postalCode || '-'}) | ${badge(sources.dropoff.city)} |`,
+    `| **Drop-off Country** | ${resolvedSpec.dropoff.country || (resolvedSpec.orderType === 'international' ? 'Singapore' : 'Indonesia')} | ${badge(sources.dropoff.country || 'ui_default')} |`,
+    `| **Drop-off Point** | ${dropoffPoint} (${resolvedSpec.dropoff.postalCode || '-'}) | ${badge(sources.dropoff.city)} |`,
+    `| **Drop-off Location Type** | ${resolvedSpec.dropoff.locationType || 'Door'} | ${badge(sources.dropoff.locationType || 'ui_default')} |`,
     `| **Drop-off Address** | ${resolvedSpec.dropoff.address || '-'} | ${badge(sources.dropoff.address)} |`,
     `| **Drop-off PIC** | ${resolvedSpec.dropoff.pic.name} (${resolvedSpec.dropoff.pic.company}) | ${badge(sources.dropoff.pic.name)} |`,
     `| **Drop-off Contact** | ${resolvedSpec.dropoff.pic.phone} / ${resolvedSpec.dropoff.pic.email} | ${badge(sources.dropoff.pic.phone)} |`,
@@ -469,5 +636,9 @@ module.exports = {
   formatSpecificationReview,
   DEFAULT_SPECIFICATION,
   PREV_SPEC_FILE,
+  REALISTIC_CARGO_ITEMS,
+  generateCargoItemName,
+  generateCargoWeightKg,
+  resetCargoGenerator,
 };
 

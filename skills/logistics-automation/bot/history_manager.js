@@ -61,6 +61,7 @@ function saveExecutionRecord(data) {
       omsStatus: o.omsStatus,
       attempts: o.attempts || 1,
       error: o.error,
+      diagnostic: o.diagnostic ? sanitizeObject(o.diagnostic) : undefined,
     })),
     specification: sanitizeObject(data.specification || {}),
   };

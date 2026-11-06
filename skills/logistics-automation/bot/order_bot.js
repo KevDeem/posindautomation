@@ -18,6 +18,10 @@ const {
 const { executeOrder } = require('../tools/order_executor');
 const { executeBatch } = require('../tools/batch_executor');
 const { executeOrderPayment, formatRupiah } = require('../tools/payment_executor');
+const {
+  validateLocationHierarchy,
+  normalizeAdminCityName,
+} = require('../tools/location_matcher');
 
 /**
  * Prompt user for input via readline
@@ -92,10 +96,29 @@ async function promptSpecificationEdits(rl, spec) {
   if (newTime) spec.scheduledTime = newTime;
 
   const newPickupCity = await promptQuestion(rl, `Pickup City [${spec.pickup.city}]: `);
-  if (newPickupCity) spec.pickup.city = newPickupCity;
+  if (newPickupCity) {
+    const norm = normalizeAdminCityName(newPickupCity);
+    if (norm.toLowerCase() !== (spec.pickup.city || '').toLowerCase()) {
+      spec.pickup.city = norm;
+      spec.pickup.district = '';
+      spec.pickup.subdistrict = '';
+      spec.pickup.postalCode = '';
+    }
+  }
 
   const newDropoffCity = await promptQuestion(rl, `Dropoff City [${spec.dropoff.city}]: `);
-  if (newDropoffCity) spec.dropoff.city = newDropoffCity;
+  if (newDropoffCity) {
+    const norm = normalizeAdminCityName(newDropoffCity);
+    if (norm.toLowerCase() !== (spec.dropoff.city || '').toLowerCase()) {
+      spec.dropoff.city = norm;
+      spec.dropoff.district = '';
+      spec.dropoff.subdistrict = '';
+      spec.dropoff.postalCode = '';
+    }
+  }
+
+  const newItemName = await promptQuestion(rl, `Cargo Item Name [${spec.cargo.itemName}]: `);
+  if (newItemName) spec.cargo.itemName = newItemName.trim();
 
   const newWeight = await promptQuestion(rl, `Weight KG [${spec.cargo.weightKg}]: `);
   if (newWeight) spec.cargo.weightKg = parseInt(newWeight, 10);
@@ -117,6 +140,20 @@ function validateSpecificationForExecution(resolvedSpec, sources = {}, userPromp
   // 2. Dropoff Point & City
   if (!resolvedSpec.dropoff || !resolvedSpec.dropoff.city || String(resolvedSpec.dropoff.city).trim() === '') {
     issues.push('Drop-off City is empty or unresolved.');
+  }
+
+  // 3. Administrative Location Hierarchy Validation
+  if (resolvedSpec.pickup) {
+    const pickupH = validateLocationHierarchy(resolvedSpec.pickup, 'Pickup');
+    if (!pickupH.valid) {
+      issues.push(pickupH.error);
+    }
+  }
+  if (resolvedSpec.dropoff) {
+    const dropoffH = validateLocationHierarchy(resolvedSpec.dropoff, 'Drop-off');
+    if (!dropoffH.valid) {
+      issues.push(dropoffH.error);
+    }
   }
 
   // 3. Explicit destination provided but unresolved
@@ -153,14 +190,21 @@ function validateSpecificationForExecution(resolvedSpec, sources = {}, userPromp
 /**
  * Handle single order flow
  */
-async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', autoPay = false } = {}) {
-  console.log(`\n=== Create ${defaultType === 'international' ? 'International' : 'Domestic'} Order ===`);
+async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', autoPay = true } = {}) {
+  console.log('\n=== Create Order and Simulate Payment ===');
   console.log('You can type your order in natural language, or press Enter to use default baseline.');
   console.log('Example: "Pickup in Tebet Jakarta Selatan to Gubeng Surabaya on 1 Dec 2026 at 08:00"');
+  console.log('         "Bandung Wetan, Kota Bandung to Tokyo, Japan air cargo on Dec 1 2026 08:00"');
 
   const userPrompt = await promptQuestion(rl, '\nOrder description: ');
   const parsed = parseOrderPrompt(userPrompt);
-  if (!parsed.spec.orderType) parsed.spec.orderType = defaultType;
+
+  // Automatically determine orderType from parsed spec or destination country without separate prompt
+  if (!parsed.spec.orderType) {
+    const isForeign = (parsed.spec.dropoff?.country && parsed.spec.dropoff.country.toLowerCase() !== 'indonesia') ||
+                      (parsed.spec.pickup?.country && parsed.spec.pickup.country.toLowerCase() !== 'indonesia');
+    parsed.spec.orderType = isForeign ? 'international' : (defaultType || 'domestic');
+  }
 
   // Resolve specification
   let { resolvedSpec, sources, missingMandatory } = resolveSpecification(parsed.spec);
@@ -201,8 +245,8 @@ async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', aut
     return;
   }
 
-  // Check if payment was requested either via menu option or natural language
-  const isPaymentRequested = autoPay || parsed.autoPay === true;
+  // Automatically simulate payment for every successfully created order
+  const isPaymentRequested = autoPay !== false;
 
   // Policy log & direct execution
   console.log('\n[POLICY] All orders submitted strictly as Non-Contract with no automatic inquiry fallback.');
@@ -219,7 +263,7 @@ async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', aut
   // Save execution record
   const savedRecord = saveExecutionRecord({
     request: userPrompt || 'Default single order',
-    menuOption: isPaymentRequested ? 'Single Order + Payment' : 'Single Order',
+    menuOption: 'Single Order + Payment',
     orderType: resolvedSpec.orderType,
     batchCount: 1,
     autoPay: isPaymentRequested,
@@ -259,65 +303,173 @@ async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', aut
 }
 
 /**
- * Handle batch orders flow
+ * Split raw batch instruction string into distinct specification items
  */
-async function handleBatchOrderFlow(rl, config, { autoPay = false } = {}) {
-  console.log('\n=== Create Multiple Orders (Batch Execution) ===');
-  console.log('You can specify count and route in natural language, or enter quantity.');
+function splitBatchPrompt(prompt = '') {
+  const text = String(prompt).trim();
+  if (!text) return [];
+
+  // 1. Explicit delimiters: semicolon, newline, pipe
+  if (/[;\n|]/.test(text)) {
+    return text.split(/[;\n|]+/).map(s => s.trim()).filter(Boolean);
+  }
+
+  // 2. Conjunctions between distinct orders (e.g., "... on 1 Dec 2026 and 2 international orders ...")
+  const conjunctionRegex = /\s+(?:and|\balso\b|\bdan\b)\s+(?=(?:create|buat|\d+\s*(?:domestic|international|orders?|pesanan|pengiriman)|international|domestic|from|pickup|jemput|kirim)\b)/i;
+  if (conjunctionRegex.test(text)) {
+    return text.split(conjunctionRegex).map(s => s.trim()).filter(Boolean);
+  }
+
+  return [text];
+}
+
+/**
+ * Handle batch orders flow (supporting mixed Domestic & International orders)
+ */
+async function handleBatchOrderFlow(rl, config, { autoPay = true } = {}) {
+  console.log('\n=== Create Multiple Orders and Simulate Payment ===');
+  console.log('You can specify single or mixed Domestic & International orders, counts, and routes.');
   console.log('Example: "Create 5 domestic orders from Tebet to Gubeng at 08:00 on 1 Dec 2026"');
+  console.log('         "2 domestic orders from Tebet to Gubeng; 2 international orders from Bandung to Tokyo"');
 
   const userPrompt = await promptQuestion(rl, '\nBatch description: ');
-  const parsed = parseOrderPrompt(userPrompt);
-  const isPaymentRequested = autoPay || parsed.autoPay === true;
+  const promptParts = splitBatchPrompt(userPrompt);
 
-  let count = parsed.count || 1;
-  if (count <= 1) {
-    const countAns = await promptQuestion(rl, 'How many identical orders to create in this batch? (default: 5): ');
-    count = parseInt(countAns, 10) || 5;
+  const rawEntries = [];
+
+  if (promptParts.length > 1) {
+    for (const part of promptParts) {
+      const parsed = parseOrderPrompt(part);
+      if (!parsed.spec.orderType) {
+        const isForeign = (parsed.spec.dropoff?.country && parsed.spec.dropoff.country.toLowerCase() !== 'indonesia') ||
+                          (parsed.spec.pickup?.country && parsed.spec.pickup.country.toLowerCase() !== 'indonesia');
+        parsed.spec.orderType = isForeign ? 'international' : 'domestic';
+      }
+      rawEntries.push({
+        rawPrompt: part,
+        spec: parsed.spec,
+        count: parsed.count || 1,
+      });
+    }
+  } else {
+    const singleText = promptParts[0] || '';
+    const parsed = parseOrderPrompt(singleText);
+    if (!parsed.spec.orderType) {
+      const isForeign = (parsed.spec.dropoff?.country && parsed.spec.dropoff.country.toLowerCase() !== 'indonesia') ||
+                        (parsed.spec.pickup?.country && parsed.spec.pickup.country.toLowerCase() !== 'indonesia');
+      parsed.spec.orderType = isForeign ? 'international' : 'domestic';
+    }
+
+    let count = parsed.count || 1;
+    if (count <= 1) {
+      const countAns = await promptQuestion(rl, 'How many identical orders to create in this batch? (default: 5): ');
+      count = parseInt(countAns, 10) || 5;
+    }
+
+    rawEntries.push({
+      rawPrompt: singleText,
+      spec: parsed.spec,
+      count,
+    });
+
+    // Optionally allow adding another specification interactively
+    while (true) {
+      const anotherPrompt = await promptQuestion(rl, 'Add another order specification to this batch? (Press Enter to finish): ');
+      if (!anotherPrompt || /^(?:n|no|selesai|done|tidak)$/i.test(anotherPrompt.trim())) {
+        break;
+      }
+      const parsedAnother = parseOrderPrompt(anotherPrompt);
+      if (!parsedAnother.spec.orderType) {
+        const isForeign = (parsedAnother.spec.dropoff?.country && parsedAnother.spec.dropoff.country.toLowerCase() !== 'indonesia') ||
+                          (parsedAnother.spec.pickup?.country && parsedAnother.spec.pickup.country.toLowerCase() !== 'indonesia');
+        parsedAnother.spec.orderType = isForeign ? 'international' : 'domestic';
+      }
+      let anotherCount = parsedAnother.count || 1;
+      if (anotherCount <= 1) {
+        const cAns = await promptQuestion(rl, 'How many identical orders for this route? (default: 1): ');
+        anotherCount = parseInt(cAns, 10) || 1;
+      }
+      rawEntries.push({
+        rawPrompt: anotherPrompt,
+        spec: parsedAnother.spec,
+        count: anotherCount,
+      });
+    }
   }
 
-  // Resolve specification
-  const { resolvedSpec, sources, missingMandatory } = resolveSpecification(parsed.spec);
-  if (missingMandatory && missingMandatory.length > 0) {
-    console.log(`\nMissing required fields: ${missingMandatory.join(', ')}`);
-    await resolveMissingMandatory(rl, resolvedSpec, missingMandatory);
+  // Resolve and validate each specification entry
+  const resolvedGroups = [];
+  for (let i = 0; i < rawEntries.length; i++) {
+    const entry = rawEntries[i];
+    if (rawEntries.length > 1) {
+      console.log(`\n--- Specification #${i + 1} (${entry.spec.orderType || 'domestic'}) ---`);
+    }
+    let { resolvedSpec, sources, missingMandatory } = resolveSpecification(entry.spec);
+    if (missingMandatory && missingMandatory.length > 0) {
+      console.log(`\nMissing required fields: ${missingMandatory.join(', ')}`);
+      await resolveMissingMandatory(rl, resolvedSpec, missingMandatory);
+      const recheck = resolveSpecification(resolvedSpec);
+      resolvedSpec = recheck.resolvedSpec;
+      sources = recheck.sources;
+    }
+
+    console.log('\n' + formatSpecificationReview(resolvedSpec, sources));
+
+    const validation = validateSpecificationForExecution(resolvedSpec, sources, entry.rawPrompt);
+    if (validation.warnings.length > 0) {
+      console.log('\n[WARNINGS DETECTED]');
+      validation.warnings.forEach(w => console.warn(`  ! ${w}`));
+    }
+
+    if (!validation.canSubmit) {
+      console.error(`\n[BLOCKER] Batch specification #${i + 1} cannot be submitted due to unresolved fields:`);
+      validation.issues.forEach(iss => console.error(`  x ${iss}`));
+      console.log('\n[CANCELED] Batch submission blocked.');
+      return;
+    }
+
+    resolvedGroups.push({
+      spec: resolvedSpec,
+      count: entry.count,
+    });
   }
 
-  console.log('\n' + formatSpecificationReview(resolvedSpec, sources));
+  // Expand into batchItems
+  const batchItems = [];
+  for (const group of resolvedGroups) {
+    for (let c = 0; c < group.count; c++) {
+      batchItems.push(JSON.parse(JSON.stringify(group.spec)));
+    }
+  }
+
+  const domesticCount = batchItems.filter(s => s.orderType !== 'international').length;
+  const intlCount = batchItems.filter(s => s.orderType === 'international').length;
   const modeLabel = config.headless ? 'Headless (background)' : 'Headed (visible browser)';
+
   console.log(`\n[Batch Summary]`);
-  console.log(`- Total Orders to create: ${count}`);
+  console.log(`- Total Orders to create: ${batchItems.length} (${domesticCount} Domestic, ${intlCount} International)`);
   console.log(`- Execution Mode: Sequential (${config.maxRetries} max retries per order)`);
-  console.log(`- Payment Simulation: ${isPaymentRequested ? 'YES (Pospay VA + Sandbox)' : 'NO'}`);
+  console.log(`- Payment Simulation: YES (Pospay VA + Sandbox)`);
   console.log(`- Browser Mode: ${modeLabel}`);
 
-  // Pre-execution validation
-  const validation = validateSpecificationForExecution(resolvedSpec, sources, userPrompt);
-  if (validation.warnings.length > 0) {
-    console.log('\n[WARNINGS DETECTED]');
-    validation.warnings.forEach(w => console.warn(`  ! ${w}`));
-  }
+  const isPaymentRequested = autoPay !== false;
 
-  if (!validation.canSubmit) {
-    console.error('\n[BLOCKER] Batch orders cannot be submitted due to unresolved fields:');
-    validation.issues.forEach(iss => console.error(`  x ${iss}`));
-    console.log('\n[CANCELED] Batch submission blocked.');
-    return;
-  }
-
-  console.log(`\nLaunching batch execution for ${count} orders (Browser Mode: ${modeLabel})...`);
-  const batchResult = await executeBatch({ specification: resolvedSpec, count }, {
+  console.log(`\nLaunching batch execution for ${batchItems.length} orders (Browser Mode: ${modeLabel})...`);
+  const batchResult = await executeBatch(batchItems, {
     headless: config.headless,
     autoPay: isPaymentRequested,
     maxRetries: config.maxRetries,
     sessionPath: config.sessionPath,
   });
 
+  const isMixed = domesticCount > 0 && intlCount > 0;
+  const orderTypeSummary = isMixed ? 'mixed' : (intlCount > 0 ? 'international' : 'domestic');
+
   const savedRecord = saveExecutionRecord({
-    request: userPrompt || `Batch ${count} orders`,
-    menuOption: isPaymentRequested ? 'Multiple Orders + Payment' : 'Multiple Orders',
-    orderType: resolvedSpec.orderType,
-    batchCount: count,
+    request: userPrompt || `Batch ${batchItems.length} orders`,
+    menuOption: 'Multiple Orders + Payment',
+    orderType: orderTypeSummary,
+    batchCount: batchItems.length,
     autoPay: isPaymentRequested,
     summary: {
       total: batchResult.total,
@@ -326,7 +478,7 @@ async function handleBatchOrderFlow(rl, config, { autoPay = false } = {}) {
       totalAmountPaid: batchResult.totalAmountPaid,
     },
     orders: batchResult.orders,
-    specification: resolvedSpec,
+    specification: batchItems[0],
   });
 
   console.log('\n======================================================');
@@ -400,43 +552,31 @@ async function startOrderingBot(options = {}) {
   let running = true;
   while (running) {
     console.log('\n--- MAIN MENU ---');
-    console.log('1. Create Domestic Order');
-    console.log('2. Create International Order');
-    console.log('3. Create Multiple Orders (Batch)');
-    console.log('4. Create Order and Simulate Payment');
-    console.log('5. Create Multiple Orders and Simulate Payment');
-    console.log('6. View Previous Execution Results');
-    console.log('7. Exit');
+    console.log('1. Create Order and Simulate Payment');
+    console.log('2. Create Multiple Orders and Simulate Payment');
+    console.log('3. View Previous Execution Results');
+    console.log('4. Exit');
 
-    const choice = await promptQuestion(rl, '\nSelect option [1-7]: ');
+    const choice = await promptQuestion(rl, '\nSelect option [1-4]: ');
 
     switch (choice) {
       case '1':
-        await handleSingleOrderFlow(rl, config, { defaultType: 'domestic', autoPay: false });
+        await handleSingleOrderFlow(rl, config, { autoPay: true });
         break;
       case '2':
-        await handleSingleOrderFlow(rl, config, { defaultType: 'international', autoPay: false });
-        break;
-      case '3':
-        await handleBatchOrderFlow(rl, config, { autoPay: false });
-        break;
-      case '4':
-        await handleSingleOrderFlow(rl, config, { defaultType: 'domestic', autoPay: true });
-        break;
-      case '5':
         await handleBatchOrderFlow(rl, config, { autoPay: true });
         break;
-      case '6':
+      case '3':
         await handleViewHistory(rl);
         break;
-      case '7':
+      case '4':
       case 'exit':
       case 'q':
         console.log('\nExiting POSIND Ordering Bot. Goodbye!\n');
         running = false;
         break;
       default:
-        console.log('Invalid selection. Please choose an option between 1 and 7.');
+        console.log('Invalid selection. Please choose an option between 1 and 4.');
         break;
     }
   }
@@ -452,4 +592,6 @@ module.exports = {
   validateSpecificationForExecution,
   promptQuestion,
   promptBrowserMode,
+  promptSpecificationEdits,
+  splitBatchPrompt,
 };
