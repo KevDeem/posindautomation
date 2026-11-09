@@ -352,6 +352,116 @@ function detectLocationType(text) {
   return 'Door';
 }
 
+/**
+ * Categorize a location into 'Door', 'Port' (seaport), or 'Airport'.
+ *
+ * @param {string} text Raw location name or type
+ * @returns {'Door'|'Port'|'Airport'}
+ */
+function detectLocationCategory(text) {
+  if (!text) return 'Door';
+  const str = String(text).toLowerCase();
+  if (/\b(?:airport|bandara|bandar\s+udara|soekarno-?hatta|tokyo\s+airport|haneda|narita|changi|juanda|ngurah\s+rai|kualanamu|hasanuddin)\b/i.test(str)) {
+    return 'Airport';
+  }
+  if (/\b(?:port|pelabuhan|tanjung\s+priok|tanjung\s+perak|belawan|singapore\s+port|batam\s+port|makassar\s+port)\b/i.test(str)) {
+    return 'Port';
+  }
+  if (/\bdoor\b/i.test(str)) {
+    return 'Door';
+  }
+  return 'Door';
+}
+
+/**
+ * Island mappings for Indonesian provinces and cities.
+ */
+const INDONESIA_ISLAND_MAPPINGS = {
+  // Java
+  'dki jakarta': 'Java',
+  'jakarta': 'Java',
+  'jawa barat': 'Java',
+  'banten': 'Java',
+  'jawa tengah': 'Java',
+  'di yogyakarta': 'Java',
+  'yogyakarta': 'Java',
+  'jawa timur': 'Java',
+  // Bali & Nusa Tenggara
+  'bali': 'Bali',
+  'denpasar': 'Bali',
+  'nusa tenggara barat': 'Nusa Tenggara',
+  'nusa tenggara timur': 'Nusa Tenggara',
+  // Sumatra
+  'aceh': 'Sumatra',
+  'sumatera utara': 'Sumatra',
+  'sumatra utara': 'Sumatra',
+  'medan': 'Sumatra',
+  'sumatera barat': 'Sumatra',
+  'riau': 'Sumatra',
+  'kepulauan riau': 'Riau Islands',
+  'batam': 'Riau Islands',
+  'jambi': 'Sumatra',
+  'sumatera selatan': 'Sumatra',
+  'palembang': 'Sumatra',
+  'bengkulu': 'Sumatra',
+  'lampung': 'Sumatra',
+  'kepulauan bangka belitung': 'Bangka Belitung',
+  // Kalimantan
+  'kalimantan barat': 'Kalimantan',
+  'kalimantan tengah': 'Kalimantan',
+  'kalimantan selatan': 'Kalimantan',
+  'kalimantan timur': 'Kalimantan',
+  'balikpapan': 'Kalimantan',
+  'samarinda': 'Kalimantan',
+  'kalimantan utara': 'Kalimantan',
+  // Sulawesi
+  'sulawesi utara': 'Sulawesi',
+  'manado': 'Sulawesi',
+  'sulawesi tengah': 'Sulawesi',
+  'sulawesi selatan': 'Sulawesi',
+  'makassar': 'Sulawesi',
+  'sulawesi tenggara': 'Sulawesi',
+  'gorontalo': 'Sulawesi',
+  'sulawesi barat': 'Sulawesi',
+  // Maluku & Papua
+  'maluku': 'Maluku',
+  'maluku utara': 'Maluku',
+  'ambon': 'Maluku',
+  'papua': 'Papua',
+  'jayapura': 'Papua',
+  'papua barat': 'Papua',
+  'papua selatan': 'Papua',
+  'papua tengah': 'Papua',
+  'papua pegunungan': 'Papua',
+  'papua barat daya': 'Papua',
+};
+
+/**
+ * Identify the island region for an Indonesian location object or string.
+ *
+ * @param {Object|string} loc
+ * @returns {string|null}
+ */
+function getIndonesianIsland(loc) {
+  if (!loc) return null;
+  const terms = typeof loc === 'string'
+    ? [loc]
+    : [loc.province, loc.city, loc.district, loc.locality, loc.address].filter(Boolean);
+
+  for (const term of terms) {
+    const clean = String(term).toLowerCase().trim();
+    if (INDONESIA_ISLAND_MAPPINGS[clean]) {
+      return INDONESIA_ISLAND_MAPPINGS[clean];
+    }
+    for (const [key, island] of Object.entries(INDONESIA_ISLAND_MAPPINGS)) {
+      if (clean.includes(key)) {
+        return island;
+      }
+    }
+  }
+  return null;
+}
+
 const INCOTERM_MAP = {
   'ddp': 'Delivered Duty Paid',
   'delivered duty paid': 'Delivered Duty Paid',
@@ -399,6 +509,9 @@ module.exports = {
   validateAndMatchDistrict,
   validateLocationHierarchy,
   detectLocationType,
+  detectLocationCategory,
+  getIndonesianIsland,
+  INDONESIA_ISLAND_MAPPINGS,
   normalizeIncoterm,
   INCOTERM_MAP,
   KNOWN_PROVINCES,

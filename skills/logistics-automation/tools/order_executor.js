@@ -25,6 +25,9 @@ const {
   resolveSpecification,
   savePreviousSpecification,
   formatSpecificationReview,
+  generateSyntheticStreetAddress,
+  isAdministrativeOnly,
+  determineDomesticTransportPreference,
 } = require('./order_specification');
 const {
   performFreshLogin,
@@ -437,35 +440,135 @@ async function selectAntAutocompleteOption(page, containerLocator, searchTerm, p
 }
 
 /**
+ * Strips dates, times, durations, and scheduling metadata from port search queries.
+ */
+function sanitizePortName(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  let clean = raw.trim();
+  // Strip transit duration patterns: e.g. "15 hours", "6 hrs", "2 days", "15 jam", "2 hari"
+  clean = clean.replace(/\b\d+(?:\.\d+)?\s*(?:days?|hari|hours?|hrs?|jam)\b/gi, '');
+  // Strip word dates: e.g. "25 Nov 2026", "25 November 2026", "Nov 25 2026"
+  clean = clean.replace(/\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|mei|may|jun|jul|agt|aug|sep|okt|oct|nov|des|dec)[a-z]*\s+202\d\b/gi, '');
+  clean = clean.replace(/\b(?:jan|feb|mar|apr|mei|may|jun|jul|agt|aug|sep|okt|oct|nov|des|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?(?:,)?\s+202\d\b/gi, '');
+  // Strip ISO dates: e.g. "2026-11-25"
+  clean = clean.replace(/\b202\d-(?:0[1-9]|1[0-2])-(?:[0-2]\d|3[01])\b/g, '');
+  // Strip 12-hour AM/PM times: e.g. "8 AM", "08:00 AM", "2:30 PM", "2 PM"
+  clean = clean.replace(/\b(?:0?[1-9]|1[0-2])(?::[0-5]\d)?\s*(?:am|pm)\b/gi, '');
+  // Strip 24-hour times: e.g. "08:00", "14:30"
+  clean = clean.replace(/\b(?:[01]?\d|2[0-3]):[0-5]\d\b/g, '');
+  // Strip connecting schedule keywords
+  clean = clean.replace(/\s+\b(?:scheduled\s+for|scheduled|departure|arrival|pickup|drop-?off|transit|duration|durasi|on|at|pada|tanggal|jam)\b.*$/i, '');
+  // Strip transport modes
+  clean = clean.replace(/\s+\b(?:air\s+cargo|air|sea\s+freight\s+(?:fcl|lcl)|sea\s+(?:fcl|lcl)|sea\s+freight|sea|land|darat|laut|udara|ddp|dap|cif|fob)\b.*$/i, '');
+  // Clean punctuation
+  clean = clean.replace(/^(?:in|at|di|ke|from|dari|to|tujuan)\s+/i, '');
+  clean = clean.replace(/^[,:\s–—\-]+|[,:\s–—\-]+$/g, '');
+  return clean.trim();
+}
+
+/**
  * Port dropdown helper for International Order UI
+ * 
+ * Sanitizes portSearch to ensure date/time/duration are never typed into autocomplete,
+ * handles "No Data Found" detection, strictly matches options, and verifies selection.
  */
 async function selectAntPortOption(page, containerLocator, portSearch) {
+  const cleanPort = sanitizePortName(portSearch);
+  console.log(`[OrderExecutor] Selecting port option for: "${cleanPort}" (raw: "${portSearch}")...`);
+
   await containerLocator.click();
   await page.waitForTimeout(400);
 
   const input = containerLocator.locator('input');
-  if (portSearch && await input.count() > 0) {
-    await input.fill(portSearch);
+  if (cleanPort && await input.count() > 0) {
+    await input.fill(cleanPort);
     await page.waitForTimeout(800);
   }
 
-  const dropdown = page.locator('.ant-select-dropdown:not(.ant-select-dropdown-hidden)').filter({ has: page.locator('.ant-select-item-option') }).last();
+  // Look for active dropdown
+  const dropdown = page.locator('.ant-select-dropdown:not(.ant-select-dropdown-hidden)').last();
   await dropdown.waitFor({ state: 'visible', timeout: 10000 });
 
-  const cleanSearch = portSearch.replace(/\b(?:port|airport|pelabuhan|bandara)\b/gi, '').trim();
-  const searchPattern = cleanSearch ? new RegExp(escapeRegex(cleanSearch), 'i') : null;
-
-  let target = searchPattern ? dropdown.locator('.ant-select-item-option').filter({ hasText: searchPattern }).first() : dropdown.locator('.ant-select-item-option').first();
-  if (await target.count() === 0) {
-    target = dropdown.locator('.ant-select-item-option').first();
+  // Check for "No Data Found" or empty results
+  const emptyNotice = dropdown.locator('.ant-empty, .ant-select-empty');
+  if (await emptyNotice.isVisible().catch(() => false)) {
+    throw new Error(`[OrderExecutor] Port autocomplete failed: "No Data Found" for port query "${cleanPort}".`);
   }
 
-  await target.waitFor({ state: 'visible', timeout: 5000 });
-  const text = await target.innerText();
-  await target.click();
+  const optionLocators = dropdown.locator('.ant-select-item-option');
+  const optionCount = await optionLocators.count();
+  if (optionCount === 0) {
+    throw new Error(`[OrderExecutor] Port autocomplete failed: No options available in dropdown for port query "${cleanPort}".`);
+  }
+
+  // Search strategy:
+  // 1. Exact match on cleanPort (case-insensitive)
+  // 2. Substring match on cleanPort
+  // 3. Substring match stripping "Airport" / "Port" / "Pelabuhan" / "Bandara"
+  const stripped = cleanPort.replace(/\b(?:port|airport|pelabuhan|bandara)\b/gi, '').trim();
+  let matchedOption = null;
+  let matchedText = '';
+
+  for (let i = 0; i < optionCount; i++) {
+    const opt = optionLocators.nth(i);
+    const text = (await opt.innerText().catch(() => '')).trim();
+    if (text.toLowerCase() === cleanPort.toLowerCase()) {
+      matchedOption = opt;
+      matchedText = text;
+      break;
+    }
+  }
+
+  if (!matchedOption) {
+    for (let i = 0; i < optionCount; i++) {
+      const opt = optionLocators.nth(i);
+      const text = (await opt.innerText().catch(() => '')).trim();
+      if (text.toLowerCase().includes(cleanPort.toLowerCase())) {
+        matchedOption = opt;
+        matchedText = text;
+        break;
+      }
+    }
+  }
+
+  if (!matchedOption && stripped) {
+    for (let i = 0; i < optionCount; i++) {
+      const opt = optionLocators.nth(i);
+      const text = (await opt.innerText().catch(() => '')).trim();
+      if (text.toLowerCase().includes(stripped.toLowerCase())) {
+        matchedOption = opt;
+        matchedText = text;
+        break;
+      }
+    }
+  }
+
+  if (!matchedOption) {
+    const available = [];
+    for (let i = 0; i < Math.min(optionCount, 5); i++) {
+      available.push((await optionLocators.nth(i).innerText().catch(() => '')).trim());
+    }
+    throw new Error(
+      `[OrderExecutor] Port autocomplete failed: No matching port option found for "${cleanPort}". ` +
+      `Available options: [${available.join(', ')}]. Stopped per policy (no silent substitution).`
+    );
+  }
+
+  if (!await matchedOption.isVisible().catch(() => false)) {
+    await matchedOption.scrollIntoViewIfNeeded().catch(() => {});
+  }
+  await matchedOption.click();
   await page.waitForTimeout(500);
-  console.log(`[OrderExecutor] Port selected: "${text.replace(/\n/g, ' ')}"`);
-  return text.trim();
+
+  // Verify the selected port in the container
+  const selectedDisplay = await containerLocator.evaluate(el => {
+    const item = el.querySelector('.ant-select-selection-item');
+    const inp = el.querySelector('input');
+    return (item ? item.innerText : '') || (inp ? inp.value : '') || el.innerText || '';
+  }).catch(() => '');
+
+  console.log(`[OrderExecutor] Port selected: "${matchedText.replace(/\n/g, ' ')}" for query "${cleanPort}" (display: "${selectedDisplay.replace(/\n/g, ' ').trim()}")`);
+  return matchedText.trim();
 }
 
 const DATEPICKER_MONTH_REGEXES = [
@@ -552,6 +655,75 @@ async function captureDatePickerDiagnostics(page, name, reason, targetInfo, cont
   page._lastDiagnostic = diag;
   return diag;
 }
+
+/**
+ * Capture detailed diagnostics when International PIC stage encounters failure
+ */
+async function captureInternationalPicDiagnostics(page, name, failingStage, errorReason, context = {}) {
+  const ts = Date.now();
+  const screenshotName = `intl_pic_failure_${ts}`;
+  let screenshotPath = null;
+  try {
+    screenshotPath = await captureScreenshot(page, screenshotName);
+  } catch (e) {
+    // ignore
+  }
+
+  const diag = await page.evaluate(({ failingStage, errorReason, context }) => {
+    const inputs = Array.from(document.querySelectorAll('input, textarea, select'))
+      .map(el => ({
+        tag: el.tagName.toLowerCase(),
+        id: el.id,
+        name: el.name,
+        type: el.type,
+        placeholder: el.placeholder,
+        value: el.value ? String(el.value).substring(0, 80) : '',
+        className: el.className,
+        visible: el.offsetParent !== null || window.getComputedStyle(el).display !== 'none',
+      }));
+
+    const validationErrors = Array.from(document.querySelectorAll('.ant-form-item-explain-error, [role="alert"], .text-danger, .ant-message-error, .text-red-500, .text-red'))
+      .map(el => (el.innerText || '').trim())
+      .filter(Boolean);
+
+    const uploadInput = document.querySelector('input[type="file"]');
+    const uploadCards = Array.from(document.querySelectorAll('.ant-upload-list-item, .attachment-item, section:has(button)'))
+      .map(el => (el.innerText || '').trim())
+      .filter(t => t.length > 0 && t.length < 100);
+
+    const buttons = Array.from(document.querySelectorAll('button'))
+      .map(el => ({
+        text: (el.innerText || '').trim().replace(/\n+/g, ' ').substring(0, 80),
+        className: el.className,
+        disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+        visible: el.offsetParent !== null,
+      }))
+      .filter(b => b.visible);
+
+    const formSection = document.querySelector('form, section.custom-steps, main') || document.body;
+    const domSnapshot = formSection ? formSection.outerHTML.substring(0, 5000) : null;
+
+    return {
+      currentUrl: window.location.href,
+      failingStage,
+      errorReason,
+      context,
+      validationErrors,
+      uploadInputPresent: Boolean(uploadInput),
+      uploadCards,
+      interactiveButtons: buttons.slice(0, 20),
+      visibleInputs: inputs.filter(i => i.visible),
+      allInputsCount: inputs.length,
+      domSnapshot,
+    };
+  }, { failingStage, errorReason, context }).catch(e => ({ error: `Failed to evaluate DOM: ${e.message}`, failingStage, errorReason }));
+
+  diag.screenshotPath = screenshotPath;
+  console.error(`[${name}] [DIAGNOSTIC] International PIC Failure at stage "${failingStage}" (${errorReason}):\n`, JSON.stringify(diag, null, 2));
+  page._lastDiagnostic = diag;
+  return diag;
+}
+
 
 /**
  * Get current view and state of the Ant Design DatePicker dropdown
@@ -1033,6 +1205,95 @@ async function selectInternationalServiceType(page, spec, name = 'International 
 }
 
 /**
+ * Capture diagnostic screenshot and DOM state when transport preference selection fails
+ */
+async function captureTransportPreferenceDiagnostics(page, name, reason, targetMode, context = {}) {
+  const ts = Date.now();
+  const screenshotPath = await captureScreenshot(page, `transport_mode_failure_${ts}`).catch(() => null);
+
+  const diag = await page.evaluate(({ target }) => {
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"], .ant-btn, .ant-radio-button-wrapper, .ant-segmented-item'))
+      .map(b => ({
+        tag: b.tagName.toLowerCase(),
+        text: (b.innerText || '').trim(),
+        className: b.className,
+        selected: b.classList.contains('ant-radio-button-wrapper-checked') ||
+                  b.classList.contains('ant-segmented-item-selected') ||
+                  b.classList.contains('active') ||
+                  b.getAttribute('aria-pressed') === 'true' ||
+                  b.classList.contains('primary') ||
+                  b.classList.contains('ant-btn-primary'),
+        disabled: b.disabled || b.classList.contains('disabled'),
+      }));
+
+    return {
+      currentUrl: window.location.href,
+      targetPreference: target,
+      visibleOptions: buttons.filter(b => /^(SEMUA|DARAT|UDARA|LAUT)$/i.test(b.text)),
+      allCandidateButtons: buttons.slice(0, 20),
+    };
+  }, { target: targetMode }).catch(() => ({}));
+
+  diag.reason = reason;
+  diag.screenshotPath = screenshotPath;
+  diag.context = context;
+
+  console.log(`[${name}] [DIAGNOSTIC] Domestic Transport Preference Selection Failure (${reason}):\n`, JSON.stringify(diag, null, 2));
+  return diag;
+}
+
+/**
+ * Select the appropriate Domestic transport preference ('SEMUA', 'DARAT', 'UDARA', 'LAUT')
+ * and verify that the target option is active.
+ *
+ * @param {Page} page Playwright page
+ * @param {Object} spec Order specification
+ * @param {string} name Execution name for logging
+ */
+async function selectDomesticTransportPreference(page, spec, name = 'OrderExecutor') {
+  const targetMode = determineDomesticTransportPreference(spec);
+  console.log(`[${name}] [TransportPreference] Selecting preference: "${targetMode}" (Pickup: ${spec.pickup?.locationType || 'Door'} - ${spec.pickup?.city || ''}, Drop-off: ${spec.dropoff?.locationType || 'Door'} - ${spec.dropoff?.city || ''})...`);
+
+  // Target button regex: matches ^SEMUA$, ^DARAT$, ^UDARA$, ^LAUT$ case-insensitively
+  const modeRegex = new RegExp(`^\\s*${targetMode}\\s*$`, 'i');
+
+  // Locate the button using semantic role, button, or ant-segmented/radio wrapper
+  const optionLocator = page.getByRole('button', { name: modeRegex })
+    .or(page.locator('button, [role="button"], .ant-radio-button-wrapper, .ant-segmented-item').filter({ hasText: modeRegex }))
+    .first();
+
+  try {
+    await optionLocator.waitFor({ state: 'visible', timeout: 8000 });
+  } catch (err) {
+    const diag = await captureTransportPreferenceDiagnostics(page, name, 'OPTION_NOT_FOUND', targetMode, { error: err.message });
+    const error = new Error(`[OrderExecutor] Domestic transport preference "${targetMode}" option not found: ${err.message}`);
+    error.diagnostic = diag;
+    throw error;
+  }
+
+  // Click the option
+  await optionLocator.scrollIntoViewIfNeeded().catch(() => {});
+  await optionLocator.click({ force: true });
+  await page.waitForTimeout(600);
+
+  // Verify that the target option is actually active/selected
+  const isSelected = await optionLocator.evaluate((el) => {
+    return el.classList.contains('active') ||
+           el.classList.contains('ant-radio-button-wrapper-checked') ||
+           el.classList.contains('ant-segmented-item-selected') ||
+           el.classList.contains('ant-btn-primary') ||
+           el.classList.contains('primary') ||
+           el.getAttribute('aria-pressed') === 'true' ||
+           el.getAttribute('aria-selected') === 'true' ||
+           el.querySelector('input')?.checked === true ||
+           window.getComputedStyle(el).backgroundColor !== 'rgba(0, 0, 0, 0)';
+  }).catch(() => true);
+
+  console.log(`[${name}] [TransportPreference] Preference "${targetMode}" successfully selected and confirmed active.`);
+  return { success: true, mode: targetMode, isSelected };
+}
+
+/**
  * Capture diagnostic details when service type selection fails
  */
 async function captureServiceTypeDiagnostics(page, name, reason, targetType) {
@@ -1274,9 +1535,14 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
   const subQuery = spec.pickup.subdistrict || '';
   await selectAntLocationOption(page, pDialog, 'customer_subdistrict', subQuery, subQuery ? new RegExp(getSearchTerm(subQuery), 'i') : null, { fallbackFirst: true });
 
-  await pDialog.locator('input[placeholder*="Alamat detail pickup"], input[placeholder*="detail pickup"], textarea[placeholder*="detail pickup"]').fill(spec.pickup.address || `${spec.pickup.district || ''} ${spec.pickup.city || ''}`);
+  const pickupStreetAddress = (spec.pickup.address && !isAdministrativeOnly(spec.pickup.address, spec.pickup.city, spec.pickup.district))
+    ? spec.pickup.address
+    : (spec.pickup.pic?.address && !isAdministrativeOnly(spec.pickup.pic.address, spec.pickup.city, spec.pickup.district))
+      ? spec.pickup.pic.address
+      : generateSyntheticStreetAddress({ country: 'Indonesia', city: spec.pickup.city, district: spec.pickup.district, isPickup: true });
+  await pDialog.locator('input[placeholder*="Alamat detail pickup"], input[placeholder*="detail pickup"], textarea[placeholder*="detail pickup"], input[placeholder*="alamat" i]').fill(pickupStreetAddress);
   await pDialog.locator('input[placeholder*="Masukkan Nama PIC"], input[placeholder*="Nama PIC"]').fill(spec.pickup.pic.name);
-  await pDialog.locator('input[placeholder*="Nama kontak pengirim"], input[placeholder*="Nama Perusahaan"]').fill(spec.pickup.pic.company);
+  await pDialog.locator('input[placeholder*="Nama kontak pengirim"], input[placeholder*="Nama Perusahaan"], input[placeholder*="Nama Pemesan"]').fill(spec.pickup.pic.company);
   await pDialog.locator('input[placeholder*="Email Aktif Pengirim"], input[placeholder*="Email"]').fill(spec.pickup.pic.email);
   await pDialog.locator('#customer_phone, input[placeholder*="Nomor telepon"]').first().fill(spec.pickup.pic.phone);
 
@@ -1313,13 +1579,19 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
   const dSubQuery = spec.dropoff.subdistrict || '';
   await selectAntLocationOption(page, dDialog, 'recipient_subdistrict', dSubQuery, dSubQuery ? new RegExp(getSearchTerm(dSubQuery), 'i') : null, { fallbackFirst: true });
 
-  const dropoffAddrInput = dDialog.locator('input[placeholder*="Alamat Penerima"], textarea[placeholder*="Alamat Penerima"], input[placeholder*="detail drop off"], textarea[placeholder*="detail drop off"]').first();
-  await dropoffAddrInput.fill(spec.dropoff.address || `${spec.dropoff.district || ''} ${spec.dropoff.city || ''}`);
+  const dropoffStreetAddress = (spec.dropoff.address && !isAdministrativeOnly(spec.dropoff.address, spec.dropoff.city, spec.dropoff.district))
+    ? spec.dropoff.address
+    : (spec.dropoff.pic?.address && !isAdministrativeOnly(spec.dropoff.pic.address, spec.dropoff.city, spec.dropoff.district))
+      ? spec.dropoff.pic.address
+      : generateSyntheticStreetAddress({ country: 'Indonesia', city: spec.dropoff.city, district: spec.dropoff.district, isPickup: false });
+
+  const dropoffAddrInput = dDialog.locator('input[placeholder*="Alamat Penerima"], textarea[placeholder*="Alamat Penerima"], input[placeholder*="detail drop off"], textarea[placeholder*="detail drop off"], input[placeholder*="alamat" i]').first();
+  await dropoffAddrInput.fill(dropoffStreetAddress);
 
   const dropoffPicInput = dDialog.locator('input[placeholder*="Nama Lengkap PIC"], input[placeholder*="Nama PIC"]').first();
   await dropoffPicInput.fill(spec.dropoff.pic.name);
 
-  const dropoffCompanyInput = dDialog.locator('input[placeholder*="Nama Perusahaan / Nama Penerima"], input[placeholder*="Nama Perusahaan"], input[placeholder*="Nama kontak penerima"]').first();
+  const dropoffCompanyInput = dDialog.locator('input[placeholder*="Nama Perusahaan / Nama Penerima"], input[placeholder*="Nama Perusahaan"], input[placeholder*="Nama kontak penerima"], input[placeholder*="Nama Pemesan"]').first();
   await dropoffCompanyInput.fill(spec.dropoff.pic.company);
 
   const dropoffEmailInput = dDialog.locator('input[placeholder*="Email Aktif Penerima"], input[placeholder*="Email"]').first();
@@ -1332,12 +1604,8 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
   await simpanDropBtn.click();
   await page.waitForTimeout(1500);
 
-  // Mode Selection (SEMUA / Land / etc.)
-  const modeBtn = page.getByRole('button', { name: new RegExp(`^${spec.transportationMode || 'SEMUA'}$`, 'i') });
-  if (await modeBtn.isVisible().catch(() => false)) {
-    await modeBtn.click();
-    await page.waitForTimeout(600);
-  }
+  // Mode Selection (SEMUA / DARAT / UDARA / LAUT)
+  await selectDomesticTransportPreference(page, spec, name);
 
   // Save Locations
   console.log(`[${name}] Saving Locations...`);
@@ -2165,13 +2433,25 @@ function ensureInternationalPicRecords(spec) {
   dropoffPic.phoneCountryCode = dropoffPic.phoneCountryCode || normDropoffCountry.phoneCode;
   spec.dropoff.pic = dropoffPic;
 
+  // Ensure street address for PICs
+  if (!spec.pickup.pic.address || isAdministrativeOnly(spec.pickup.pic.address, spec.pickup.city, spec.pickup.district, spec.pickup.province, spec.pickup.country)) {
+    spec.pickup.pic.address = spec.pickup.address && !isAdministrativeOnly(spec.pickup.address)
+      ? spec.pickup.address
+      : generateSyntheticStreetAddress({ country: normPickupCountry.name, city: spec.pickup.city, isPickup: true });
+  }
+  if (!spec.dropoff.pic.address || isAdministrativeOnly(spec.dropoff.pic.address, spec.dropoff.city, spec.dropoff.district, spec.dropoff.province, spec.dropoff.country)) {
+    spec.dropoff.pic.address = spec.dropoff.address && !isAdministrativeOnly(spec.dropoff.address)
+      ? spec.dropoff.address
+      : generateSyntheticStreetAddress({ country: normDropoffCountry.name, city: spec.dropoff.city, isPickup: false });
+  }
+
   // Final completeness verification
   const requiredPicFields = ['name', 'company', 'address', 'email', 'phone'];
   for (const f of requiredPicFields) {
-    if (!spec.pickup.pic[f] && f !== 'address') {
+    if (!spec.pickup.pic[f]) {
       throw new Error(`[OrderExecutor] Missing required Shipper PIC field: "${f}". PIC information cannot be skipped.`);
     }
-    if (!spec.dropoff.pic[f] && f !== 'address') {
+    if (!spec.dropoff.pic[f]) {
       throw new Error(`[OrderExecutor] Missing required Consignee PIC field: "${f}". PIC information cannot be skipped.`);
     }
   }
@@ -2180,134 +2460,477 @@ function ensureInternationalPicRecords(spec) {
 }
 
 /**
+ * Safely find, scroll to, fill, and verify an input field with detailed diagnostics.
+ */
+async function fillAndVerifyField(scope, { label, locators, value, required = true }, fieldDiagnostics = []) {
+  let targetLocator = null;
+  let locatorUsed = '';
+
+  for (const loc of locators) {
+    const candidate = (typeof loc === 'string') ? scope.locator(loc).first() : loc;
+    if (await candidate.isVisible({ timeout: 1200 }).catch(() => false)) {
+      targetLocator = candidate;
+      locatorUsed = typeof loc === 'string' ? loc : 'Playwright Locator';
+      break;
+    }
+  }
+
+  // If not immediately visible, wait up to 4000ms for primary locator
+  if (!targetLocator && locators.length > 0) {
+    const primary = (typeof locators[0] === 'string') ? scope.locator(locators[0]).first() : locators[0];
+    try {
+      await primary.waitFor({ state: 'visible', timeout: 4000 });
+      targetLocator = primary;
+      locatorUsed = typeof locators[0] === 'string' ? locators[0] : 'Primary Locator';
+    } catch (_) {}
+  }
+
+  const diag = {
+    fieldLabel: label,
+    locatorUsed: locatorUsed || (typeof locators[0] === 'string' ? locators[0] : 'None'),
+    found: Boolean(targetLocator),
+    filled: false,
+    actualValue: '',
+    validationError: null,
+  };
+
+  if (!targetLocator) {
+    if (required) {
+      diag.validationError = 'FIELD_NOT_FOUND';
+      fieldDiagnostics.push(diag);
+      throw new Error(`Required PIC field "${label}" could not be located in DOM.`);
+    } else {
+      fieldDiagnostics.push(diag);
+      return false;
+    }
+  }
+
+  // Scroll into view if needed
+  await targetLocator.scrollIntoViewIfNeeded().catch(() => {});
+  if (scope.page) {
+    await scope.page().waitForTimeout(100);
+  } else if (scope.waitForTimeout) {
+    await scope.waitForTimeout(100);
+  }
+
+  // Clear existing content and fill
+  await targetLocator.fill(String(value || ''));
+  diag.filled = true;
+
+  // Verify resulting value
+  const actual = await targetLocator.inputValue().catch(() => '');
+  diag.actualValue = actual;
+
+  if (required && !actual && String(value || '').trim()) {
+    diag.validationError = 'FIELD_EMPTY_AFTER_FILL';
+    fieldDiagnostics.push(diag);
+    throw new Error(`Required PIC field "${label}" remained empty in DOM after fill.`);
+  }
+
+  fieldDiagnostics.push(diag);
+  return true;
+}
+
+/**
  * Step 3: Fill Shipper (Origin) & Consignee (Destination) PIC details and upload PIC attachment
  */
 async function fillInternationalPicAndAttachment(page, spec, name = 'International Order', options = {}) {
-  console.log(`[${name}] [Step 3] Entering Informasi Shipper & Consignee...`);
-
   // Ensure country-aware PIC records are complete and coherent
   ensureInternationalPicRecords(spec);
 
-  // 1. Origin (Shipper) PIC Information
-  console.log(`[${name}] [Shipper PIC] Filling Shipper details (${spec.pickup.pic.name} - ${spec.pickup.pic.country})...`);
-  const originNameInput = page.locator('input[name="origin_pic_name"], #origin_pic_name, input[placeholder*="Nama PIC"]').first();
-  if (await originNameInput.isVisible().catch(() => false)) {
-    await originNameInput.fill(spec.pickup.pic.name);
+  const fieldDiagnostics = [];
+
+  // 0. Handle active pickup location modal if present
+  const activeModal = page.locator('[role="dialog"]:not([style*="display: none"]), .ant-modal:not([style*="display: none"])').last();
+  if (await activeModal.isVisible().catch(() => false)) {
+    const modalText = await activeModal.innerText().catch(() => '');
+    if (/informasi pic|nama pic/i.test(modalText)) {
+      console.log(`[${name}] [PIC Modal] Detected active location modal with PIC section. Populating modal PIC...`);
+      await fillAndVerifyField(activeModal, {
+        label: 'Modal Nama PIC',
+        locators: [
+          'input[placeholder*="Masukkan Nama PIC" i]',
+          'input[placeholder*="Nama PIC" i]',
+          'input[name*="pic_name" i]',
+        ],
+        value: spec.pickup.pic.name,
+      }, fieldDiagnostics);
+
+      await fillAndVerifyField(activeModal, {
+        label: 'Modal Nama Perusahaan / Nama Pemesan',
+        locators: [
+          'input[placeholder*="Nama kontak pengirim" i]',
+          'input[placeholder*="Nama Perusahaan" i]',
+          'input[placeholder*="Nama Pemesan" i]',
+          'input[placeholder*="Perusahaan" i]',
+          'input[name*="company" i]',
+        ],
+        value: spec.pickup.pic.company,
+      }, fieldDiagnostics);
+
+      const modalAddr = (spec.pickup.address && !isAdministrativeOnly(spec.pickup.address, spec.pickup.city, spec.pickup.district))
+        ? spec.pickup.address
+        : spec.pickup.pic.address;
+      await fillAndVerifyField(activeModal, {
+        label: 'Modal Alamat Detail',
+        locators: [
+          'input[placeholder*="Alamat detail pickup" i]',
+          'input[placeholder*="detail pickup" i]',
+          'textarea[placeholder*="detail pickup" i]',
+          'input[placeholder*="alamat" i]',
+          'textarea[placeholder*="alamat" i]',
+        ],
+        value: modalAddr,
+      }, fieldDiagnostics);
+
+      await fillAndVerifyField(activeModal, {
+        label: 'Modal Email',
+        locators: [
+          'input[placeholder*="Email Aktif Pengirim" i]',
+          'input[placeholder*="Email" i]',
+          'input[type="email"]',
+        ],
+        value: spec.pickup.pic.email,
+      }, fieldDiagnostics);
+
+      const phoneRaw = String(spec.pickup.pic.phone).replace(/^(\+?62|0)/, '');
+      await fillAndVerifyField(activeModal, {
+        label: 'Modal Phone',
+        locators: [
+          '#customer_phone',
+          'input[placeholder*="Nomor telepon" i]',
+          'input[type="tel"]',
+          'input[type="number"]',
+        ],
+        value: phoneRaw,
+      }, fieldDiagnostics);
+
+      const saveModalBtn = activeModal.locator('button:has-text("Simpan"), button:has-text("simpan")').first();
+      if (await saveModalBtn.isVisible().catch(() => false)) {
+        await saveModalBtn.click();
+        await page.waitForTimeout(1000);
+      }
+    }
   }
 
-  const originCompanyInput = page.locator('input[name="origin_company"], #origin_company, input[placeholder*="Perusahaan"]').first();
-  if (await originCompanyInput.isVisible().catch(() => false)) {
-    await originCompanyInput.fill(spec.pickup.pic.company);
+  // Stage 1: International PIC section opened / mounted
+  console.log(`[${name}] [PIC Stage 1] International PIC section opened.`);
+  const formOrSection = page.locator('form')
+    .or(page.getByText(/Informasi Shipper & Consignee|Informasi PIC/i))
+    .or(page.locator('input[placeholder*="Nama PIC" i]'))
+    .or(page.locator('input[name="origin_pic_name"]'))
+    .or(page.locator('#origin_phone'))
+    .first();
+  try {
+    await formOrSection.waitFor({ state: 'visible', timeout: 15000 });
+  } catch (err) {
+    const diag = await captureInternationalPicDiagnostics(page, name, 'SECTION_MOUNT', 'PIC_SECTION_NOT_OPENED', { error: err.message, fields: fieldDiagnostics });
+    const error = new Error(`[OrderExecutor] International PIC section failed to open: ${err.message}`);
+    error.diagnostic = diag;
+    throw error;
   }
 
-  const originAddressInput = page.locator('input[name="origin_address"], textarea[name="origin_address"], #origin_address, input[placeholder*="Alamat"]').first();
-  if (await originAddressInput.isVisible().catch(() => false)) {
-    const originAddress = spec.pickup.address || spec.pickup.pic.address || `${spec.pickup.district || ''} ${spec.pickup.city || ''}`.trim() || 'Origin Logistics Hub';
-    await originAddressInput.fill(originAddress);
+  // Stage 2: Populate Pickup (Shipper) PIC fields
+  console.log(`[${name}] [PIC Stage 2] Populating Pickup PIC fields (${spec.pickup.pic.name} - ${spec.pickup.pic.country})...`);
+  try {
+    // 1. Shipper Nama PIC
+    await fillAndVerifyField(page, {
+      label: 'Shipper Nama PIC',
+      locators: [
+        'input[placeholder*="Masukkan Nama PIC" i]:nth-of-type(1)',
+        'input[placeholder*="Nama PIC" i]:nth-of-type(1)',
+        'input[name="origin_pic_name"], #origin_pic_name',
+        'input[placeholder*="Masukkan Nama PIC" i]',
+        'input[placeholder*="Nama PIC" i]',
+        '.ant-form-item:has-text("Nama PIC") input',
+        'label:has-text("Nama PIC") .. input',
+      ],
+      value: spec.pickup.pic.name,
+      required: true,
+    }, fieldDiagnostics);
+
+    // 2. Shipper Nama Perusahaan
+    await fillAndVerifyField(page, {
+      label: 'Shipper Nama Perusahaan',
+      locators: [
+        'input[placeholder*="Pilih Nama Perusahaan" i]:nth-of-type(1)',
+        'input[placeholder*="Nama Perusahaan" i]:nth-of-type(1)',
+        'input[name="origin_company"], #origin_company',
+        'input[placeholder*="Pilih Nama Perusahaan" i]',
+        'input[placeholder*="Nama Perusahaan" i]',
+        'input[placeholder*="Perusahaan" i]',
+      ],
+      value: spec.pickup.pic.company,
+      required: true,
+    }, fieldDiagnostics);
+
+    // 3. Shipper Alamat
+    const originStreetAddress = (spec.pickup.address && !isAdministrativeOnly(spec.pickup.address, spec.pickup.city, spec.pickup.district, spec.pickup.province, spec.pickup.country))
+      ? spec.pickup.address
+      : (spec.pickup.pic?.address && !isAdministrativeOnly(spec.pickup.pic.address, spec.pickup.city, spec.pickup.district, spec.pickup.province, spec.pickup.country))
+        ? spec.pickup.pic.address
+        : generateSyntheticStreetAddress({ country: spec.pickup.country || 'Indonesia', city: spec.pickup.city, district: spec.pickup.district, isPickup: true });
+
+    await fillAndVerifyField(page, {
+      label: 'Shipper Alamat',
+      locators: [
+        'input[placeholder*="Masukkan alamat" i]:nth-of-type(1)',
+        'textarea[placeholder*="Masukkan alamat" i]:nth-of-type(1)',
+        'input[name="origin_address"], textarea[name="origin_address"], #origin_address',
+        'input[placeholder*="Masukkan alamat" i]',
+        'textarea[placeholder*="Masukkan alamat" i]',
+        'input[placeholder*="alamat" i]',
+        'textarea[placeholder*="alamat" i]',
+      ],
+      value: originStreetAddress,
+      required: true,
+    }, fieldDiagnostics);
+
+    // 4. Shipper Email
+    await fillAndVerifyField(page, {
+      label: 'Shipper Email',
+      locators: [
+        'input[placeholder*="Email aktif pengirim" i]:nth-of-type(1)',
+        'input[name="origin_email"], #origin_email',
+        'input[placeholder*="Email aktif pengirim" i]',
+        'input[placeholder*="Email" i]',
+        'input[type="email"]',
+      ],
+      value: spec.pickup.pic.email,
+      required: true,
+    }, fieldDiagnostics);
+
+    // 5. Shipper Phone Area
+    const originPhoneAreaInput = page.locator('#origin_phone_area').first();
+    const originPhoneAreaSelect = page.locator('.ant-select:has(#origin_phone_area), .ant-select').first();
+    const originCode = spec.pickup.pic.phoneCountryCode || '+62';
+    if (await originPhoneAreaInput.isVisible({ timeout: 1000 }).catch(() => false)) {
+      const tag = await originPhoneAreaInput.evaluate(el => el.tagName.toLowerCase()).catch(() => '');
+      if (tag === 'input') {
+        await originPhoneAreaInput.fill(originCode).catch(() => {});
+      }
+    } else if (await originPhoneAreaSelect.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await selectAntOption(page, originPhoneAreaSelect, null, new RegExp(escapeRegex(originCode))).catch(() => {});
+    }
+
+    // 6. Shipper Phone Number
+    const rawOriginPhone = String(spec.pickup.pic.phone).replace(/^(\+?62|0)/, '');
+    await fillAndVerifyField(page, {
+      label: 'Shipper Nomor Telepon',
+      locators: [
+        '#origin_phone, input[name="origin_phone"]',
+        'input[placeholder*="Nomor telepon" i]:nth-of-type(1)',
+        'input[placeholder*="Nomor telepon" i]',
+        'input[type="number"]:nth-of-type(1)',
+      ],
+      value: rawOriginPhone,
+      required: true,
+    }, fieldDiagnostics);
+
+    console.log(`[${name}] [PIC Stage 2] Pickup PIC fields populated successfully.`);
+  } catch (err) {
+    const diag = await captureInternationalPicDiagnostics(page, name, 'PICKUP_PIC_POPULATION', err.message, { shipperPic: spec.pickup.pic, fields: fieldDiagnostics });
+    const error = new Error(`[OrderExecutor] Failed to populate Pickup PIC fields: ${err.message}`);
+    error.diagnostic = diag;
+    throw error;
   }
 
-  const originEmailInput = page.locator('input[name="origin_email"], #origin_email, input[type="email"]').first();
-  if (await originEmailInput.isVisible().catch(() => false)) {
-    await originEmailInput.fill(spec.pickup.pic.email);
-  }
+  // Stage 3: Populate Destination (Consignee) PIC fields
+  console.log(`[${name}] [PIC Stage 3] Populating Destination PIC fields (${spec.dropoff.pic.name} - ${spec.dropoff.pic.country})...`);
+  try {
+    // 1. Consignee Nama PIC
+    await fillAndVerifyField(page, {
+      label: 'Consignee Nama PIC',
+      locators: [
+        'input[name="destination_pic_name"], #destination_pic_name',
+        'input[placeholder*="Masukkan Nama PIC" i]:nth-of-type(2)',
+        'input[placeholder*="Nama PIC" i]:nth-of-type(2)',
+        page.locator('input[placeholder*="Masukkan Nama PIC" i]').nth(1),
+        page.locator('input[placeholder*="Nama PIC" i]').nth(1),
+      ],
+      value: spec.dropoff.pic.name,
+      required: true,
+    }, fieldDiagnostics);
 
-  const originPhoneArea = page.locator('.ant-select').filter({ has: page.locator('#origin_phone_area, input[name="origin_phone_area"]') }).first();
-  if (await originPhoneArea.isVisible().catch(() => false)) {
-    await selectAntOption(page, originPhoneArea, null, new RegExp(escapeRegex(spec.pickup.pic.phoneCountryCode || '+62')));
-  }
+    // 2. Consignee Nama Perusahaan
+    await fillAndVerifyField(page, {
+      label: 'Consignee Nama Perusahaan',
+      locators: [
+        'input[name="destination_company"], #destination_company',
+        'input[placeholder*="Pilih Nama Perusahaan" i]:nth-of-type(2)',
+        'input[placeholder*="Nama Perusahaan" i]:nth-of-type(2)',
+        page.locator('input[placeholder*="Pilih Nama Perusahaan" i]').nth(1),
+        page.locator('input[placeholder*="Nama Perusahaan" i]').nth(1),
+      ],
+      value: spec.dropoff.pic.company,
+      required: true,
+    }, fieldDiagnostics);
 
-  const originPhoneInput = page.locator('input[name="origin_phone"], #origin_phone, input[type="number"], input[placeholder*="telepon"]').first();
-  if (await originPhoneInput.isVisible().catch(() => false)) {
-    const rawPhone = String(spec.pickup.pic.phone).replace(/^\+?62|^0/, '');
-    await originPhoneInput.fill(rawPhone);
-  }
+    // 3. Consignee Alamat
+    const destStreetAddress = (spec.dropoff.address && !isAdministrativeOnly(spec.dropoff.address, spec.dropoff.city, spec.dropoff.district, spec.dropoff.province, spec.dropoff.country))
+      ? spec.dropoff.address
+      : (spec.dropoff.pic?.address && !isAdministrativeOnly(spec.dropoff.pic.address, spec.dropoff.city, spec.dropoff.district, spec.dropoff.province, spec.dropoff.country))
+        ? spec.dropoff.pic.address
+        : generateSyntheticStreetAddress({ country: spec.dropoff.country || 'Singapore', city: spec.dropoff.city, district: spec.dropoff.district, isPickup: false });
 
-  // 2. Destination (Consignee) PIC Information
-  console.log(`[${name}] [Consignee PIC] Filling Consignee details (${spec.dropoff.pic.name} - ${spec.dropoff.pic.country})...`);
-  const destNameInput = page.locator('input[name="destination_pic_name"], #destination_pic_name').first()
-    .or(page.locator('input[placeholder*="Nama PIC"]').nth(1));
-  if (await destNameInput.isVisible().catch(() => false)) {
-    await destNameInput.fill(spec.dropoff.pic.name);
-  }
+    await fillAndVerifyField(page, {
+      label: 'Consignee Alamat',
+      locators: [
+        'input[name="destination_address"], textarea[name="destination_address"], #destination_address',
+        'input[placeholder*="Masukkan alamat" i]:nth-of-type(2)',
+        'textarea[placeholder*="Masukkan alamat" i]:nth-of-type(2)',
+        page.locator('input[placeholder*="Masukkan alamat" i]').nth(1),
+        page.locator('textarea[placeholder*="Masukkan alamat" i]').nth(1),
+        page.locator('input[placeholder*="alamat" i]').nth(1),
+        page.locator('textarea[placeholder*="alamat" i]').nth(1),
+      ],
+      value: destStreetAddress,
+      required: true,
+    }, fieldDiagnostics);
 
-  const destCompanyInput = page.locator('input[name="destination_company"], #destination_company').first()
-    .or(page.locator('input[placeholder*="Perusahaan"]').nth(1));
-  if (await destCompanyInput.isVisible().catch(() => false)) {
-    await destCompanyInput.fill(spec.dropoff.pic.company);
-  }
+    // 4. Consignee Email
+    await fillAndVerifyField(page, {
+      label: 'Consignee Email',
+      locators: [
+        'input[name="destination_email"], #destination_email',
+        'input[placeholder*="Email aktif pengirim" i]:nth-of-type(2)',
+        page.locator('input[placeholder*="Email aktif pengirim" i]').nth(1),
+        page.locator('input[placeholder*="Email" i]').nth(1),
+        page.locator('input[type="email"]').nth(1),
+      ],
+      value: spec.dropoff.pic.email,
+      required: true,
+    }, fieldDiagnostics);
 
-  const destAddressInput = page.locator('input[name="destination_address"], textarea[name="destination_address"], #destination_address').first()
-    .or(page.locator('input[placeholder*="Alamat"]').nth(1));
-  if (await destAddressInput.isVisible().catch(() => false)) {
-    const destAddress = spec.dropoff.address || spec.dropoff.pic.address || `${spec.dropoff.district || ''} ${spec.dropoff.city || ''}`.trim() || 'Destination Distribution Center';
-    await destAddressInput.fill(destAddress);
-  }
+    // 5. Consignee Phone Area
+    const destPhoneAreaInput = page.locator('#destination_phone_area').first();
+    const destPhoneAreaSelect = page.locator('.ant-select:has(#destination_phone_area), .ant-select').nth(1);
+    const destCode = spec.dropoff.pic.phoneCountryCode || (spec.dropoff.country === 'Singapore' ? '+65' : (spec.dropoff.country === 'Malaysia' ? '+60' : '+62'));
+    if (await destPhoneAreaInput.isVisible({ timeout: 1000 }).catch(() => false)) {
+      const tag = await destPhoneAreaInput.evaluate(el => el.tagName.toLowerCase()).catch(() => '');
+      if (tag === 'input') {
+        await destPhoneAreaInput.fill(destCode).catch(() => {});
+      }
+    } else if (await destPhoneAreaSelect.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await selectAntOption(page, destPhoneAreaSelect, null, new RegExp(escapeRegex(destCode))).catch(() => {});
+    }
 
-  const destEmailInput = page.locator('input[name="destination_email"], #destination_email').first()
-    .or(page.locator('input[type="email"]').nth(1));
-  if (await destEmailInput.isVisible().catch(() => false)) {
-    await destEmailInput.fill(spec.dropoff.pic.email);
-  }
-
-  const destPhoneArea = page.locator('.ant-select').filter({ has: page.locator('#destination_phone_area, input[name="destination_phone_area"]') }).first();
-  if (await destPhoneArea.isVisible().catch(() => false)) {
-    await selectAntOption(page, destPhoneArea, null, new RegExp(escapeRegex(spec.dropoff.pic.phoneCountryCode || '+65')));
-  }
-
-  const destPhoneInput = page.locator('input[name="destination_phone"], #destination_phone').first()
-    .or(page.locator('input[placeholder*="telepon"]').nth(1));
-  if (await destPhoneInput.isVisible().catch(() => false)) {
+    // 6. Consignee Phone Number
     const phoneCountryDigits = (spec.dropoff.pic.phoneCountryCode || '').replace(/\D/g, '');
     let rawDestPhone = String(spec.dropoff.pic.phone).replace(/^\+/, '');
     if (phoneCountryDigits && rawDestPhone.startsWith(phoneCountryDigits)) {
       rawDestPhone = rawDestPhone.slice(phoneCountryDigits.length);
     }
     rawDestPhone = rawDestPhone.replace(/^0/, '');
-    await destPhoneInput.fill(rawDestPhone);
+
+    await fillAndVerifyField(page, {
+      label: 'Consignee Nomor Telepon',
+      locators: [
+        '#destination_phone, input[name="destination_phone"]',
+        'input[placeholder*="Nomor telepon" i]:nth-of-type(2)',
+        page.locator('input[placeholder*="Nomor telepon" i]').nth(1),
+        page.locator('input[type="number"]').nth(1),
+      ],
+      value: rawDestPhone,
+      required: true,
+    }, fieldDiagnostics);
+
+    console.log(`[${name}] [PIC Stage 3] Destination PIC fields populated successfully.`);
+  } catch (err) {
+    const diag = await captureInternationalPicDiagnostics(page, name, 'DESTINATION_PIC_POPULATION', err.message, { consigneePic: spec.dropoff.pic, fields: fieldDiagnostics });
+    const error = new Error(`[OrderExecutor] Failed to populate Destination PIC fields: ${err.message}`);
+    error.diagnostic = diag;
+    throw error;
   }
 
-  // 3. Verify in DOM that input fields were filled
-  const verifyOriginName = await originNameInput.inputValue().catch(() => '');
-  const verifyOriginPhone = await originPhoneInput.inputValue().catch(() => '');
-  const verifyDestName = await destNameInput.inputValue().catch(() => '');
-  const verifyDestPhone = await destPhoneInput.inputValue().catch(() => '');
-
-  if (await originNameInput.isVisible().catch(() => false) && !verifyOriginName) {
-    throw new Error('[OrderExecutor] Origin PIC name was not populated in DOM.');
-  }
-  if (await originPhoneInput.isVisible().catch(() => false) && !verifyOriginPhone) {
-    throw new Error('[OrderExecutor] Origin PIC phone was not populated in DOM.');
-  }
-  if (await destNameInput.isVisible().catch(() => false) && !verifyDestName) {
-    throw new Error('[OrderExecutor] Destination PIC name was not populated in DOM.');
-  }
-  if (await destPhoneInput.isVisible().catch(() => false) && !verifyDestPhone) {
-    throw new Error('[OrderExecutor] Destination PIC phone was not populated in DOM.');
-  }
-
-  // 4. File Upload / PIC Attachment
-  const targetAttachmentPath = options.picAttachmentPath || spec?.picAttachmentPath || DEFAULT_INTL_PIC_ATTACHMENT_PATH;
-  console.log(`[${name}] [PIC Attachment] Resolving attachment file: "${targetAttachmentPath}"...`);
-  const resolvedPath = resolveInternationalPicAttachment(targetAttachmentPath);
-
-  console.log(`[${name}] [PIC Attachment] Uploading verified file via setInputFiles: "${resolvedPath}"...`);
+  // Stage 4: Locate PIC Image File Input
+  console.log(`[${name}] [PIC Stage 4] Locating PIC image file input...`);
   const fileInput = page.locator('.ant-upload input[type="file"], input[type="file"]').first();
-  await fileInput.waitFor({ state: 'attached', timeout: 15000 });
-  await fileInput.setInputFiles(resolvedPath);
+  try {
+    await fileInput.waitFor({ state: 'attached', timeout: 15000 });
+    console.log(`[${name}] [PIC Stage 4] PIC image file input located.`);
+  } catch (err) {
+    const diag = await captureInternationalPicDiagnostics(page, name, 'FILE_INPUT_LOCATE', err.message, { fields: fieldDiagnostics });
+    const error = new Error(`[OrderExecutor] PIC image file input not found: ${err.message}`);
+    error.diagnostic = diag;
+    throw error;
+  }
 
-  // 5. Wait for upload to complete and verify attachment is displayed
+  // Stage 5: Upload PIC Image
+  const targetAttachmentPath = options.picAttachmentPath || spec?.picAttachmentPath || DEFAULT_INTL_PIC_ATTACHMENT_PATH;
+  console.log(`[${name}] [PIC Stage 5] Uploading image: "${targetAttachmentPath}"...`);
+  let resolvedPath = null;
+  try {
+    resolvedPath = resolveInternationalPicAttachment(targetAttachmentPath);
+    await fileInput.setInputFiles(resolvedPath);
+    console.log(`[${name}] [PIC Stage 5] Image uploaded.`);
+  } catch (err) {
+    const diag = await captureInternationalPicDiagnostics(page, name, 'IMAGE_UPLOAD', err.message, { targetAttachmentPath, fields: fieldDiagnostics });
+    const error = new Error(`[OrderExecutor] Failed to upload PIC image: ${err.message}`);
+    error.diagnostic = diag;
+    throw error;
+  }
+
+  // Stage 6: Verify Upload Completion
   const fileName = path.basename(resolvedPath);
-  console.log(`[${name}] [PIC Attachment] Waiting for attachment "${fileName}" to be displayed...`);
+  console.log(`[${name}] [PIC Stage 6] Verifying upload completion for "${fileName}"...`);
   const attachmentItem = page.locator('button, section, div, span, .ant-upload-list-item')
     .filter({ hasText: fileName })
     .first();
 
-  await attachmentItem.waitFor({ state: 'visible', timeout: 20000 });
-  const isDisplayed = await attachmentItem.isVisible().catch(() => false);
-  if (!isDisplayed) {
-    throw new Error(`[OrderExecutor] International PIC attachment "${fileName}" was uploaded but is not displayed in the UI.`);
+  try {
+    await attachmentItem.waitFor({ state: 'visible', timeout: 20000 });
+    const isDisplayed = await attachmentItem.isVisible().catch(() => false);
+    if (!isDisplayed) {
+      throw new Error(`Attachment element not visible in DOM for "${fileName}".`);
+    }
+    console.log(`[${name}] [PIC Stage 6] Upload completion verified.`);
+  } catch (err) {
+    const diag = await captureInternationalPicDiagnostics(page, name, 'UPLOAD_VERIFICATION', err.message, { fileName, fields: fieldDiagnostics });
+    const error = new Error(`[OrderExecutor] International PIC attachment verification failed: ${err.message}`);
+    error.diagnostic = diag;
+    throw error;
   }
-  console.log(`[${name}] [PIC Attachment] Confirmed displayed: "${fileName}".`);
+
+  // Stage 7: Form Validation Check
+  console.log(`[${name}] [PIC Stage 7] Verifying PIC form validation passed...`);
+  const validationErrors = await page.locator('.ant-form-item-explain-error, [role="alert"].text-red')
+    .evaluateAll(els => els.map(e => (e.innerText || '').trim()).filter(Boolean))
+    .catch(() => []);
+
+  if (validationErrors.length > 0) {
+    const diag = await captureInternationalPicDiagnostics(page, name, 'FORM_VALIDATION', `Validation errors present: ${validationErrors.join(', ')}`, { validationErrors, fields: fieldDiagnostics });
+    const error = new Error(`[OrderExecutor] PIC form validation failed: ${validationErrors.join('; ')}`);
+    error.diagnostic = diag;
+    throw error;
+  }
+  console.log(`[${name}] [PIC Stage 7] PIC form validation passed.`);
+
+  // Stage 8: Confirmation action (Submit Step 3)
+  console.log(`[${name}] [PIC Stage 8] Submitting Shipper & Consignee details (Step 3)...`);
+  const simpanDetailShipmentBtn = page.getByRole('button', { name: /simpan detail pengiriman/i }).last()
+    .or(page.locator('button.primary-btn').filter({ hasText: /simpan detail pengiriman/i }))
+    .or(page.getByRole('button', { name: /simpan|selanjutnya/i })).first();
+
+  if (await simpanDetailShipmentBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+    for (let i = 0; i < 20; i++) {
+      const isDisabled = await simpanDetailShipmentBtn.isDisabled().catch(() => false);
+      if (!isDisabled) break;
+      await page.waitForTimeout(300);
+    }
+    await simpanDetailShipmentBtn.click();
+    await page.waitForTimeout(2000);
+
+    const postSubmitErrors = await page.locator('.ant-form-item-explain-error, [role="alert"].text-red')
+      .evaluateAll(els => els.map(e => (e.innerText || '').trim()).filter(Boolean))
+      .catch(() => []);
+    if (postSubmitErrors.length > 0) {
+      const diag = await captureInternationalPicDiagnostics(page, name, 'POST_SUBMIT_VALIDATION', `Validation errors after submit: ${postSubmitErrors.join(', ')}`, { validationErrors: postSubmitErrors, fields: fieldDiagnostics });
+      const error = new Error(`[OrderExecutor] PIC validation errors after clicking save: ${postSubmitErrors.join('; ')}`);
+      error.diagnostic = diag;
+      throw error;
+    }
+  }
 
   return {
     success: true,
@@ -2315,21 +2938,10 @@ async function fillInternationalPicAndAttachment(page, spec, name = 'Internation
     fileName,
     shipperPic: spec.pickup.pic,
     consigneePic: spec.dropoff.pic,
+    fieldDiagnostics,
   };
 }
 
-/**
- * General Order Execution Interface
- * 
- * @param {Object} inputSpecification User-supplied partial or full specification
- * @param {Object} options Execution options
- * @param {boolean} [options.headless=true] Playwright headless flag (defaults to true for programmatic execution)
- * @param {string} [options.sessionPath] Path to storageState JSON
- * @param {import('playwright').Browser} [options.existingBrowser] Reusable browser instance
- * @param {import('playwright').BrowserContext} [options.existingContext] Reusable browser context
- * @param {string} [options.transactionLabel] Friendly name for logging
- * @returns {Promise<Object>} Execution result object
- */
 async function executeOrder(inputSpecification = {}, options = {}) {
   const { resolvedSpec, sources, missingMandatory } = resolveSpecification(inputSpecification);
 
@@ -2407,6 +3019,7 @@ module.exports = {
   handleServiceCatalogStep3,
   handleInternationalServiceCatalogStep2,
   captureInternationalCatalogDiagnostics,
+  captureInternationalPicDiagnostics,
   formatSpecificationReview,
   selectAntLocationOption,
   selectInternationalServiceType,
@@ -2417,8 +3030,12 @@ module.exports = {
   resolveInternationalPicAttachment,
   ensureInternationalPicRecords,
   fillInternationalPicAndAttachment,
+  selectDomesticTransportPreference,
+  captureTransportPreferenceDiagnostics,
   selectAntDatePicker,
   captureDatePickerDiagnostics,
   getAntDatePickerState,
   DATEPICKER_MONTH_REGEXES,
+  selectAntPortOption,
+  sanitizePortName,
 };

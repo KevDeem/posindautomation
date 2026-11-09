@@ -183,173 +183,274 @@ function classifyFailure(err) {
  * @param {string} [options.sessionPath] Path to storageState JSON
  * @returns {Promise<Object>} Batch summary and item results
  */
-async function executeBatch(batchInput, options = {}) {
-  const items = normalizeBatchInput(batchInput);
+/**
+ * Execute a single batch order item through its full lifecycle:
+ * Order Form -> Service Catalog -> PIC & File -> Submission -> Payment Selection -> VA -> Sandbox -> Verification.
+ * Each invocation operates inside its own isolated Playwright browser context with an independent fresh login.
+ *
+ * @param {Object} item Normalized batch item
+ * @param {number} index Index in the batch (0-based)
+ * @param {number} totalItems Total number of items in the batch
+ * @param {import('playwright').Browser} browser Shared browser instance (workers create isolated contexts)
+ * @param {Object} options Options passed to batch executor
+ * @returns {Promise<Object>} Completed order record
+ */
+async function executeBatchWorkerItem(item, index, totalItems, browser, options = {}) {
   const headless = options.headless === true;
   const autoPay = options.autoPay !== undefined ? options.autoPay : true;
   const maxRetries = options.maxRetries !== undefined ? options.maxRetries : 2;
-  const sessionPath = options.sessionPath || DEFAULT_SESSION_PATH;
+  const orderLabel = item.label || `Order #${index + 1}`;
+
+  console.log(`\n>>> [Worker: ${index + 1}/${totalItems}] Starting ${orderLabel}...`);
+
+  let orderRecord = {
+    label: orderLabel,
+    index: index + 1,
+    success: false,
+    attempts: 0,
+    orderId: null,
+    shipmentId: null,
+    amount: 0,
+    serviceCatalog: null,
+    orderStatus: 'FAILED',
+    paymentStatus: autoPay ? 'ORDER_CREATED_PAYMENT_PENDING' : 'ORDER_CREATED',
+    paymentMethod: autoPay ? 'POSPAY' : null,
+    vaNumber: null,
+    sandboxPayment: null,
+    omsStatus: null,
+    overallStatus: 'FAILED',
+    error: null,
+  };
+
+  // Deep clone and resolve specification once for this batch item to lock generated values
+  const specClone = JSON.parse(JSON.stringify(item.spec || {}));
+  const resolvedItem = resolveSpecification(specClone);
+  const resolvedSpec = resolvedItem.resolvedSpec;
+
+  let orderSubmitted = false;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    orderRecord.attempts = attempt;
+    if (attempt > 1) {
+      console.warn(`[Worker ${index + 1}] Retrying ${orderLabel} from start (Attempt ${attempt}/${maxRetries})...`);
+    }
+
+    // Allocate an isolated context for this worker execution attempt
+    let context = null;
+    let page = null;
+
+    try {
+      context = await browser.newContext({
+        viewport: { width: 1440, height: 950 },
+      });
+
+      page = await context.newPage();
+
+      // Independent fresh login for this worker context (no shared session or cookies)
+      console.log(`[Worker ${index + 1}] Authenticating worker context for ${orderLabel}...`);
+      await performFreshLogin(page, context, {
+        ...options,
+        sessionPath: null, // Do not write to shared sessionPath to prevent race conditions
+      });
+      console.log(`[Worker ${index + 1}] Worker authenticated successfully.`);
+
+      // Execute order creation
+      const { result: createResult } = await executeOrder(resolvedSpec, {
+        headless,
+        existingBrowser: browser,
+        existingContext: context,
+        existingPage: page,
+        skipLogin: true, // Already logged in with fresh authentication in this context
+        transactionLabel: `${orderLabel} (Worker ${index + 1}, Try ${attempt})`,
+      });
+
+      if (!createResult.success) {
+        orderRecord.orderStatus = 'ORDER_FAILED';
+        if (createResult.diagnostic) {
+          orderRecord.diagnostic = createResult.diagnostic;
+        }
+        const err = new Error(createResult.error || 'Order creation failed');
+        if (createResult.diagnostic) err.diagnostic = createResult.diagnostic;
+        throw err;
+      }
+
+      // If an order ID was returned, order submission has definitively succeeded
+      if (createResult.orderId) {
+        orderSubmitted = true;
+      }
+
+      orderRecord.orderId = createResult.orderId;
+      orderRecord.shipmentId = createResult.shipmentId;
+      orderRecord.amount = createResult.amount || 0;
+      orderRecord.serviceCatalog = createResult.serviceCatalog;
+      orderRecord.orderStatus = 'SUCCESS';
+
+      // Execute Payment if requested
+      if (autoPay && orderRecord.orderId) {
+        console.log(`[Worker ${index + 1}] Proceeding to payment simulation for Order ${orderRecord.orderId}...`);
+        const payResult = await executeOrderPayment(page, context, {
+          orderId: orderRecord.orderId,
+          shipmentId: orderRecord.shipmentId,
+          amount: orderRecord.amount,
+        }, {
+          headless,
+          sandboxUrl: options.sandboxUrl,
+          apiEndpoint: options.apiEndpoint,
+        });
+
+        orderRecord.vaNumber = payResult.vaNumber;
+        orderRecord.sandboxPayment = payResult.sandboxResult;
+        orderRecord.omsStatus = payResult.omsPaymentStatus;
+        orderRecord.paymentStatus = payResult.paymentStatus;
+        orderRecord.paymentMethod = payResult.paymentMethod || 'POSPAY';
+
+        if (payResult.amount && (!orderRecord.amount || orderRecord.amount === 0)) {
+          orderRecord.amount = payResult.amount;
+        }
+
+        if (payResult.paymentStatus === 'PAYMENT_VERIFIED' && payResult.overallStatus === 'SUCCESS') {
+          orderRecord.success = true;
+          orderRecord.overallStatus = 'SUCCESS';
+          orderRecord.error = null;
+        } else {
+          orderRecord.success = false;
+          orderRecord.overallStatus = 'ORDER_CREATED_PAYMENT_PENDING';
+          orderRecord.error = payResult.error || `Payment incomplete: ${payResult.paymentStatus}`;
+          console.warn(`[Worker ${index + 1}] Payment simulation did not verify SUCCESS for Order ${orderRecord.orderId}: ${payResult.paymentStatus}`);
+        }
+      } else {
+        orderRecord.paymentStatus = 'ORDER_CREATED';
+        orderRecord.success = true;
+        orderRecord.overallStatus = 'SUCCESS';
+        orderRecord.error = null;
+      }
+
+      // Order completed successfully; exit retry loop
+      break;
+
+    } catch (err) {
+      if (err.diagnostic && !orderRecord.diagnostic) {
+        orderRecord.diagnostic = err.diagnostic;
+      }
+      const classification = classifyFailure(err);
+      console.error(`[Worker ${index + 1}] ${orderLabel} attempt ${attempt} failed [${classification.type}]:`, err.message);
+      orderRecord.error = `${classification.type}: ${err.message}`;
+
+      // Prevent accidental duplicate order submissions
+      if (orderSubmitted || !classification.retryable) {
+        console.warn(`[Worker ${index + 1}] Non-retryable condition (${orderSubmitted ? 'Order already submitted' : classification.reason}). Halting retries for ${orderLabel}.`);
+        break;
+      }
+
+      if (attempt === maxRetries) {
+        console.error(`[Worker ${index + 1}] ${orderLabel} exhausted all ${maxRetries} attempts.`);
+      }
+    } finally {
+      // Clean up isolated context and page for this worker attempt
+      if (page) await page.close().catch(() => {});
+      if (context) await context.close().catch(() => {});
+    }
+  }
+
+  return orderRecord;
+}
+
+/**
+ * Execute a pool of tasks with configurable concurrency.
+ *
+ * @param {Array<Function>} taskRunners Array of factory functions returning promises
+ * @param {number} concurrency Maximum concurrent workers
+ * @returns {Promise<Array>} Results in original order
+ */
+async function runWithConcurrency(taskRunners, concurrency = 3) {
+  const results = new Array(taskRunners.length);
+  const workerCount = Math.max(1, Math.min(concurrency, taskRunners.length));
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < taskRunners.length) {
+      const currentIndex = nextIndex++;
+      try {
+        results[currentIndex] = await taskRunners[currentIndex]();
+      } catch (fatalErr) {
+        console.error(`[ConcurrentRunner] Unexpected worker error at index ${currentIndex}:`, fatalErr);
+        results[currentIndex] = {
+          index: currentIndex + 1,
+          success: false,
+          error: `WORKER_FATAL: ${fatalErr.message}`,
+          overallStatus: 'FAILED',
+        };
+      }
+    }
+  }
+
+  const workers = [];
+  for (let w = 0; w < workerCount; w++) {
+    workers.push(worker());
+  }
+
+  await Promise.all(workers);
+  return results;
+}
+
+/**
+ * Execute a batch of orders with configurable concurrency (default: 3 workers).
+ * Each worker operates with an isolated Playwright browser context and fresh login.
+ *
+ * @param {Array|Object} batchInput Specifications or groups to execute
+ * @param {Object} options Batch execution options
+ * @param {boolean} [options.headless=true] Run browser headlessly
+ * @param {number} [options.concurrency=3] Concurrent workers (1 = sequential)
+ * @param {boolean} [options.autoPay=true] Execute payment simulation after order creation
+ * @param {number} [options.maxRetries=2] Max attempts per order if failure occurs
+ * @returns {Promise<Object>} Batch summary and item results
+ */
+async function executeBatch(batchInput, options = {}) {
+  const items = normalizeBatchInput(batchInput);
+  const headless = options.headless !== false; // Keep all workers headless by default
+  const autoPay = options.autoPay !== undefined ? options.autoPay : true;
+  const maxRetries = options.maxRetries !== undefined ? options.maxRetries : 2;
+  const rawConcurrency = options.concurrency !== undefined
+    ? parseInt(options.concurrency, 10)
+    : (process.env.BATCH_CONCURRENCY !== undefined ? parseInt(process.env.BATCH_CONCURRENCY, 10) : 3);
+  const concurrency = (!Number.isNaN(rawConcurrency) && rawConcurrency > 0) ? rawConcurrency : 3;
 
   console.log(`\n======================================================`);
-  console.log(`[BatchExecutor] Starting batch of ${items.length} order(s) (Browser Mode: ${headless ? 'Headless (background)' : 'Headed (visible browser)'}, autoPay: ${autoPay}, maxRetries: ${maxRetries})`);
+  console.log(`[BatchExecutor] Starting batch of ${items.length} order(s)`);
+  console.log(`- Browser Mode: ${headless ? 'Headless (background)' : 'Headed (visible browser)'}`);
+  console.log(`- Concurrency: ${concurrency} worker(s) (${concurrency > 1 ? 'Concurrent' : 'Sequential'})`);
+  console.log(`- Payment Simulation: ${autoPay ? 'YES' : 'NO'}`);
+  console.log(`- Max Retries: ${maxRetries}`);
   console.log(`======================================================\n`);
 
   const results = {
     total: items.length,
+    concurrency,
     succeeded: 0,
     failed: 0,
     totalAmountPaid: 0,
     orders: [],
   };
 
-  const browser = await chromium.launch({ headless, slowMo: headless ? 0 : 100 });
-  const context = await browser.newContext({
-    viewport: { width: 1440, height: 950 },
-  });
-
-  // Authenticate once at the beginning of the batch
-  console.log('[BatchExecutor] Initializing single batch authentication session...');
-  const authPage = await context.newPage();
-  try {
-    await performFreshLogin(authPage, context, {
-      ...options,
-      sessionPath,
-    });
-  } finally {
-    await authPage.close().catch(() => {});
+  if (items.length === 0) {
+    return results;
   }
-  console.log('[BatchExecutor] Batch authentication session established.');
 
-  let authExpiredMidBatch = false;
+  const browser = await chromium.launch({ headless, slowMo: headless ? 0 : 100 });
 
   try {
-    for (let index = 0; index < items.length; index++) {
-      const item = items[index];
-      const orderLabel = item.label || `Order #${index + 1}`;
-      console.log(`\n>>> [${index + 1}/${items.length}] Processing ${orderLabel}...`);
+    const taskRunners = items.map((item, index) => {
+      return () => executeBatchWorkerItem(item, index, items.length, browser, {
+        ...options,
+        headless,
+        autoPay,
+        maxRetries,
+      });
+    });
 
-      let orderRecord = {
-        label: orderLabel,
-        index: index + 1,
-        success: false,
-        attempts: 0,
-        orderId: null,
-        shipmentId: null,
-        amount: 0,
-        serviceCatalog: null,
-        orderStatus: 'FAILED',
-        paymentStatus: autoPay ? 'ORDER_CREATED_PAYMENT_PENDING' : 'ORDER_CREATED',
-        paymentMethod: autoPay ? 'POSPAY' : null,
-        vaNumber: null,
-        sandboxPayment: null,
-        omsStatus: null,
-        overallStatus: 'FAILED',
-        error: null,
-      };
+    const completedOrders = await runWithConcurrency(taskRunners, concurrency);
 
-      // Resolve specification once for this batch item before execution/retry loop to lock generated values
-      const resolvedItem = resolveSpecification(item.spec);
-      item.spec = resolvedItem.resolvedSpec;
-
-      for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        orderRecord.attempts = attempt;
-        if (attempt > 1) {
-          console.warn(`[BatchExecutor] Retrying ${orderLabel} from start (Attempt ${attempt}/${maxRetries})...`);
-        }
-
-        try {
-          const { result: createResult, page } = await executeOrder(item.spec, {
-            headless,
-            existingBrowser: browser,
-            existingContext: context,
-            skipLogin: true, // Reuse authenticated batch session
-            transactionLabel: `${orderLabel} (Try ${attempt})`,
-          });
-
-          if (!createResult.success) {
-            orderRecord.orderStatus = 'ORDER_FAILED';
-            if (createResult.diagnostic) {
-              orderRecord.diagnostic = createResult.diagnostic;
-            }
-            const err = new Error(createResult.error || 'Order creation failed');
-            if (createResult.diagnostic) err.diagnostic = createResult.diagnostic;
-            throw err;
-          }
-
-          orderRecord.orderId = createResult.orderId;
-          orderRecord.shipmentId = createResult.shipmentId;
-          orderRecord.amount = createResult.amount || 0;
-          orderRecord.serviceCatalog = createResult.serviceCatalog;
-          orderRecord.orderStatus = 'SUCCESS';
-
-          // Execute Payment if requested
-          if (autoPay && orderRecord.orderId) {
-            console.log(`[BatchExecutor] Proceeding to payment simulation for Order ${orderRecord.orderId}...`);
-            const payResult = await executeOrderPayment(page, context, {
-              orderId: orderRecord.orderId,
-              shipmentId: orderRecord.shipmentId,
-              amount: orderRecord.amount,
-            }, {
-              headless,
-              sandboxUrl: options.sandboxUrl,
-              apiEndpoint: options.apiEndpoint,
-            });
-
-            orderRecord.vaNumber = payResult.vaNumber;
-            orderRecord.sandboxPayment = payResult.sandboxResult;
-            orderRecord.omsStatus = payResult.omsPaymentStatus;
-            orderRecord.paymentStatus = payResult.paymentStatus;
-            orderRecord.paymentMethod = payResult.paymentMethod || 'POSPAY';
-
-            if (payResult.amount && (!orderRecord.amount || orderRecord.amount === 0)) {
-              orderRecord.amount = payResult.amount;
-            }
-
-            if (payResult.paymentStatus === 'PAYMENT_VERIFIED' && payResult.overallStatus === 'SUCCESS') {
-              orderRecord.success = true;
-              orderRecord.overallStatus = 'SUCCESS';
-              orderRecord.error = null;
-            } else {
-              orderRecord.success = false;
-              orderRecord.overallStatus = 'ORDER_CREATED_PAYMENT_PENDING';
-              orderRecord.error = payResult.error || `Payment incomplete: ${payResult.paymentStatus}`;
-              console.warn(`[BatchExecutor] Payment simulation did not verify SUCCESS for Order ${orderRecord.orderId}: ${payResult.paymentStatus}`);
-            }
-          } else {
-            orderRecord.paymentStatus = 'ORDER_CREATED';
-            orderRecord.success = true;
-            orderRecord.overallStatus = 'SUCCESS';
-            orderRecord.error = null;
-          }
-
-          await page.close().catch(() => {});
-          break; // Order created, exit retry loop (never retry creation)
-
-        } catch (err) {
-          if (err.diagnostic && !orderRecord.diagnostic) {
-            orderRecord.diagnostic = err.diagnostic;
-          }
-          const classification = classifyFailure(err);
-          console.error(`[BatchExecutor] ${orderLabel} attempt ${attempt} failed [${classification.type}]:`, err.message);
-          orderRecord.error = `${classification.type}: ${err.message}`;
-
-          if (classification.type === 'AUTH_EXPIRED') {
-            console.error(`[BatchExecutor] Authentication expired mid-batch on ${orderLabel}. Aborting batch safely.`);
-            authExpiredMidBatch = true;
-            break;
-          }
-
-          if (!classification.retryable) {
-            console.warn(`[BatchExecutor] Non-retryable condition: ${classification.reason} Stopping retries for ${orderLabel}.`);
-            break;
-          }
-
-          if (attempt === maxRetries) {
-            console.error(`[BatchExecutor] ${orderLabel} exhausted all ${maxRetries} attempts.`);
-          }
-        }
-      }
-
+    for (const orderRecord of completedOrders) {
       if (orderRecord.success) {
         results.succeeded++;
         if (autoPay && orderRecord.paymentStatus === 'PAYMENT_VERIFIED') {
@@ -358,13 +459,7 @@ async function executeBatch(batchInput, options = {}) {
       } else {
         results.failed++;
       }
-
       results.orders.push(orderRecord);
-
-      if (authExpiredMidBatch) {
-        console.error(`[BatchExecutor] Stopped batch safely due to expired session on ${orderLabel}.`);
-        break;
-      }
     }
   } finally {
     await browser.close().catch(() => {});
@@ -380,6 +475,8 @@ async function executeBatch(batchInput, options = {}) {
 
 module.exports = {
   executeBatch,
+  executeBatchWorkerItem,
+  runWithConcurrency,
   normalizeBatchInput,
   classifyFailure,
 };

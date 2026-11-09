@@ -65,15 +65,101 @@ function parseDateString(text) {
 }
 
 /**
- * Parse time string like "08:00", "8:00", "03:30", "10:00"
+ * Parse time string like "08:00", "8:00", "03:30", "10:00", "8 AM", "8:00 AM", "2 PM", "2:30 PM"
  */
 function parseTimeString(text) {
   if (!text) return null;
+
+  // 12-hour AM/PM format: e.g. "8 AM", "08:00 AM", "2:30 PM", "2 PM"
+  const ampmMatch = text.match(/\b(0?[1-9]|1[0-2])(?::([0-5]\d))?\s*(am|pm)\b/i);
+  if (ampmMatch) {
+    let hour = parseInt(ampmMatch[1], 10);
+    const minute = ampmMatch[2] ? ampmMatch[2] : '00';
+    const meridiem = ampmMatch[3].toLowerCase();
+    if (meridiem === 'pm' && hour < 12) {
+      hour += 12;
+    } else if (meridiem === 'am' && hour === 12) {
+      hour = 0;
+    }
+    return `${String(hour).padStart(2, '0')}:${minute}`;
+  }
+
+  // 24-hour format: e.g. "08:00", "14:30", "8:00"
   const timeMatch = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
   if (timeMatch) {
     return `${timeMatch[1].padStart(2, '0')}:${timeMatch[2]}`;
   }
   return null;
+}
+
+/**
+ * Parse transit duration expression like "6 hours", "15 hrs", "2 days", "15 jam", "2 hari"
+ */
+function parseTransitDuration(text) {
+  if (!text) return null;
+  const daysMatch = text.match(/\b(\d+(?:\.\d+)?)\s*(?:days?|hari)\b/i);
+  if (daysMatch) {
+    const days = parseFloat(daysMatch[1]);
+    const hours = Math.round(days * 24);
+    return {
+      text: `${daysMatch[1]} day${daysMatch[1] === '1' ? '' : 's'}`,
+      hours,
+      days,
+    };
+  }
+
+  const hoursMatch = text.match(/\b(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|jam)\b/i);
+  if (hoursMatch) {
+    const hours = parseFloat(hoursMatch[1]);
+    return {
+      text: `${hoursMatch[1]} hour${hoursMatch[1] === '1' ? '' : 's'}`,
+      hours,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Strips date, time, transit duration, and scheduling keywords from location strings.
+ * Preserves multi-word port names intact.
+ *
+ * @param {string} str Raw location string
+ * @returns {string} Cleaned location string
+ */
+function stripScheduleAndMetadata(str) {
+  if (!str || typeof str !== 'string') return '';
+  let clean = str;
+
+  // 1. Strip transit duration patterns: e.g. "15 hours", "6 hrs", "2 days", "15 jam", "2 hari"
+  clean = clean.replace(/\b\d+(?:\.\d+)?\s*(?:days?|hari|hours?|hrs?|jam)\b/gi, '');
+
+  // 2. Strip word dates: e.g. "25 Nov 2026", "25 November 2026", "Nov 25 2026", "November 25, 2026"
+  clean = clean.replace(/\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|mei|may|jun|jul|agt|aug|sep|okt|oct|nov|des|dec)[a-z]*\s+202\d\b/gi, '');
+  clean = clean.replace(/\b(?:jan|feb|mar|apr|mei|may|jun|jul|agt|aug|sep|okt|oct|nov|des|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?(?:,)?\s+202\d\b/gi, '');
+
+  // 3. Strip ISO dates: e.g. "2026-11-25"
+  clean = clean.replace(/\b202\d-(?:0[1-9]|1[0-2])-(?:[0-2]\d|3[01])\b/g, '');
+
+  // 4. Strip 12-hour AM/PM times: e.g. "8 AM", "08:00 AM", "2:30 PM", "2 PM"
+  clean = clean.replace(/\b(?:0?[1-9]|1[0-2])(?::[0-5]\d)?\s*(?:am|pm)\b/gi, '');
+
+  // 5. Strip 24-hour times: e.g. "08:00", "14:30"
+  clean = clean.replace(/\b(?:[01]?\d|2[0-3]):[0-5]\d\b/g, '');
+
+  // 6. Strip connecting schedule / transit keywords
+  clean = clean.replace(/\s+\b(?:scheduled\s+for|scheduled|departure|arrival|pickup|drop-?off)\b.*$/i, '');
+  clean = clean.replace(/\s+\b(?:transit\s+duration|duration|durasi)\b.*$/i, '');
+  clean = clean.replace(/\s+\b(?:on|at|pada|tanggal|jam)\b.*$/i, '');
+
+  // 7. Strip transport modes/incoterms if appended
+  clean = clean.replace(/\s+\b(?:air\s+cargo|air|sea\s+freight\s+(?:fcl|lcl)|sea\s+(?:fcl|lcl)|sea\s+freight|sea|land|darat|laut|udara|ddp|dap|cif|fob)\b.*$/i, '');
+
+  // 8. Clean leading/trailing punctuation and whitespace
+  clean = clean.replace(/^(?:in|at|di|ke|from|dari|to|tujuan)\s+/i, '');
+  clean = clean.replace(/^[,:\s–—\-]+|[,:\s–—\-]+$/g, '');
+
+  return clean.trim();
 }
 
 /**
@@ -157,6 +243,12 @@ function parseOrderPrompt(prompt = '') {
   const time = parseTimeString(text);
   if (time) spec.scheduledTime = time;
 
+  const duration = parseTransitDuration(text);
+  if (duration) {
+    spec.transitDuration = duration.text;
+    spec.durationHours = duration.hours;
+  }
+
   // 7. Route: From ... To ...
   spec.pickup = {};
   spec.dropoff = {};
@@ -182,10 +274,7 @@ function parseOrderPrompt(prompt = '') {
   function cleanLocationText(raw) {
     if (!raw) return { district: '', city: '', province: '', address: '', locationType: 'Door' };
     const locType = detectLocationType(raw);
-    let clean = raw.replace(/\s+\b(?:on|at|pada|tanggal|jam|scheduled|pickup)\b.*$/i, '').trim();
-    clean = clean.replace(/\s+\b(?:air\s+cargo|air|sea\s+freight\s+(?:fcl|lcl)|sea\s+(?:fcl|lcl)|sea\s+freight|sea|land|ddp|dap|cif|fob)\b.*$/i, '').trim();
-    clean = clean.replace(/^(?:in|at|di|ke|from|dari|to|tujuan)\s+/i, '');
-    clean = clean.replace(/^[,:\s]+|[,:\s]+$/g, '');
+    let clean = stripScheduleAndMetadata(raw);
 
     if (/(?:unknown|destin|somewhere|unspecified|atlantis|entah)/i.test(clean)) {
       return {
@@ -226,25 +315,62 @@ function parseOrderPrompt(prompt = '') {
       };
     }
     if (/tokyo\s+airport|haneda|narita/i.test(clean)) {
+      const portName = /narita/i.test(clean) ? 'Narita' : (/haneda/i.test(clean) ? 'Haneda' : 'Tokyo Airport');
       return {
         district: '',
-        locality: 'Tokyo Airport',
+        locality: portName,
         city: 'Tokyo',
         country: 'Japan',
         locationType: 'Port',
-        searchQuery: 'Tokyo Airport',
+        searchQuery: portName,
         parentContext: 'Japan',
         address: '',
       };
     }
-    if (/singapore\s+port|changi|jurong\s+port/i.test(clean)) {
+    if (/changi/i.test(clean)) {
       return {
         district: '',
-        locality: clean,
+        locality: 'Changi Airport',
         city: 'Singapore',
         country: 'Singapore',
         locationType: 'Port',
-        searchQuery: clean,
+        searchQuery: 'Changi Airport',
+        parentContext: 'Singapore',
+        address: '',
+      };
+    }
+    if (/pasir\s+panjang/i.test(clean)) {
+      return {
+        district: '',
+        locality: 'Pasir Panjang',
+        city: 'Singapore',
+        country: 'Singapore',
+        locationType: 'Port',
+        searchQuery: 'Pasir Panjang',
+        parentContext: 'Singapore',
+        address: '',
+      };
+    }
+    if (/jurong/i.test(clean)) {
+      return {
+        district: '',
+        locality: 'Jurong Port',
+        city: 'Singapore',
+        country: 'Singapore',
+        locationType: 'Port',
+        searchQuery: 'Jurong Port',
+        parentContext: 'Singapore',
+        address: '',
+      };
+    }
+    if (/singapore\s+port/i.test(clean)) {
+      return {
+        district: '',
+        locality: 'Singapore Port',
+        city: 'Singapore',
+        country: 'Singapore',
+        locationType: 'Port',
+        searchQuery: 'Singapore Port',
         parentContext: 'Singapore',
         address: '',
       };
@@ -263,14 +389,29 @@ function parseOrderPrompt(prompt = '') {
       if (FOREIGN_COUNTRIES[secondLower]) {
         const countryName = FOREIGN_COUNTRIES[secondLower];
         const isSg = countryName === 'Singapore';
+        let portLocality = firstPart;
+        let pLocType = locType;
+        if (/changi/i.test(firstPart)) {
+          portLocality = 'Changi Airport';
+          pLocType = 'Port';
+        } else if (/pasir\s+panjang/i.test(firstPart)) {
+          portLocality = 'Pasir Panjang';
+          pLocType = 'Port';
+        } else if (/jurong/i.test(firstPart)) {
+          portLocality = 'Jurong Port';
+          pLocType = 'Port';
+        } else if (/tokyo\s+airport|haneda|narita/i.test(firstPart)) {
+          portLocality = /narita/i.test(firstPart) ? 'Narita' : (/haneda/i.test(firstPart) ? 'Haneda' : 'Tokyo Airport');
+          pLocType = 'Port';
+        }
         return {
           district: isSg ? '' : firstPart,
-          locality: firstPart,
+          locality: portLocality,
           city: firstPart,
           country: countryName,
           postalCode: isSg ? '238801' : '',
-          locationType: locType,
-          searchQuery: firstPart,
+          locationType: pLocType,
+          searchQuery: portLocality,
           parentContext: countryName,
           address: '',
         };
@@ -451,10 +592,10 @@ function parseOrderPrompt(prompt = '') {
     };
   }
 
-  // Primary Route Regex: prioritize explicit "from X to Y", "dari X ke Y", "pickup X to Y"
-  let routeMatch = text.match(/(?:from|dari|pickup(?:\s+in|\s+at|\s+di)?)\s+([\s\S]+?)\s+(?:to|ke|antar\s+ke|tujuan(?:\s+ke)?)\s+([\s\S]+?)(?:\s*,?\s*\b(?:on|at|pada|tanggal|jam|scheduled|pickup)\b|$)/i);
+  // Primary Route Regex: prioritize explicit "from X to Y", "dari X ke Y", "pickup X to Y", or "X - Y"
+  let routeMatch = text.match(/(?:from|dari|pickup(?:\s+in|\s+at|\s+di)?)\s+([\s\S]+?)(?:\s+(?:to|ke|antar\s+ke|tujuan(?:\s+ke)?)\s+|\s+[-–—]\s+)([\s\S]+?)$/i);
   if (!routeMatch) {
-    routeMatch = text.match(/^\s*([\s\S]+?)\s+(?:to|ke|antar\s+ke|tujuan(?:\s+ke)?)\s+([\s\S]+?)(?:\s*,?\s*\b(?:on|at|pada|tanggal|jam|scheduled|pickup)\b|$)/i);
+    routeMatch = text.match(/(?:^|orders?\s+|pengiriman\s+)?([A-Za-z0-9\s,.'()\-]+?)(?:\s+(?:to|ke|antar\s+ke|tujuan(?:\s+ke)?)\s+|\s+[-–—]\s+)([\s\S]+?)$/i);
   }
 
   if (routeMatch) {
@@ -551,6 +692,21 @@ function parseOrderPrompt(prompt = '') {
     spec.incoterm = 'Delivered Duty Paid';
   }
 
+  // Infer transportationMode from endpoints if unspecified
+  if (!spec.transportationMode) {
+    const pLoc = `${spec.pickup?.locality || ''} ${spec.pickup?.raw || ''}`.toLowerCase();
+    const dLoc = `${spec.dropoff?.locality || ''} ${spec.dropoff?.raw || ''}`.toLowerCase();
+    const isAirport = (loc) => /airport|bandara|changi|soekarno-?hatta|haneda|narita/i.test(loc);
+    const isSeaPort = (loc) => /priok|pasir\s+panjang|jurong|pelabuhan|port|tanjung/i.test(loc);
+
+    if (isAirport(pLoc) || isAirport(dLoc)) {
+      spec.transportationMode = 'Air';
+      spec.serviceType = spec.serviceType || 'Cargo';
+    } else if (isSeaPort(pLoc) || isSeaPort(dLoc)) {
+      spec.transportationMode = 'Sea Freight';
+    }
+  }
+
   // 8. Cargo details
   spec.cargo = {};
   const weightMatch = text.match(/(\d+)\s*(?:kg|kilogram)/i);
@@ -586,4 +742,6 @@ module.exports = {
   parseOrderPrompt,
   parseDateString,
   parseTimeString,
+  parseTransitDuration,
+  stripScheduleAndMetadata,
 };

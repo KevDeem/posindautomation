@@ -15,6 +15,7 @@ const DEFAULT_CONFIG = {
   apiEndpoint: 'https://sr-pos-oms-api.nisims.web.id/api/v1',
   paymentSandboxUrl: 'https://pospay-sandbox.vercel.app',
   headless: false,
+  batchConcurrency: 3,
   maxRetries: 2,
   navigationTimeoutMs: 45000,
   actionTimeoutMs: 15000,
@@ -34,9 +35,15 @@ function loadConfig() {
     }
   }
 
+  const rawConcurrency = process.env.BATCH_CONCURRENCY !== undefined
+    ? parseInt(process.env.BATCH_CONCURRENCY, 10)
+    : (fileConfig.batchConcurrency !== undefined ? parseInt(fileConfig.batchConcurrency, 10) : DEFAULT_CONFIG.batchConcurrency);
+  const batchConcurrency = (!Number.isNaN(rawConcurrency) && rawConcurrency > 0) ? rawConcurrency : DEFAULT_CONFIG.batchConcurrency;
+
   return {
     ...DEFAULT_CONFIG,
     ...fileConfig,
+    batchConcurrency,
     headless: process.env.HEADLESS !== undefined
       ? process.env.HEADLESS === 'true'
       : (fileConfig.headless !== undefined ? fileConfig.headless : DEFAULT_CONFIG.headless),

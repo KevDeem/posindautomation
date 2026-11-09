@@ -11,8 +11,9 @@
     "test-spec": "node skills/logistics-automation/tools/test_specification.js",
     "test-pic": "node skills/logistics-automation/tools/test_pic.js",
     "test-cargo": "node skills/logistics-automation/tools/test_cargo.js",
+    "test-vms": "node skills/logistics-automation/tools/test_vms.js",
     "test-bot": "node skills/logistics-automation/tools/test_bot.js",
-    "test": "node skills/logistics-automation/tools/test_engine.js && node skills/logistics-automation/tools/test_specification.js && node skills/logistics-automation/tools/test_pic.js && node skills/logistics-automation/tools/test_cargo.js && node skills/logistics-automation/tools/test_bot.js && npm run smoke-test"
+    "test": "node skills/logistics-automation/tools/test_engine.js && node skills/logistics-automation/tools/test_specification.js && node skills/logistics-automation/tools/test_pic.js && node skills/logistics-automation/tools/test_cargo.js && node skills/logistics-automation/tools/test_vms.js && node skills/logistics-automation/tools/test_bot.js && npm run smoke-test"
   },
   "repository": {
     "type": "git",

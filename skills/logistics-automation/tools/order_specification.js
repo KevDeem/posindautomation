@@ -27,8 +27,11 @@ const {
   extractAdminPrefix,
   normalizeAdminCityName,
   detectLocationType,
+  detectLocationCategory,
+  getIndonesianIsland,
   normalizeIncoterm,
 } = require('./location_matcher');
+const { stripScheduleAndMetadata } = require('../bot/nl_parser');
 
 const ROOT_DIR = path.resolve(__dirname, '../../..');
 const SESSIONS_DIR = path.join(ROOT_DIR, '.sessions');
@@ -49,12 +52,12 @@ const DEFAULT_SPECIFICATION = {
     city: 'Jakarta Selatan',
     district: 'Tebet',
     subdistrict: 'Manggarai',
-    address: 'Tebet',
+    address: 'Jl. Logistik Simulasi No. 15, RT 02/RW 04',
     postalCode: '12850',
     pic: {
       name: 'Kevin',
       company: 'Kevin Co',
-      address: 'Tebet',
+      address: 'Jl. Logistik Simulasi No. 15, RT 02/RW 04',
       email: 'kevin@kevinco.com',
       phone: '08755029428339'
     }
@@ -65,12 +68,12 @@ const DEFAULT_SPECIFICATION = {
     city: 'Kota Surabaya',
     district: 'Gubeng',
     subdistrict: 'Pucang Sewu',
-    address: 'Gubeng',
+    address: 'Jl. Simulasi Pengiriman Raya No. 28, RT 03/RW 05',
     postalCode: '60283',
     pic: {
       name: 'Aldin',
       company: 'Aldin Co',
-      address: 'Gubeng',
+      address: 'Jl. Simulasi Pengiriman Raya No. 28, RT 03/RW 05',
       email: 'aldin@aldinco.com',
       phone: '08755910333483'
     }
@@ -133,6 +136,210 @@ function generateCargoWeightKg(min = 50, max = 100) {
   const low = Math.min(min, max);
   const high = Math.max(min, max);
   return Math.floor(Math.random() * (high - low + 1)) + low;
+}
+
+/**
+ * Check whether a string is only an administrative location (e.g. city, district, province)
+ * rather than a genuine street address.
+ */
+function isAdministrativeOnly(addr, city = '', district = '', province = '', country = '') {
+  if (!addr || typeof addr !== 'string') return true;
+  const trimmed = addr.trim();
+  if (trimmed.length === 0) return true;
+
+  const lower = trimmed.toLowerCase();
+  const cLower = String(city || '').trim().toLowerCase();
+  const dLower = String(district || '').trim().toLowerCase();
+  const pLower = String(province || '').trim().toLowerCase();
+  const cntryLower = String(country || '').trim().toLowerCase();
+
+  // If address equals administrative names exactly
+  if (cLower && lower === cLower) return true;
+  if (dLower && lower === dLower) return true;
+  if (pLower && lower === pLower) return true;
+  if (cntryLower && lower === cntryLower) return true;
+
+  // If address is simply a combination of district/city/province (e.g. "Tebet, Jakarta Selatan", "Benda Kota Tangerang")
+  const stripped = lower.replace(/[,.-]/g, ' ').replace(/\s+/g, ' ').trim();
+  const adminTokens = [cLower, dLower, pLower, cntryLower].filter(Boolean).map(t => t.replace(/[,.-]/g, ' ').trim());
+  let remaining = stripped;
+  for (const token of adminTokens) {
+    if (token) {
+      remaining = remaining.replace(new RegExp(`\\b${token}\\b`, 'g'), '').trim();
+    }
+  }
+  const nonAdminWords = remaining.replace(/\b(kota|kabupaten|kab|provinsi|prov|kecamatan|kec|kelurahan|kel|indonesia|singapore|malaysia)\b/g, '').trim();
+  if (!nonAdminWords && !/\d+/.test(trimmed)) {
+    return true;
+  }
+
+  // Check if it lacks street markers AND digits
+  const hasStreetIndicator = /(?:\b(?:jl|jalan|gang|gg|street|st|road|rd|ave|avenue|blvd|boulevard|komplek|ruko|blok|no|rt|rw|gedung|tower|floor|lantai|suite|unit|hub|terminal)\b|\d+)/i.test(trimmed);
+  if (!hasStreetIndicator) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Generate a realistic synthetic street address tailored to location and country.
+ * Clearly designates simulated/test data and never copies city/district.
+ */
+function generateSyntheticStreetAddress(options = {}) {
+  const normCountry = normalizeCountry(options.country);
+  const isPickup = options.isPickup !== false;
+  const num = Math.floor(Math.random() * 88) + 1;
+  const rt = String(Math.floor(Math.random() * 9) + 1).padStart(2, '0');
+  const rw = String(Math.floor(Math.random() * 9) + 1).padStart(2, '0');
+
+  if (normCountry.code === 'SG') {
+    const streets = isPickup
+      ? ['10 Orchard Road #05-12, Singapore', '250 Orchard Rd #03-01, Singapore', '12 Marina Boulevard #18-01, Singapore']
+      : ['5 Changi South Lane #02-04, Singapore', '10 Collyer Quay #10-01, Singapore', '8 Jurong Port Road #01-05, Singapore'];
+    return streets[Math.floor(Math.random() * streets.length)];
+  }
+
+  if (normCountry.code === 'MY') {
+    return isPickup
+      ? `No. ${num}, Jalan Logistik Percobaan, Bukit Bintang`
+      : `No. ${num + 10}, Jalan Kargo Simulasi, Seksyen 15`;
+  }
+
+  // Indonesian addresses
+  const pickupStreets = [
+    `Jl. Logistik Simulasi No. ${num}, RT ${rt}/RW ${rw}`,
+    `Jl. Percobaan Kargo Raya No. ${num}, RT ${rt}/RW ${rw}`,
+    `Jl. Pergudangan Uji Coba No. ${num}, Blok A, RT ${rt}/RW ${rw}`,
+    `Komplek Distribusi Simulasi No. ${num}, RT ${rt}/RW ${rw}`,
+  ];
+  const dropoffStreets = [
+    `Jl. Simulasi Pengiriman Raya No. ${num + 5}, RT ${rt}/RW ${rw}`,
+    `Jl. Mitra Ekspedisi Percobaan No. ${num + 12}, RT ${rt}/RW ${rw}`,
+    `Kawasan Industri Testing No. ${num + 20}, Blok B, RT ${rt}/RW ${rw}`,
+    `Ruko Sentra Simulasi No. ${num + 3}, RT ${rt}/RW ${rw}`,
+  ];
+
+  const pool = isPickup ? pickupStreets : dropoffStreets;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+/**
+ * Determine the Domestic transport preference ('SEMUA', 'DARAT', 'UDARA', 'LAUT')
+ * based on pickup/drop-off location types, geography, and transport requirements.
+ *
+ * Rules:
+ * 1. Port -> Port must ALWAYS select LAUT.
+ * 2. Airport -> Airport must ALWAYS select UDARA.
+ * 3. Door -> Door with exclusive land transport selects DARAT.
+ * 4. Multi-modal combinations (Door->Port, Port->Door, Airport->Door, Door->Airport,
+ *    Port->Airport, Airport->Port, cross-island, cross-country, or mixed transport) select SEMUA.
+ * 5. Explicit user instructions take precedence unless Port->Port (LAUT) or Airport->Airport (UDARA).
+ * 6. Fallback is SEMUA when uncertain.
+ *
+ * @param {Object} spec Order specification or partial spec
+ * @returns {'SEMUA'|'DARAT'|'UDARA'|'LAUT'}
+ */
+function determineDomesticTransportPreference(spec = {}) {
+  const pickup = spec.pickup || {};
+  const dropoff = spec.dropoff || {};
+
+  // Normalize location types/categories
+  const pCat = pickup.locationCategory || detectLocationCategory(pickup.locationType || pickup.locality || pickup.searchQuery || pickup.address || pickup.city);
+  const dCat = dropoff.locationCategory || detectLocationCategory(dropoff.locationType || dropoff.locality || dropoff.searchQuery || dropoff.address || dropoff.city);
+
+  // Mandatory override 1: Port -> Port must ALWAYS select LAUT
+  if (pCat === 'Port' && dCat === 'Port') {
+    return 'LAUT';
+  }
+
+  // Mandatory override 2: Airport -> Airport must ALWAYS select UDARA
+  if (pCat === 'Airport' && dCat === 'Airport') {
+    return 'UDARA';
+  }
+
+  // Cross-country shipment requires multi-modal / air / sea -> SEMUA
+  const pCountry = String(pickup.country || 'Indonesia').trim().toLowerCase();
+  const dCountry = String(dropoff.country || 'Indonesia').trim().toLowerCase();
+  const isInternational = spec.orderType === 'international' || (pCountry && dCountry && pCountry !== dCountry);
+  if (isInternational) {
+    return 'SEMUA';
+  }
+
+  // Check explicit transportation mode or instructions if provided
+  const rawMode = String(spec.transportationMode || '').trim().toUpperCase();
+  const rawInstruct = String(spec.transportInstructions || spec.prompt || '').toLowerCase();
+
+  // If mixed land, sea, air shipment explicitly mentioned -> SEMUA
+  if (rawInstruct.includes('mixed') || (rawInstruct.includes('darat') && (rawInstruct.includes('laut') || rawInstruct.includes('udara')))) {
+    return 'SEMUA';
+  }
+
+  // If explicit mode requested and not conflicting with mandatory overrides
+  if (rawMode === 'DARAT' || rawMode === 'LAND') {
+    // Only valid for Door -> Door land
+    if (pCat === 'Door' && dCat === 'Door') {
+      const pIsland = getIndonesianIsland(pickup);
+      const dIsland = getIndonesianIsland(dropoff);
+      if (!pIsland || !dIsland || pIsland === dIsland) {
+        return 'DARAT';
+      }
+      // Cross-island requires sea or air -> SEMUA
+      return 'SEMUA';
+    }
+    return 'SEMUA';
+  }
+
+  if (rawMode === 'UDARA' || rawMode === 'AIR') {
+    // If not Airport -> Airport, multi-modal leg involved -> SEMUA
+    return 'SEMUA';
+  }
+
+  if (rawMode === 'LAUT' || rawMode === 'SEA' || rawMode === 'SEA FREIGHT') {
+    // If not Port -> Port, multi-modal leg involved -> SEMUA
+    return 'SEMUA';
+  }
+
+  // Combinations involving Port or Airport with Door or each other
+  // Door -> Port, Port -> Door, Airport -> Door, Door -> Airport, Port -> Airport, Airport -> Port
+  if (
+    (pCat === 'Door' && dCat === 'Port') ||
+    (pCat === 'Port' && dCat === 'Door') ||
+    (pCat === 'Airport' && dCat === 'Door') ||
+    (pCat === 'Door' && dCat === 'Airport') ||
+    (pCat === 'Port' && dCat === 'Airport') ||
+    (pCat === 'Airport' && dCat === 'Port')
+  ) {
+    return 'SEMUA';
+  }
+
+  // Check Door -> Door geography
+  if (pCat === 'Door' && dCat === 'Door') {
+    // Check if route crosses islands (e.g., Jakarta -> Bali, Jakarta -> Makassar)
+    const pIsland = getIndonesianIsland(pickup);
+    const dIsland = getIndonesianIsland(dropoff);
+
+    if (pIsland && dIsland && pIsland !== dIsland) {
+      // Crosses islands: requires sea or air transportation -> SEMUA
+      return 'SEMUA';
+    }
+
+    // Check if instructions mention sea or air
+    if (rawInstruct.includes('sea') || rawInstruct.includes('laut') || rawInstruct.includes('air') || rawInstruct.includes('udara')) {
+      return 'SEMUA';
+    }
+
+    // Exclusively land route on the same island (e.g. Jakarta -> Surabaya)
+    if (pIsland && dIsland && pIsland === dIsland) {
+      return 'DARAT';
+    }
+
+    // Default Door -> Door within Indonesia when islands cannot be distinguished
+    return 'DARAT';
+  }
+
+  // Confident determination not possible -> fallback to SEMUA
+  return 'SEMUA';
 }
 
 /**
@@ -278,6 +485,23 @@ function resolveSpecification(inputSpec = {}, options = {}) {
     sources.scheduledTime = 'reused';
   }
 
+  // 3b. Transit Duration & Hours
+  if (inputSpec.transitDuration) {
+    resolved.transitDuration = inputSpec.transitDuration;
+    sources.transitDuration = 'provided';
+  } else if (prev.transitDuration && !isTypeChanged) {
+    resolved.transitDuration = prev.transitDuration;
+    sources.transitDuration = 'reused';
+  }
+
+  if (inputSpec.durationHours !== undefined) {
+    resolved.durationHours = inputSpec.durationHours;
+    sources.durationHours = 'provided';
+  } else if (prev.durationHours !== undefined && !isTypeChanged) {
+    resolved.durationHours = prev.durationHours;
+    sources.durationHours = 'reused';
+  }
+
   // 4. Pickup Location (Independent resolution)
   resolved.pickup = {};
   sources.pickup = {};
@@ -318,6 +542,27 @@ function resolveSpecification(inputSpec = {}, options = {}) {
     } else {
       sources.pickup[k] = 'missing';
     }
+  }
+
+  // Sanitize searchQuery and locality if they contain schedules/metadata
+  if (resolved.pickup.searchQuery) {
+    resolved.pickup.searchQuery = stripScheduleAndMetadata(resolved.pickup.searchQuery);
+  }
+  if (resolved.pickup.locality) {
+    resolved.pickup.locality = stripScheduleAndMetadata(resolved.pickup.locality);
+  }
+
+  // Ensure pickup address is a genuine street address, not an administrative placeholder
+  if (resolved.pickup.address && !isAdministrativeOnly(resolved.pickup.address, resolved.pickup.city, resolved.pickup.district, resolved.pickup.province, resolved.pickup.country)) {
+    // Keep explicit street address
+  } else {
+    resolved.pickup.address = generateSyntheticStreetAddress({
+      country: resolved.pickup.country || 'Indonesia',
+      city: resolved.pickup.city,
+      district: resolved.pickup.district,
+      isPickup: true,
+    });
+    sources.pickup.address = (inputPickup.address && !isAdministrativeOnly(inputPickup.address, resolved.pickup.city, resolved.pickup.district)) ? 'provided' : 'generated';
   }
 
   // Default locationType
@@ -377,6 +622,9 @@ function resolveSpecification(inputSpec = {}, options = {}) {
       resolved.pickup.pic[k] = pickupSelection.pic[k];
       sources.pickup.pic[k] = pickupSelection.origin;
     }
+  }
+  if (!resolved.pickup.pic.address || isAdministrativeOnly(resolved.pickup.pic.address, resolved.pickup.city, resolved.pickup.district, resolved.pickup.province, resolved.pickup.country)) {
+    resolved.pickup.pic.address = resolved.pickup.address;
   }
   resolved.pickup.pic.country = pickupSelection.pic.country || pickupCountry;
   resolved.pickup.pic.countryCode = pickupSelection.pic.countryCode;
@@ -448,6 +696,27 @@ function resolveSpecification(inputSpec = {}, options = {}) {
     }
   }
 
+  // Sanitize searchQuery and locality if they contain schedules/metadata
+  if (resolved.dropoff.searchQuery) {
+    resolved.dropoff.searchQuery = stripScheduleAndMetadata(resolved.dropoff.searchQuery);
+  }
+  if (resolved.dropoff.locality) {
+    resolved.dropoff.locality = stripScheduleAndMetadata(resolved.dropoff.locality);
+  }
+
+  // Ensure dropoff address is a genuine street address, not an administrative placeholder, and distinct from pickup
+  if (resolved.dropoff.address && !isAdministrativeOnly(resolved.dropoff.address, resolved.dropoff.city, resolved.dropoff.district, resolved.dropoff.province, resolved.dropoff.country)) {
+    // Keep explicit street address
+  } else {
+    resolved.dropoff.address = generateSyntheticStreetAddress({
+      country: resolved.dropoff.country || (resolved.orderType === 'international' ? 'Singapore' : 'Indonesia'),
+      city: resolved.dropoff.city,
+      district: resolved.dropoff.district,
+      isPickup: false,
+    });
+    sources.dropoff.address = (inputDropoff.address && !isAdministrativeOnly(inputDropoff.address, resolved.dropoff.city, resolved.dropoff.district)) ? 'provided' : 'generated';
+  }
+
   if (!resolved.dropoff.locationType) {
     resolved.dropoff.locationType = 'Door';
     sources.dropoff.locationType = 'ui_default';
@@ -496,6 +765,9 @@ function resolveSpecification(inputSpec = {}, options = {}) {
       resolved.dropoff.pic[k] = dropoffSelection.pic[k];
       sources.dropoff.pic[k] = dropoffSelection.origin;
     }
+  }
+  if (!resolved.dropoff.pic.address || isAdministrativeOnly(resolved.dropoff.pic.address, resolved.dropoff.city, resolved.dropoff.district, resolved.dropoff.province, resolved.dropoff.country)) {
+    resolved.dropoff.pic.address = resolved.dropoff.address;
   }
   resolved.dropoff.pic.country = dropoffSelection.pic.country || dropoffCountry;
   resolved.dropoff.pic.countryCode = dropoffSelection.pic.countryCode;
@@ -557,6 +829,19 @@ function resolveSpecification(inputSpec = {}, options = {}) {
     sources.serviceCatalogPreference = 'ui_default';
   }
 
+  // 9b. Domestic Transport Preference Resolution
+  if (resolved.orderType === 'domestic') {
+    resolved.transportationMode = determineDomesticTransportPreference({
+      ...inputSpec,
+      orderType: 'domestic',
+      pickup: resolved.pickup,
+      dropoff: resolved.dropoff,
+      transportationMode: inputSpec.transportationMode,
+      transportInstructions: inputSpec.transportInstructions || inputSpec.prompt || '',
+    });
+    sources.transportationMode = inputSpec.transportationMode ? 'provided' : 'ui_default';
+  }
+
   // 10. Check Missing Mandatory Fields
   const missingMandatory = [];
   if (!resolved.pickup.city) missingMandatory.push('pickup.city');
@@ -606,6 +891,7 @@ function formatSpecificationReview(resolvedSpec, sources) {
     `| **Transportation Mode** | ${resolvedSpec.transportationMode} | ${badge(sources.transportationMode)} |`,
     `| **Service Type** | ${resolvedSpec.serviceType || 'Standard'} | ${badge(sources.serviceType || 'ui_default')} |`,
     `| **Pickup Date & Time** | ${resolvedSpec.scheduledDate} ${resolvedSpec.scheduledTime} | ${badge(sources.scheduledDate)} |`,
+    resolvedSpec.transitDuration ? `| **Transit Duration** | ${resolvedSpec.transitDuration} (${resolvedSpec.durationHours || 0} hours) | ${badge(sources.transitDuration || 'provided')} |` : null,
     `| **Pickup Country** | ${resolvedSpec.pickup.country || 'Indonesia'} | ${badge(sources.pickup.country || 'ui_default')} |`,
     `| **Pickup Point** | ${pickupPoint} (${resolvedSpec.pickup.postalCode || '-'}) | ${badge(sources.pickup.city)} |`,
     `| **Pickup Location Type** | ${resolvedSpec.pickup.locationType || 'Door'} | ${badge(sources.pickup.locationType || 'ui_default')} |`,
@@ -640,5 +926,8 @@ module.exports = {
   generateCargoItemName,
   generateCargoWeightKg,
   resetCargoGenerator,
+  generateSyntheticStreetAddress,
+  isAdministrativeOnly,
+  determineDomesticTransportPreference,
 };
 

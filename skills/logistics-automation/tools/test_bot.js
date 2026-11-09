@@ -13,7 +13,13 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
-const { parseOrderPrompt, parseDateString, parseTimeString } = require('../bot/nl_parser');
+const {
+  parseOrderPrompt,
+  parseDateString,
+  parseTimeString,
+  parseTransitDuration,
+  stripScheduleAndMetadata,
+} = require('../bot/nl_parser');
 const {
   saveExecutionRecord,
   listExecutionRecords,
@@ -21,7 +27,7 @@ const {
 } = require('../bot/history_manager');
 const { loadConfig } = require('../bot/config');
 const { resolveSpecification, DEFAULT_SPECIFICATION, formatSpecificationReview } = require('./order_specification');
-const { normalizeBatchInput, classifyFailure } = require('./batch_executor');
+const { normalizeBatchInput, classifyFailure, executeBatch, runWithConcurrency } = require('./batch_executor');
 const { executeOrderPayment, formatRupiah, parseCurrency } = require('./payment_executor');
 const {
   extractAdminPrefix,
@@ -39,11 +45,16 @@ const {
   resolveInternationalPicAttachment,
   ensureInternationalPicRecords,
   fillInternationalPicAndAttachment,
+  selectDomesticTransportPreference,
+  captureTransportPreferenceDiagnostics,
   handleInternationalServiceCatalogStep2,
   captureInternationalCatalogDiagnostics,
+  captureInternationalPicDiagnostics,
   selectAntDatePicker,
   captureDatePickerDiagnostics,
   getAntDatePickerState,
+  selectAntPortOption,
+  sanitizePortName,
 } = require('./order_executor');
 const {
   getPicLibrary,
@@ -488,13 +499,13 @@ async function runBotTests() {
   await browserTest.close();
   console.log('  [PASS] Navigation logging and element verification verified.');
 
-  // Test 24: Batch authenticating only once at startup
-  console.log('\n[Test 24] Testing batch authenticates once at startup and reuses session...');
+  // Test 24: Batch authenticates each worker independently with fresh login
+  console.log('\n[Test 24] Testing batch authenticates each worker independently without sharing cookies/sessions...');
   const batchCode = fs.readFileSync(path.join(__dirname, 'batch_executor.js'), 'utf-8');
-  assert(batchCode.includes('performFreshLogin(authPage, context'), 'Batch executor must call performFreshLogin at startup');
-  assert(batchCode.includes('skipLogin: true'), 'Batch executor must pass skipLogin: true to individual orders');
-  assert(batchCode.includes('authExpiredMidBatch'), 'Batch executor must halt safely if auth expires mid-batch');
-  console.log('  [PASS] Batch single-login pattern verified.');
+  assert(batchCode.includes('performFreshLogin(page, context'), 'Batch executor worker must call performFreshLogin independently');
+  assert(batchCode.includes('browser.newContext('), 'Batch executor worker must create an isolated context');
+  assert(batchCode.includes('context.close()'), 'Batch executor worker must close context after completion');
+  console.log('  [PASS] Batch independent worker authentication and context isolation verified.');
 
   // Test 25: Safe abort on AUTH_EXPIRED failure mid-batch
   console.log('\n[Test 25] Testing classifyFailure on auth expiration...');
@@ -1298,9 +1309,10 @@ async function runBotTests() {
   assert(orderBotFile.includes('1. Create Order and Simulate Payment'), 'Menu must contain Option 1: Create Order and Simulate Payment');
   assert(orderBotFile.includes('2. Create Multiple Orders and Simulate Payment'), 'Menu must contain Option 2: Create Multiple Orders and Simulate Payment');
   assert(orderBotFile.includes('3. View Previous Execution Results'), 'Menu must contain Option 3: View Previous Execution Results');
-  assert(orderBotFile.includes('4. Exit'), 'Menu must contain Option 4: Exit');
-  assert(orderBotFile.includes('Select option [1-4]:'), 'Prompt must specify [1-4]');
-  assert(orderBotFile.includes('Invalid selection. Please choose an option between 1 and 4.'), 'Must validate input range 1-4');
+  assert(orderBotFile.includes('4. Manage VMS Service Catalog'), 'Menu must contain Option 4: Manage VMS Service Catalog');
+  assert(orderBotFile.includes('5. Exit'), 'Menu must contain Option 5: Exit');
+  assert(orderBotFile.includes('Select option [1-5]:'), 'Prompt must specify [1-5]');
+  assert(orderBotFile.includes('Invalid selection. Please choose an option between 1 and 5.'), 'Must validate input range 1-5');
 
   // Verify obsolete separate domestic/international menu options are gone
   assert(!orderBotFile.includes('1. Create Domestic Order'), 'Must not have separate Create Domestic Order option');
@@ -1310,7 +1322,7 @@ async function runBotTests() {
 
   // Test interactive loop validation with invalid choice then exit
   const { startOrderingBot } = require('../bot/order_bot');
-  const mockMenuRl = createMockRl(['99', '4']); // 99 (invalid), then 4 (exit)
+  const mockMenuRl = createMockRl(['99', '5']); // 99 (invalid), then 5 (exit)
   const menuLogs = [];
   const origLog = console.log;
   console.log = (...args) => {
@@ -1320,9 +1332,9 @@ async function runBotTests() {
   await startOrderingBot({ rl: mockMenuRl, headless: true });
   console.log = origLog;
 
-  assert(menuLogs.some(l => l.includes('Invalid selection. Please choose an option between 1 and 4.')), 'Must log invalid selection warning');
+  assert(menuLogs.some(l => l.includes('Invalid selection. Please choose an option between 1 and 5.')), 'Must log invalid selection warning');
   assert(menuLogs.some(l => l.includes('Exiting POSIND Ordering Bot. Goodbye!')), 'Must log goodbye message on exit');
-  console.log('  [PASS] CLI 4-option menu structure, input validation, and exit verified.');
+  console.log('  [PASS] CLI 5-option menu structure, input validation, and exit verified.');
 
   // Test 50: Unified Option 1 Domestic & International Routing & Auto-Payment
   console.log('\n[Test 50] Testing Unified Option 1 Domestic & International Routing & Auto-Payment...');
@@ -1764,7 +1776,7 @@ async function runBotTests() {
         </style>
       </head>
       <body>
-        <form id="pic-form">
+        <form id="pic-form" onsubmit="event.preventDefault()">
           <input name="origin_pic_name" id="origin_pic_name" placeholder="Masukkan nama PIC" />
           <input name="origin_company" id="origin_company" placeholder="Nama Perusahaan" />
           <input name="origin_address" id="origin_address" placeholder="Alamat detail" />
@@ -2221,12 +2233,7 @@ async function runBotTests() {
   assert.strictEqual(await pageMockFullFlow.locator('#destination_pic_name').inputValue(), 'Darren Tan');
   assert.strictEqual(await pageMockFullFlow.locator('#destination_company').inputValue(), 'Singapore Imports Pte Ltd');
 
-  // Advance Step 3 to Step 4
-  const step3Btn = pageMockFullFlow.locator('#btn-save-step3');
-  await step3Btn.click();
-  await pageMockFullFlow.waitForTimeout(300);
-
-  // Verify Step 4 visible
+  // Verify Step 4 visible (submitted automatically by fillInternationalPicAndAttachment Stage 8)
   assert.strictEqual(await pageMockFullFlow.locator('#step-4').isVisible(), true, 'Step 4 must be visible after Step 3 submit');
 
   // Confirm Step 4
@@ -2416,11 +2423,793 @@ async function runBotTests() {
   console.log('  [PASS] DatePicker "Baik" confirmation button successfully clicked and date committed.');
   await pageMockBaik.close();
 
+  // Test 70: Stage-by-Stage International PIC Instrumentation & Diagnostic Capture
+  console.log('\n[Test 70] Testing International PIC stage instrumentation & diagnostic capture on real Ant Design DOM wrappers...');
+  const pageMockIntlPic = await browserPay.newPage();
+  await pageMockIntlPic.setContent(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/antd/5.12.5/antd.min.css">
+    </head>
+    <body>
+      <div id="step-3">
+        <h2>Informasi Shipper & Consignee</h2>
+        <form id="intl-form">
+          <!-- Ant Design Input item with label text "Nama PIC" and id="country" inside -->
+          <div class="ant-form-item">
+            <label>Nama PIC</label>
+            <input id="country" name="origin_pic_name" placeholder="Nama PIC" />
+          </div>
+          <div class="ant-form-item">
+            <label>Perusahaan</label>
+            <input id="country" name="origin_company" placeholder="Perusahaan" />
+          </div>
+          <div class="ant-form-item">
+            <label>Alamat</label>
+            <textarea name="origin_address" placeholder="Alamat"></textarea>
+          </div>
+          <div class="ant-form-item">
+            <label>Email</label>
+            <input name="origin_email" type="email" placeholder="Email" />
+          </div>
+          <div class="ant-form-item">
+            <label>Nomor Telepon</label>
+            <input name="origin_phone" type="text" placeholder="Nomor Telepon" />
+          </div>
+
+          <!-- Destination Section -->
+          <div class="ant-form-item">
+            <label>Nama PIC</label>
+            <input name="destination_pic_name" placeholder="Nama PIC" />
+          </div>
+          <div class="ant-form-item">
+            <label>Perusahaan</label>
+            <input name="destination_company" placeholder="Perusahaan" />
+          </div>
+          <div class="ant-form-item">
+            <label>Alamat</label>
+            <textarea name="destination_address" placeholder="Alamat"></textarea>
+          </div>
+          <div class="ant-form-item">
+            <label>Email</label>
+            <input name="destination_email" type="email" placeholder="Email" />
+          </div>
+          <div class="ant-form-item">
+            <label>Nomor Telepon</label>
+            <input name="destination_phone" type="text" placeholder="Nomor Telepon" />
+          </div>
+
+          <!-- File Upload -->
+          <div class="ant-upload">
+            <input type="file" id="pic-attachment-uploader" />
+          </div>
+          <div id="uploaded-files-container"></div>
+        </form>
+      </div>
+
+      <script>
+        const fileInput = document.getElementById('pic-attachment-uploader');
+        fileInput.addEventListener('change', (e) => {
+          Array.from(e.target.files).forEach(f => {
+            const card = document.createElement('div');
+            card.className = 'ant-upload-list-item';
+            card.innerHTML = '<span>' + f.name + '</span>';
+            document.getElementById('uploaded-files-container').appendChild(card);
+          });
+        });
+      </script>
+    </body>
+    </html>
+  `);
+
+  const testSpec70 = {
+    orderType: 'international',
+    pickup: {
+      country: 'Indonesia',
+      city: 'Jakarta',
+      pic: {
+        name: 'Budi Santoso',
+        company: 'PT Nusantara Jaya',
+        address: 'Jl. Merdeka No. 1',
+        email: 'budi@nusantara.id',
+        phone: '081234567890',
+      },
+    },
+    dropoff: {
+      country: 'Singapore',
+      city: 'Singapore',
+      pic: {
+        name: 'Michael Tan',
+        company: 'Singa Global Pte Ltd',
+        address: '10 Collyer Quay',
+        email: 'michael@singaglobal.sg',
+        phone: '+6591234567',
+      },
+    },
+  };
+
+  const resPic70 = await fillInternationalPicAndAttachment(pageMockIntlPic, testSpec70, 'Test 70 (Instrumented PIC)');
+  assert.strictEqual(resPic70.success, true, 'fillInternationalPicAndAttachment must succeed');
+  assert.strictEqual(resPic70.fileName, 'WhatsApp Image 2026-05-29 at 15.30.23.jpeg', 'FileName must match expected PIC file');
+
+  // Verify inputs in DOM
+  const verifyName = await pageMockIntlPic.locator('input[name="origin_pic_name"]').inputValue();
+  assert.strictEqual(verifyName, 'Budi Santoso', 'Origin PIC name must be populated in DOM');
+  const verifyDest = await pageMockIntlPic.locator('input[name="destination_pic_name"]').inputValue();
+  assert.strictEqual(verifyDest, 'Michael Tan', 'Destination PIC name must be populated in DOM');
+  console.log('  [PASS] International PIC stage instrumentation and real Ant Design DOM selectors verified.');
+
+  // Verify Diagnostic capture on missing section / form
+  const pageEmpty = await browserPay.newPage();
+  await pageEmpty.setContent('<html><body><div>Empty Step</div></body></html>');
+  let picHaltCaught = false;
+  try {
+    await fillInternationalPicAndAttachment(pageEmpty, testSpec70, 'Test 70 (Halt Verification)');
+  } catch (err) {
+    picHaltCaught = true;
+    assert(err.message.includes('International PIC section failed to open'), 'Must halt when PIC section is not open');
+    assert(err.diagnostic, 'Error must contain diagnostic metadata');
+    assert.strictEqual(err.diagnostic.failingStage, 'SECTION_MOUNT', 'Diagnostic failingStage must be SECTION_MOUNT');
+  }
+  assert.strictEqual(picHaltCaught, true, 'Must strictly halt when PIC section is missing');
+  await pageEmpty.close();
+  await pageMockIntlPic.close();
+  console.log('  [PASS] International PIC strict halting and diagnostic capture verified.');
+
   await pageMockCatalog.close();
   await pageMockPic.close();
   await pageMockAuto.close();
   await pageMockService.close();
   await browserPay.close();
+
+  // ==========================================
+  // Test 71: Concurrency scheduler and result aggregation
+  // ==========================================
+  console.log('\n[Test 71] Testing concurrency scheduling (default 3 workers) and ordered result aggregation...');
+  const activeWorkersHistory = [];
+  let currentActive = 0;
+  let maxActive = 0;
+
+  const mockTasks = [1, 2, 3, 4, 5, 6, 7].map(id => async () => {
+    currentActive++;
+    if (currentActive > maxActive) maxActive = currentActive;
+    activeWorkersHistory.push({ id, action: 'start', active: currentActive });
+    // Simulate async network/DOM latency
+    await new Promise(r => setTimeout(r, 40));
+    currentActive--;
+    activeWorkersHistory.push({ id, action: 'end', active: currentActive });
+    return {
+      index: id,
+      orderId: `ORCA${1000 + id}`,
+      success: true,
+      amount: 50000 * id,
+    };
+  });
+
+  const scheduledResults = await runWithConcurrency(mockTasks, 3);
+  assert.strictEqual(scheduledResults.length, 7, 'Must aggregate exactly 7 results');
+  assert.strictEqual(maxActive, 3, 'Maximum concurrent active workers must not exceed 3');
+  for (let i = 0; i < 7; i++) {
+    assert.strictEqual(scheduledResults[i].index, i + 1, `Result order must match input order (index ${i + 1})`);
+    assert.strictEqual(scheduledResults[i].orderId, `ORCA${1001 + i}`, `Result payload must match index ${i + 1}`);
+  }
+  console.log('  [PASS] Concurrency scheduler enforced limit of 3 workers and preserved result ordering.');
+
+  // ==========================================
+  // Test 72: Failure isolation and independent order state
+  // ==========================================
+  console.log('\n[Test 72] Testing worker failure isolation and independent state across concurrent tasks...');
+  const mixedTasks = [
+    async () => {
+      await new Promise(r => setTimeout(r, 20));
+      return { index: 1, success: true, orderId: 'ORCA2001', amount: 100000, overallStatus: 'SUCCESS' };
+    },
+    async () => {
+      await new Promise(r => setTimeout(r, 30));
+      // Worker 2 fails completely
+      return { index: 2, success: false, orderId: null, amount: 0, overallStatus: 'FAILED', error: 'CATALOG_NOT_FOUND: No catalog' };
+    },
+    async () => {
+      await new Promise(r => setTimeout(r, 10));
+      return { index: 3, success: true, orderId: 'ORCA2003', amount: 150000, overallStatus: 'SUCCESS' };
+    },
+    async () => {
+      // Worker 4 throws an unhandled fatal error
+      await new Promise(r => setTimeout(r, 15));
+      throw new Error('Fatal socket hang up');
+    },
+    async () => {
+      await new Promise(r => setTimeout(r, 25));
+      return { index: 5, success: true, orderId: 'ORCA2005', amount: 200000, overallStatus: 'SUCCESS' };
+    },
+  ];
+
+  const isolatedResults = await runWithConcurrency(mixedTasks, 3);
+  assert.strictEqual(isolatedResults.length, 5, 'All 5 tasks must return results regardless of failures');
+  assert.strictEqual(isolatedResults[0].success, true, 'Task 1 must succeed');
+  assert.strictEqual(isolatedResults[1].success, false, 'Task 2 failure must be recorded');
+  assert.strictEqual(isolatedResults[2].success, true, 'Task 3 must succeed despite Task 2 failure');
+  assert.strictEqual(isolatedResults[3].success, false, 'Task 4 fatal exception must be caught and isolated');
+  assert(isolatedResults[3].error.includes('WORKER_FATAL'), 'Task 4 error must indicate worker isolation');
+  assert.strictEqual(isolatedResults[4].success, true, 'Task 5 must succeed despite Task 2 & 4 failures');
+  console.log('  [PASS] Failure isolation verified: failed and threw tasks did not affect remaining workers.');
+
+  // ==========================================
+  // Test 73: Batch configuration loading and fallback
+  // ==========================================
+  console.log('\n[Test 73] Testing batch concurrency configuration loading, defaults, and overrides...');
+  const baseCfg = loadConfig();
+  assert.strictEqual(typeof baseCfg.batchConcurrency, 'number', 'batchConcurrency must be a number');
+  assert(baseCfg.batchConcurrency >= 1, 'batchConcurrency must be >= 1');
+
+  // Test custom environment variable override
+  const prevEnv = process.env.BATCH_CONCURRENCY;
+  process.env.BATCH_CONCURRENCY = '1';
+  const seqCfg = loadConfig();
+  assert.strictEqual(seqCfg.batchConcurrency, 1, 'BATCH_CONCURRENCY=1 must configure sequential fallback');
+
+  process.env.BATCH_CONCURRENCY = '5';
+  const highCfg = loadConfig();
+  assert.strictEqual(highCfg.batchConcurrency, 5, 'BATCH_CONCURRENCY=5 must configure 5 workers');
+
+  if (prevEnv !== undefined) {
+    process.env.BATCH_CONCURRENCY = prevEnv;
+  } else {
+    delete process.env.BATCH_CONCURRENCY;
+  }
+  console.log('  [PASS] Batch concurrency configuration and sequential fallback verified.');
+
+  // ==========================================
+  // Test 74: Real Staging Next.js/Tailwind Step 3 DOM & Field-Level Diagnostics
+  // ==========================================
+  console.log('\n[Test 74] Testing International Step 3 PIC population on real Next.js DOM (id="country", empty name, placeholders) & field diagnostics...');
+  const { chromium: chromium74 } = require('playwright');
+  const browser74 = await chromium74.launch({ headless: true });
+  const page74 = await browser74.newPage();
+
+  await page74.setContent(`
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="utf-8"></head>
+    <body>
+      <div id="step-3-container">
+        <h2>Informasi Shipper & Consignee</h2>
+        <div class="grid grid-cols-2">
+          <div id="shipper-col">
+            <h3>Informasi PIC Titik Asal</h3>
+            <div><label>Nama PIC</label><input id="country" name="" placeholder="Masukkan Nama PIC" /></div>
+            <div><label>Nama Perusahaan</label><input id="country" name="" placeholder="Pilih Nama Perusahaan" /></div>
+            <div><label>Alamat</label><input id="country" name="" placeholder="Masukkan alamat" /></div>
+            <div><label>Email</label><input id="country" name="" placeholder="Email aktif pengirim" /></div>
+            <div>
+              <label>Nomor Telepon</label>
+              <input id="origin_phone_area" name="" value="+62" />
+              <input id="origin_phone" name="" placeholder="812345678" />
+            </div>
+          </div>
+          <div id="consignee-col">
+            <h3>Informasi PIC Titik Tujuan</h3>
+            <div><label>Nama PIC</label><input id="country" name="" placeholder="Masukkan Nama PIC" /></div>
+            <div><label>Nama Perusahaan</label><input id="country" name="" placeholder="Pilih Nama Perusahaan" /></div>
+            <div><label>Alamat</label><input id="country" name="" placeholder="Masukkan alamat" /></div>
+            <div><label>Email</label><input id="country" name="" placeholder="Email aktif pengirim" /></div>
+            <div>
+              <label>Nomor Telepon</label>
+              <input id="destination_phone_area" name="" value="+62" />
+              <input id="destination_phone" name="" placeholder="91234567" />
+            </div>
+          </div>
+        </div>
+        <div>
+          <input type="file" id="pic-attachment-uploader" />
+          <div id="uploaded-files-container"></div>
+        </div>
+        <button type="button" id="save-detail-btn">Simpan Detail Pengiriman</button>
+      </div>
+      <script>
+        document.getElementById('pic-attachment-uploader').addEventListener('change', (e) => {
+          Array.from(e.target.files).forEach(f => {
+            const item = document.createElement('div');
+            item.className = 'ant-upload-list-item';
+            item.innerHTML = '<span>' + f.name + '</span>';
+            document.getElementById('uploaded-files-container').appendChild(item);
+          });
+        });
+      </script>
+    </body>
+    </html>
+  `);
+
+  const spec74 = {
+    orderType: 'international',
+    pickup: {
+      country: 'Indonesia',
+      city: 'Kabupaten Tangerang',
+      address: 'Jl. Logistik Simulasi No. 15, RT 02/RW 04',
+      pic: {
+        name: 'Ahmad Pratama',
+        company: 'PT Logistik Nusantara',
+        address: 'Jl. Logistik Simulasi No. 15, RT 02/RW 04',
+        email: 'ahmad.pratama@example.com',
+        phone: '081234567890',
+      },
+    },
+    dropoff: {
+      country: 'Singapore',
+      city: 'Singapore',
+      district: 'Orchard',
+      address: '10 Orchard Road, #05-12, Singapore 238841',
+      pic: {
+        name: 'Michael Tan',
+        company: 'Singa Express Pte Ltd',
+        address: '10 Orchard Road, #05-12, Singapore 238841',
+        email: 'michael.tan@example.sg',
+        phone: '+6591234567',
+      },
+    },
+  };
+
+  const res74 = await fillInternationalPicAndAttachment(page74, spec74, 'Test 74 Staging DOM');
+  assert.strictEqual(res74.success, true, 'fillInternationalPicAndAttachment must succeed on staging DOM');
+  assert(res74.fieldDiagnostics && res74.fieldDiagnostics.length >= 10, 'fieldDiagnostics must be populated with all field checks');
+
+  // Verify field values directly in DOM
+  const inputsName = await page74.locator('input[placeholder*="Nama PIC" i]').all();
+  assert.strictEqual(inputsName.length, 2, 'Should find both Shipper and Consignee Name PIC inputs');
+  assert.strictEqual(await inputsName[0].inputValue(), 'Ahmad Pratama', 'Shipper PIC Name must be Ahmad Pratama');
+  assert.strictEqual(await inputsName[1].inputValue(), 'Michael Tan', 'Consignee PIC Name must be Michael Tan');
+
+  const inputsAddr = await page74.locator('input[placeholder*="Masukkan alamat" i]').all();
+  assert.strictEqual(await inputsAddr[0].inputValue(), 'Jl. Logistik Simulasi No. 15, RT 02/RW 04', 'Shipper Address must be full street address');
+  assert.strictEqual(await inputsAddr[1].inputValue(), '10 Orchard Road, #05-12, Singapore 238841', 'Consignee Address must be full street address');
+
+  const destPhoneArea = await page74.locator('#destination_phone_area').inputValue();
+  assert.strictEqual(destPhoneArea, '+65', 'Singapore Consignee phone area must be updated to +65');
+
+  const destPhone = await page74.locator('#destination_phone').inputValue();
+  assert.strictEqual(destPhone, '91234567', 'Consignee phone must have country code stripped when prefix is set');
+
+  // Verify all field diagnostics have found: true, filled: true, and non-empty actualValue
+  for (const diag of res74.fieldDiagnostics) {
+    assert.strictEqual(diag.found, true, `Field ${diag.fieldLabel} must be found`);
+    assert.strictEqual(diag.filled, true, `Field ${diag.fieldLabel} must be filled`);
+    assert(diag.actualValue && diag.actualValue.length > 0, `Field ${diag.fieldLabel} actualValue must not be empty`);
+  }
+  console.log('  [PASS] Staging Step 3 DOM (id="country", empty name, placeholders) and field diagnostics verified.');
+
+  await browser74.close();
+
+  // ==========================================
+  // Test 75: Domestic Transport Preference UI Selection & Diagnostic Capture
+  // ==========================================
+  console.log('\n[Test 75] Testing Domestic Transport Preference UI Selection & Verification on Step 1 buttons...');
+  const { chromium: chromium75 } = require('playwright');
+  const browser75 = await chromium75.launch({ headless: true });
+  const page75 = await browser75.newPage();
+
+  await page75.setContent(`
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="utf-8"></head>
+    <body>
+      <div id="step-1-form">
+        <h3>Preferensi Moda Transportasi</h3>
+        <p>Pilih preferensi mode transportasi yang Anda butuhkan</p>
+        <div class="transport-modes">
+          <button type="button" class="mode-btn" id="btn-semua">SEMUA</button>
+          <button type="button" class="mode-btn" id="btn-darat">DARAT</button>
+          <button type="button" class="mode-btn" id="btn-udara">UDARA</button>
+          <button type="button" class="mode-btn" id="btn-laut">LAUT</button>
+        </div>
+      </div>
+      <script>
+        document.querySelectorAll('.mode-btn').forEach(btn => {
+          btn.addEventListener('click', (e) => {
+            document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+          });
+        });
+      </script>
+    </body>
+    </html>
+  `);
+
+  // Test selecting DARAT (Door -> Door Java land)
+  const specDarat = {
+    orderType: 'domestic',
+    pickup: { locationType: 'Door', city: 'Jakarta Selatan', province: 'DKI Jakarta' },
+    dropoff: { locationType: 'Door', city: 'Kota Surabaya', province: 'Jawa Timur' },
+  };
+  const resDarat = await selectDomesticTransportPreference(page75, specDarat, 'Test 75 DARAT');
+  assert.strictEqual(resDarat.success, true);
+  assert.strictEqual(resDarat.mode, 'DARAT');
+  assert.strictEqual(resDarat.isSelected, true);
+  assert(await page75.locator('#btn-darat').evaluate(el => el.classList.contains('active')), 'DARAT button must have active class');
+
+  // Test selecting LAUT (Port -> Port)
+  const specLaut = {
+    orderType: 'domestic',
+    pickup: { locationType: 'Port', city: 'Jakarta Utara', address: 'Tanjung Priok' },
+    dropoff: { locationType: 'Port', city: 'Kota Surabaya', address: 'Tanjung Perak' },
+  };
+  const resLaut = await selectDomesticTransportPreference(page75, specLaut, 'Test 75 LAUT');
+  assert.strictEqual(resLaut.success, true);
+  assert.strictEqual(resLaut.mode, 'LAUT');
+  assert(await page75.locator('#btn-laut').evaluate(el => el.classList.contains('active')), 'LAUT button must have active class');
+
+  // Test selecting UDARA (Airport -> Airport)
+  const specUdara = {
+    orderType: 'domestic',
+    pickup: { locationType: 'Airport', city: 'Kota Tangerang', address: 'Bandara Soekarno-Hatta' },
+    dropoff: { locationType: 'Airport', city: 'Sidoarjo', address: 'Bandara Juanda' },
+  };
+  const resUdara = await selectDomesticTransportPreference(page75, specUdara, 'Test 75 UDARA');
+  assert.strictEqual(resUdara.success, true);
+  assert.strictEqual(resUdara.mode, 'UDARA');
+  assert(await page75.locator('#btn-udara').evaluate(el => el.classList.contains('active')), 'UDARA button must have active class');
+
+  // Test selecting SEMUA (Door -> Port)
+  const specSemua = {
+    orderType: 'domestic',
+    pickup: { locationType: 'Door', city: 'Jakarta Selatan' },
+    dropoff: { locationType: 'Port', city: 'Kota Surabaya', address: 'Pelabuhan Tanjung Perak' },
+  };
+  const resSemua = await selectDomesticTransportPreference(page75, specSemua, 'Test 75 SEMUA');
+  assert.strictEqual(resSemua.success, true);
+  assert.strictEqual(resSemua.mode, 'SEMUA');
+  assert(await page75.locator('#btn-semua').evaluate(el => el.classList.contains('active')), 'SEMUA button must have active class');
+
+  console.log('  [PASS] Domestic Transport Preference UI selection and active state verification verified.');
+
+  // Test diagnostic capture when target button is missing
+  const pageEmptyTransport = await browser75.newPage();
+  await pageEmptyTransport.setContent('<html><body><div>No transport buttons</div></body></html>');
+  let missingBtnCaught = false;
+  try {
+    await selectDomesticTransportPreference(pageEmptyTransport, specDarat, 'Test 75 Halt');
+  } catch (err) {
+    missingBtnCaught = true;
+    assert(err.message.includes('not found'), 'Must throw error when option not found');
+    assert(err.diagnostic, 'Error must include diagnostic data');
+    assert.strictEqual(err.diagnostic.reason, 'OPTION_NOT_FOUND');
+  }
+  assert.strictEqual(missingBtnCaught, true, 'Must strictly halt when transport preference button is missing');
+  await pageEmptyTransport.close();
+
+  await browser75.close();
+
+  // ==========================================
+  // Test 76: Batch Order Execution Mode Selection (Sequential vs Bulk/Concurrent)
+  // ==========================================
+  console.log('\n[Test 76] Testing Batch Order Execution Mode Selection (Sequential vs Bulk/Concurrent)...');
+  const { promptBatchExecutionMode } = require('../bot/order_bot');
+
+  // 1. Verify promptBatchExecutionMode re-prompts on invalid input and returns exact mode on valid selection
+  // Test invalid input rejection followed by selecting Sequential (1)
+  const rlSeq = createMockRl(['invalid', '99', '', '1']);
+  const modeSeqResult = await promptBatchExecutionMode(rlSeq, 3);
+  assert.strictEqual(modeSeqResult.mode, 'sequential');
+  assert.strictEqual(modeSeqResult.concurrency, 1);
+  assert(modeSeqResult.label.includes('Sequential'));
+
+  // Test selecting Sequential by word
+  const rlSeqWord = createMockRl(['sequential']);
+  const modeSeqWordResult = await promptBatchExecutionMode(rlSeqWord, 3);
+  assert.strictEqual(modeSeqWordResult.mode, 'sequential');
+  assert.strictEqual(modeSeqWordResult.concurrency, 1);
+
+  // Test selecting Bulk / Concurrent (2) with default concurrency
+  const rlBulk = createMockRl(['what?', '2']);
+  const modeBulkResult = await promptBatchExecutionMode(rlBulk, 3);
+  assert.strictEqual(modeBulkResult.mode, 'concurrent');
+  assert.strictEqual(modeBulkResult.concurrency, 3);
+  assert(modeBulkResult.label.includes('Bulk / Concurrent'));
+
+  // Test selecting Bulk by word 'concurrent' with custom default concurrency
+  const rlBulkWord = createMockRl(['concurrent']);
+  const modeBulkWordResult = await promptBatchExecutionMode(rlBulkWord, 5);
+  assert.strictEqual(modeBulkWordResult.mode, 'concurrent');
+  assert.strictEqual(modeBulkWordResult.concurrency, 5);
+
+  // 2. Test Sequential execution ordering: Order creation and payment for each order completes before starting the next
+  const seqTimeline = [];
+  const test76BatchSpecs = [
+    { orderType: 'domestic', pickup: { city: 'Jakarta' }, dropoff: { city: 'Surabaya' } },
+    { orderType: 'international', pickup: { city: 'Bandung' }, dropoff: { country: 'Japan', city: 'Tokyo' } },
+    { orderType: 'domestic', pickup: { city: 'Medan' }, dropoff: { city: 'Padang' } },
+  ];
+
+  const mockSeqTasks = test76BatchSpecs.map((spec, i) => async () => {
+    const id = i + 1;
+    seqTimeline.push({ id, event: 'order_start', orderType: spec.orderType });
+    await new Promise(r => setTimeout(r, 20));
+    seqTimeline.push({ id, event: 'order_done', orderId: `ORCA${3000 + id}` });
+    seqTimeline.push({ id, event: 'payment_start', vaNumber: `8888${3000 + id}` });
+    await new Promise(r => setTimeout(r, 20));
+    seqTimeline.push({ id, event: 'payment_done' });
+    return {
+      index: id,
+      label: `Order #${id}`,
+      orderType: spec.orderType,
+      orderId: `ORCA${3000 + id}`,
+      vaNumber: `8888${3000 + id}`,
+      amount: 100000 * id,
+      orderStatus: 'SUCCESS',
+      paymentStatus: 'PAYMENT_VERIFIED',
+      sandboxPayment: 'SUCCESS',
+      overallStatus: 'SUCCESS',
+      success: true,
+    };
+  });
+
+  const seqResults = await runWithConcurrency(mockSeqTasks, 1);
+  assert.strictEqual(seqResults.length, 3, 'Sequential execution must process all 3 orders');
+  assert.strictEqual(seqResults[0].orderType, 'domestic');
+  assert.strictEqual(seqResults[1].orderType, 'international');
+  assert.strictEqual(seqResults[2].orderType, 'domestic');
+  // Verify strict ordering in timeline: order 1 payment finishes before order 2 starts
+  const order1PaymentDoneIndex = seqTimeline.findIndex(t => t.id === 1 && t.event === 'payment_done');
+  const order2StartIndex = seqTimeline.findIndex(t => t.id === 2 && t.event === 'order_start');
+  const order2PaymentDoneIndex = seqTimeline.findIndex(t => t.id === 2 && t.event === 'payment_done');
+  const order3StartIndex = seqTimeline.findIndex(t => t.id === 3 && t.event === 'order_start');
+
+  assert(order1PaymentDoneIndex < order2StartIndex, 'Order 1 must complete payment before Order 2 starts in Sequential mode');
+  assert(order2PaymentDoneIndex < order3StartIndex, 'Order 2 must complete payment before Order 3 starts in Sequential mode');
+  console.log('  [PASS] Sequential mode enforces single-worker ordering and completes order+payment per item before next starts.');
+
+  // 3. Test Bulk mode failure isolation and independent payment verification
+  let bulkConcurrentActive = 0;
+  let bulkMaxActive = 0;
+  const mockBulkTasks = [
+    async () => {
+      bulkConcurrentActive++;
+      if (bulkConcurrentActive > bulkMaxActive) bulkMaxActive = bulkConcurrentActive;
+      await new Promise(r => setTimeout(r, 30));
+      bulkConcurrentActive--;
+      return { index: 1, orderId: 'ORCA4001', vaNumber: '88884001', amount: 50000, orderStatus: 'SUCCESS', paymentStatus: 'PAYMENT_VERIFIED', overallStatus: 'SUCCESS', success: true };
+    },
+    async () => {
+      bulkConcurrentActive++;
+      if (bulkConcurrentActive > bulkMaxActive) bulkMaxActive = bulkConcurrentActive;
+      await new Promise(r => setTimeout(r, 10));
+      bulkConcurrentActive--;
+      // Worker 2 fails at catalog stage
+      return { index: 2, orderId: null, orderStatus: 'FAILED', paymentStatus: 'NOT_PAID', overallStatus: 'FAILED', success: false, error: 'CATALOG_NOT_FOUND: No catalog' };
+    },
+    async () => {
+      bulkConcurrentActive++;
+      if (bulkConcurrentActive > bulkMaxActive) bulkMaxActive = bulkConcurrentActive;
+      await new Promise(r => setTimeout(r, 25));
+      bulkConcurrentActive--;
+      return { index: 3, orderId: 'ORCA4003', vaNumber: '88884003', amount: 75000, orderStatus: 'SUCCESS', paymentStatus: 'PAYMENT_VERIFIED', overallStatus: 'SUCCESS', success: true };
+    },
+  ];
+
+  const bulkResults = await runWithConcurrency(mockBulkTasks, 3);
+  assert.strictEqual(bulkResults.length, 3, 'Bulk mode must return all 3 task results');
+  assert(bulkMaxActive > 1, 'Bulk mode must execute multiple tasks concurrently');
+  assert.strictEqual(bulkResults[0].success, true, 'Worker 1 succeeded');
+  assert.strictEqual(bulkResults[1].success, false, 'Worker 2 failed');
+  assert.strictEqual(bulkResults[2].success, true, 'Worker 3 succeeded despite Worker 2 failure');
+  console.log('  [PASS] Bulk mode concurrency and worker failure isolation verified.');
+
+  // ==========================================
+  // Test 77: VMS Service Catalog CLI Menu Integration & Navigation
+  // ==========================================
+  console.log('\n[Test 77] Testing VMS Service Catalog CLI Menu Integration & Navigation...');
+  const { handleVmsMenu } = require('../vms');
+  assert(typeof handleVmsMenu === 'function', 'handleVmsMenu must be exported by vms module');
+
+  // 1. Direct VMS menu navigation: invalid input -> return to main menu
+  const vmsMockRl = createMockRl(['99', '4']);
+  const vmsLogs = [];
+  const origLogVms = console.log;
+  console.log = (...args) => {
+    vmsLogs.push(args.join(' '));
+    origLogVms(...args);
+  };
+  await handleVmsMenu(vmsMockRl);
+  console.log = origLogVms;
+
+  assert(vmsLogs.some(l => l.includes('--- VMS SERVICE CATALOG MENU ---')), 'Must render VMS menu header');
+  assert(vmsLogs.some(l => l.includes('1. Create Service Catalog')), 'Must list Option 1: Create Service Catalog');
+  assert(vmsLogs.some(l => l.includes('2. Manage Existing Service Catalogs')), 'Must list Option 2: Manage Existing Service Catalogs');
+  assert(vmsLogs.some(l => l.includes('3. Add Routes to Existing Catalog')), 'Must list Option 3: Add Routes to Existing Catalog');
+  assert(vmsLogs.some(l => l.includes('4. Return to Main Menu')), 'Must list Option 4: Return to Main Menu');
+  assert(vmsLogs.some(l => l.includes('Invalid selection. Please choose an option between 1 and 4.')), 'Must handle invalid choice');
+  assert(vmsLogs.some(l => l.includes('Returning to POSIND main menu...')), 'Option 4 must exit VMS menu loop');
+  console.log('  [PASS] Direct VMS menu options, input validation, and return navigation verified.');
+
+  // 2. Full main menu loop integration with Headed browser mode: Main Menu (4) -> VMS Menu -> Return (4) -> Main Menu (5) Exit
+  const headedMockRl = createMockRl(['4', 'invalid', '4', '5']);
+  const headedLogs = [];
+  const origLogHeaded = console.log;
+  console.log = (...args) => {
+    headedLogs.push(args.join(' '));
+    origLogHeaded(...args);
+  };
+  // Pass headless: false to verify headed browser mode is accepted and maintained
+  await startOrderingBot({ rl: headedMockRl, headless: false });
+  console.log = origLogHeaded;
+
+  assert(headedLogs.some(l => l.includes('[Browser Mode] Selected: Headed (visible browser)')), 'Must confirm Headed mode in session');
+  assert(headedLogs.some(l => l.includes('4. Manage VMS Service Catalog')), 'Main menu must include Option 4');
+  assert(headedLogs.some(l => l.includes('--- VMS SERVICE CATALOG MENU ---')), 'Option 4 must route to VMS menu');
+  assert(headedLogs.some(l => l.includes('Returning to POSIND main menu...')), 'VMS menu must return to main menu cleanly');
+  assert(headedLogs.some(l => l.includes('Exiting POSIND Ordering Bot. Goodbye!')), 'Option 5 in main menu must terminate process cleanly');
+  console.log('  [PASS] Full CLI navigation with Headed browser mode verified.');
+
+  // 3. Headless browser mode verification
+  const headlessMockRl = createMockRl(['4', '4', '5']);
+  const headlessLogs = [];
+  const origLogHeadless = console.log;
+  console.log = (...args) => {
+    headlessLogs.push(args.join(' '));
+    origLogHeadless(...args);
+  };
+  await startOrderingBot({ rl: headlessMockRl, headless: true });
+  console.log = origLogHeadless;
+
+  assert(headlessLogs.some(l => l.includes('[Browser Mode] Selected: Headless (background)')), 'Must confirm Headless mode in session');
+  assert(headlessLogs.some(l => l.includes('Exiting POSIND Ordering Bot. Goodbye!')));
+  console.log('  [PASS] Browser mode propagation (Headed & Headless) into VMS menu verified.');
+
+  // =========================================
+  // Test 78: International Destination Port Autocomplete Sanitization & NL Route Builder
+  // =========================================
+  console.log('\n[Test 78] Testing International Destination Port Autocomplete Sanitization & NL Route Builder...');
+
+  // 1. Time string parsing (12-hour AM/PM and 24-hour)
+  assert.strictEqual(parseTimeString('8 AM'), '08:00', 'Must convert 8 AM to 08:00');
+  assert.strictEqual(parseTimeString('8:00 AM'), '08:00', 'Must convert 8:00 AM to 08:00');
+  assert.strictEqual(parseTimeString('2 PM'), '14:00', 'Must convert 2 PM to 14:00');
+  assert.strictEqual(parseTimeString('2:30 PM'), '14:30', 'Must convert 2:30 PM to 14:30');
+  assert.strictEqual(parseTimeString('12 PM'), '12:00', 'Must convert 12 PM to 12:00');
+  assert.strictEqual(parseTimeString('12 AM'), '00:00', 'Must convert 12 AM to 00:00');
+  assert.strictEqual(parseTimeString('08:00'), '08:00', 'Must preserve 08:00');
+  assert.strictEqual(parseTimeString('14:30'), '14:30', 'Must preserve 14:30');
+  console.log('  [PASS] 12-hour AM/PM and 24-hour time parsing verified.');
+
+  // 2. Transit duration parsing
+  const dur1 = parseTransitDuration('15 hours');
+  assert.strictEqual(dur1.text, '15 hours');
+  assert.strictEqual(dur1.hours, 15);
+
+  const dur2 = parseTransitDuration('6 hrs');
+  assert.strictEqual(dur2.text, '6 hours');
+  assert.strictEqual(dur2.hours, 6);
+
+  const dur3 = parseTransitDuration('2 days');
+  assert.strictEqual(dur3.text, '2 days');
+  assert.strictEqual(dur3.hours, 48);
+
+  const dur4 = parseTransitDuration('15 jam');
+  assert.strictEqual(dur4.text, '15 hours');
+  assert.strictEqual(dur4.hours, 15);
+  console.log('  [PASS] Transit duration parsing in hours and days verified.');
+
+  // 3. stripScheduleAndMetadata and sanitizePortName
+  assert.strictEqual(
+    sanitizePortName('changi airport 25 nov 2026 08:00'),
+    'changi airport',
+    'Date and time must be stripped from port name'
+  );
+  assert.strictEqual(
+    sanitizePortName('Pasir Panjang, Singapore 15 Dec 2026 08:00, 15 hours'),
+    'Pasir Panjang, Singapore',
+    'Date, time, and duration must be stripped from port name'
+  );
+  assert.strictEqual(
+    sanitizePortName('Soekarno-Hatta 2026-11-25 8 AM'),
+    'Soekarno-Hatta',
+    'ISO date and 12-hour time must be stripped from port name'
+  );
+  console.log('  [PASS] Port query sanitization verified.');
+
+  // 4. Natural language route parsing for International Sea route with hyphen delimiter
+  const promptSea = 'Tanjung Priok, Jakarta - Pasir Panjang, Singapore 15 Dec 2026 08:00, 15 hours';
+  const pSea = parseOrderPrompt(promptSea);
+  assert.strictEqual(pSea.spec.orderType, 'international', 'Must resolve to international order');
+  assert.strictEqual(pSea.spec.transportationMode, 'Sea Freight', 'Must resolve to Sea Freight');
+  assert.strictEqual(pSea.spec.pickup.locality, 'Tanjung Priok', 'Pickup locality must be Tanjung Priok');
+  assert.strictEqual(pSea.spec.pickup.locationType, 'Port', 'Pickup must be Port');
+  assert.strictEqual(pSea.spec.dropoff.locality, 'Pasir Panjang', 'Dropoff locality must be Pasir Panjang');
+  assert.strictEqual(pSea.spec.dropoff.searchQuery, 'Pasir Panjang', 'Dropoff searchQuery must NOT include date/time');
+  assert.strictEqual(pSea.spec.dropoff.locationType, 'Port', 'Dropoff must be Port');
+  assert.strictEqual(pSea.spec.scheduledDate, '2026-12-15', 'Scheduled date must be 2026-12-15');
+  assert.strictEqual(pSea.spec.scheduledTime, '08:00', 'Scheduled time must be 08:00');
+  assert.strictEqual(pSea.spec.transitDuration, '15 hours', 'Transit duration must be 15 hours');
+  assert.strictEqual(pSea.spec.durationHours, 15, 'Duration hours must be 15');
+  console.log('  [PASS] International Sea route NL parsing with hyphen delimiter verified.');
+
+  // 5. Natural language route parsing for International Air route with hyphen delimiter
+  const promptAir = 'Soekarno-Hatta, Tangerang - Changi Airport 25 Nov 2026 08:00';
+  const pAir = parseOrderPrompt(promptAir);
+  assert.strictEqual(pAir.spec.orderType, 'international', 'Must resolve to international order');
+  assert.strictEqual(pAir.spec.pickup.searchQuery, 'Soekarno-Hatta', 'Pickup searchQuery must be Soekarno-Hatta');
+  assert.strictEqual(pAir.spec.dropoff.searchQuery, 'Changi Airport', 'Dropoff searchQuery must be clean Changi Airport');
+  assert.strictEqual(pAir.spec.dropoff.locality, 'Changi Airport', 'Dropoff locality must be clean Changi Airport');
+  assert.strictEqual(pAir.spec.scheduledDate, '2026-11-25', 'Scheduled date must be 2026-11-25');
+  assert.strictEqual(pAir.spec.scheduledTime, '08:00', 'Scheduled time must be 08:00');
+  console.log('  [PASS] International Air route NL parsing with hyphen delimiter verified.');
+
+  // 6. selectAntPortOption DOM Playwright test: verifies input.fill receives ONLY clean port name
+  const portBrowser = await chromium.launch({ headless: true });
+  const pageMockPort = await portBrowser.newPage();
+  await pageMockPort.setContent(`
+    <html>
+      <body>
+        <div id="dest-container" class="ant-select">
+          <input id="destination_port" class="ant-select-selection-search-input" value="" />
+          <span class="ant-select-selection-item"></span>
+        </div>
+
+        <div id="dropdown-port" class="ant-select-dropdown">
+          <div class="ant-select-item-option" id="opt-changi">
+            <div class="ant-select-item-option-content">Changi Airport</div>
+          </div>
+          <div class="ant-select-item-option" id="opt-singapore">
+            <div class="ant-select-item-option-content">Singapore Port</div>
+          </div>
+        </div>
+
+        <script>
+          const input = document.getElementById('destination_port');
+          const optChangi = document.getElementById('opt-changi');
+          const optSg = document.getElementById('opt-singapore');
+          const itemSpan = document.querySelector('.ant-select-selection-item');
+
+          optChangi.addEventListener('click', () => {
+            itemSpan.innerText = 'Changi Airport';
+            input.value = 'Changi Airport';
+          });
+          optSg.addEventListener('click', () => {
+            itemSpan.innerText = 'Singapore Port';
+            input.value = 'Singapore Port';
+          });
+        </script>
+      </body>
+    </html>
+  `);
+
+  const container = pageMockPort.locator('#dest-container');
+  // Pass dirty string containing schedule and time into selectAntPortOption
+  const selectedResult = await selectAntPortOption(pageMockPort, container, 'changi airport 25 nov 2026 08:00');
+  assert.strictEqual(selectedResult, 'Changi Airport', 'Must successfully select Changi Airport');
+
+  // Verify the input field was NEVER filled with date or time
+  const inputFinalValue = await pageMockPort.locator('#destination_port').inputValue();
+  assert.strictEqual(inputFinalValue, 'Changi Airport', 'Input field must only contain clean port name');
+  assert(!inputFinalValue.includes('25 nov'), 'Input must not contain date');
+  assert(!inputFinalValue.includes('08:00'), 'Input must not contain time');
+  console.log('  [PASS] selectAntPortOption clean input fill and option selection verified.');
+
+  // 7. selectAntPortOption with "No Data Found" (.ant-empty) rejection test
+  await pageMockPort.setContent(`
+    <html>
+      <body>
+        <div id="dest-container-empty" class="ant-select">
+          <input id="destination_port" class="ant-select-selection-search-input" value="" />
+        </div>
+        <div class="ant-select-dropdown">
+          <div class="ant-empty">No Data Found</div>
+        </div>
+      </body>
+    </html>
+  `);
+  let emptyPortErrorCaught = false;
+  try {
+    await selectAntPortOption(pageMockPort, pageMockPort.locator('#dest-container-empty'), 'NonExistentPort');
+  } catch (err) {
+    emptyPortErrorCaught = true;
+    assert(err.message.includes('No Data Found'), 'Must report No Data Found error');
+  }
+  assert.strictEqual(emptyPortErrorCaught, true, 'Must reject when Ant Design dropdown shows No Data Found');
+  console.log('  [PASS] selectAntPortOption strict rejection on No Data Found verified.');
+
+  await pageMockPort.close();
+  await portBrowser.close();
 
   console.log('\n>>> ALL POSIND ORDERING BOT TESTS PASSED SUCCESSFULLY! <<<');
 }

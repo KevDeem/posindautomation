@@ -22,6 +22,7 @@ const {
   validateLocationHierarchy,
   normalizeAdminCityName,
 } = require('../tools/location_matcher');
+const { handleVmsMenu } = require('../vms');
 
 /**
  * Prompt user for input via readline
@@ -324,11 +325,61 @@ function splitBatchPrompt(prompt = '') {
 }
 
 /**
+ * Prompt user to select batch execution mode (Sequential vs Bulk / Concurrent).
+ * Explains differences clearly and requires valid user selection before proceeding.
+ */
+async function promptBatchExecutionMode(rl, defaultConcurrency = 3) {
+  console.log('\n--- Choose Execution Mode ---');
+  console.log('1. Sequential        – Process orders one at a time. Complete order creation and payment for each order before starting the next.');
+  console.log(`2. Bulk / Concurrent – Process multiple orders simultaneously using independent workers (default ${defaultConcurrency} concurrent workers).`);
+
+  while (true) {
+    const choice = await promptQuestion(rl, '\nSelect execution mode [1-2]: ');
+    const trimmed = (choice || '').trim().toLowerCase();
+
+    if (trimmed === '1' || trimmed === 'sequential' || trimmed === 'seq') {
+      console.log('-> Execution Mode: Sequential (1 order at a time)');
+      return { mode: 'sequential', concurrency: 1, label: 'Sequential (1 order at a time)' };
+    }
+    if (trimmed === '2' || trimmed === 'bulk' || trimmed === 'concurrent' || trimmed === 'bulk / concurrent' || trimmed === 'bulk/concurrent') {
+      console.log(`-> Execution Mode: Bulk / Concurrent (${defaultConcurrency} concurrent workers)`);
+      return { mode: 'concurrent', concurrency: defaultConcurrency, label: `Bulk / Concurrent (${defaultConcurrency} concurrent workers)` };
+    }
+
+    console.log('Invalid selection. Please choose 1 for Sequential or 2 for Bulk / Concurrent.');
+  }
+}
+
+/**
  * Handle batch orders flow (supporting mixed Domestic & International orders)
  */
-async function handleBatchOrderFlow(rl, config, { autoPay = true } = {}) {
+async function handleBatchOrderFlow(rl, config, { autoPay = true, executionMode = null, concurrency: customConcurrency = null } = {}) {
   console.log('\n=== Create Multiple Orders and Simulate Payment ===');
-  console.log('You can specify single or mixed Domestic & International orders, counts, and routes.');
+
+  const defaultConcurrency = (config && config.batchConcurrency !== undefined && config.batchConcurrency > 0)
+    ? config.batchConcurrency
+    : 3;
+
+  let selectedMode;
+  if (executionMode) {
+    const isSeq = executionMode === 'sequential' || executionMode === '1';
+    const c = isSeq ? 1 : (customConcurrency || defaultConcurrency);
+    selectedMode = {
+      mode: isSeq ? 'sequential' : 'concurrent',
+      concurrency: c,
+      label: isSeq ? 'Sequential (1 order at a time)' : `Bulk / Concurrent (${c} concurrent workers)`,
+    };
+  } else if (rl) {
+    selectedMode = await promptBatchExecutionMode(rl, defaultConcurrency);
+  } else {
+    selectedMode = {
+      mode: 'concurrent',
+      concurrency: defaultConcurrency,
+      label: `Bulk / Concurrent (${defaultConcurrency} concurrent workers)`,
+    };
+  }
+
+  console.log('\nYou can specify single or mixed Domestic & International orders, counts, and routes.');
   console.log('Example: "Create 5 domestic orders from Tebet to Gubeng at 08:00 on 1 Dec 2026"');
   console.log('         "2 domestic orders from Tebet to Gubeng; 2 international orders from Bandung to Tokyo"');
 
@@ -444,19 +495,20 @@ async function handleBatchOrderFlow(rl, config, { autoPay = true } = {}) {
 
   const domesticCount = batchItems.filter(s => s.orderType !== 'international').length;
   const intlCount = batchItems.filter(s => s.orderType === 'international').length;
-  const modeLabel = config.headless ? 'Headless (background)' : 'Headed (visible browser)';
+  const concurrency = selectedMode.concurrency;
 
   console.log(`\n[Batch Summary]`);
   console.log(`- Total Orders to create: ${batchItems.length} (${domesticCount} Domestic, ${intlCount} International)`);
-  console.log(`- Execution Mode: Sequential (${config.maxRetries} max retries per order)`);
+  console.log(`- Execution Mode: ${selectedMode.label} (${config.maxRetries} max retries per order)`);
   console.log(`- Payment Simulation: YES (Pospay VA + Sandbox)`);
-  console.log(`- Browser Mode: ${modeLabel}`);
+  console.log(`- Browser Mode: Headless (background)`);
 
   const isPaymentRequested = autoPay !== false;
 
-  console.log(`\nLaunching batch execution for ${batchItems.length} orders (Browser Mode: ${modeLabel})...`);
+  console.log(`\nLaunching batch execution for ${batchItems.length} orders (Browser Mode: Headless (background), Execution Mode: ${selectedMode.label})...`);
   const batchResult = await executeBatch(batchItems, {
-    headless: config.headless,
+    headless: true, // Batch executions must strictly run headlessly per requirements
+    concurrency,
     autoPay: isPaymentRequested,
     maxRetries: config.maxRetries,
     sessionPath: config.sessionPath,
@@ -470,6 +522,8 @@ async function handleBatchOrderFlow(rl, config, { autoPay = true } = {}) {
     menuOption: 'Multiple Orders + Payment',
     orderType: orderTypeSummary,
     batchCount: batchItems.length,
+    executionMode: selectedMode.mode,
+    concurrency: selectedMode.concurrency,
     autoPay: isPaymentRequested,
     summary: {
       total: batchResult.total,
@@ -484,6 +538,7 @@ async function handleBatchOrderFlow(rl, config, { autoPay = true } = {}) {
   console.log('\n======================================================');
   console.log('                 BATCH EXECUTION REPORT               ');
   console.log('======================================================');
+  console.log(`Mode: ${selectedMode.label}`);
   console.log(`Total: ${batchResult.total} | Succeeded: ${batchResult.succeeded} | Failed: ${batchResult.failed}`);
   console.log(`Total Amount Paid: ${formatRupiah(batchResult.totalAmountPaid)}`);
   console.log('------------------------------------------------------');
@@ -492,8 +547,14 @@ async function handleBatchOrderFlow(rl, config, { autoPay = true } = {}) {
       const isSuccess = o.orderStatus === 'SUCCESS' && o.vaNumber && o.sandboxPayment === 'SUCCESS' && o.overallStatus === 'SUCCESS';
       const statusText = isSuccess ? 'SUCCESS' : (o.orderId ? 'ORDER_CREATED_PAYMENT_PENDING' : 'FAILED');
       console.log(`[#${o.index}] ${o.label}: ${statusText} | Order: ${o.orderId || '-'} | Shipment: ${o.shipmentId || '-'} | VA: ${o.vaNumber || '-'} | Amount: ${formatRupiah(o.amount)} | Sandbox: ${o.sandboxPayment === 'SUCCESS' ? 'Payment Successful!' : (o.sandboxPayment || 'FAILED')}`);
+      if (o.error) {
+        console.log(`    Error: ${o.error}`);
+      }
     } else {
       console.log(`[#${o.index}] ${o.label}: ${o.orderStatus === 'SUCCESS' ? 'SUCCESS' : 'FAILED'} | Order: ${o.orderId || '-'} | Shipment: ${o.shipmentId || '-'} | Status: ORDER_CREATED (Payment Not Requested)`);
+      if (o.error) {
+        console.log(`    Error: ${o.error}`);
+      }
     }
   });
   console.log(`Saved Record ID: ${savedRecord.id}`);
@@ -555,9 +616,10 @@ async function startOrderingBot(options = {}) {
     console.log('1. Create Order and Simulate Payment');
     console.log('2. Create Multiple Orders and Simulate Payment');
     console.log('3. View Previous Execution Results');
-    console.log('4. Exit');
+    console.log('4. Manage VMS Service Catalog');
+    console.log('5. Exit');
 
-    const choice = await promptQuestion(rl, '\nSelect option [1-4]: ');
+    const choice = await promptQuestion(rl, '\nSelect option [1-5]: ');
 
     switch (choice) {
       case '1':
@@ -570,13 +632,16 @@ async function startOrderingBot(options = {}) {
         await handleViewHistory(rl);
         break;
       case '4':
+        await handleVmsMenu(rl, { headless: config.headless });
+        break;
+      case '5':
       case 'exit':
       case 'q':
         console.log('\nExiting POSIND Ordering Bot. Goodbye!\n');
         running = false;
         break;
       default:
-        console.log('Invalid selection. Please choose an option between 1 and 4.');
+        console.log('Invalid selection. Please choose an option between 1 and 5.');
         break;
     }
   }
@@ -592,6 +657,7 @@ module.exports = {
   validateSpecificationForExecution,
   promptQuestion,
   promptBrowserMode,
+  promptBatchExecutionMode,
   promptSpecificationEdits,
   splitBatchPrompt,
 };
