@@ -14,7 +14,9 @@ async function performVmsLogin(page, context, config = {}) {
   const loginUrl = `${cfg.vmsUrl}/login`;
 
   console.log('[VMSAuth] Navigating to VMS login page...');
-  await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: cfg.navigationTimeoutMs });
+  await page.goto(loginUrl, { waitUntil: 'networkidle', timeout: cfg.navigationTimeoutMs }).catch(async () => {
+    await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: cfg.navigationTimeoutMs });
+  });
 
   // Check if already authenticated and redirected away from login
   if (!page.url().includes('/login')) {
@@ -30,7 +32,18 @@ async function performVmsLogin(page, context, config = {}) {
   await emailInput.waitFor({ state: 'visible', timeout: cfg.actionTimeoutMs });
   await emailInput.fill(cfg.username);
   await passwordInput.fill(cfg.password);
-  await submitBtn.click();
+
+  // Wait for initial Next.js loading overlay to detach if present
+  await page.locator('img[alt="loading image"], div:has(img[alt="loading image"])').first().waitFor({ state: 'detached', timeout: 8000 }).catch(() => {});
+
+  try {
+    await submitBtn.click({ timeout: 5000 });
+  } catch (clickErr) {
+    console.warn('[VMSAuth] Standard click on submit button intercepted, attempting forced click...');
+    await submitBtn.click({ force: true }).catch(async () => {
+      await submitBtn.evaluate(b => b.click());
+    });
+  }
 
   // Wait for post-login redirect away from /login
   await page.waitForFunction(
@@ -92,11 +105,31 @@ async function getAuthenticatedVmsPage(options = {}) {
         page.waitForSelector('.ant-table, .ant-menu, .ant-layout-sider, .ant-layout-header', { state: 'visible', timeout: 6000 }).then(() => false).catch(() => false),
       ]);
 
-      if (needsLogin || page.url().includes('/login')) {
-        console.log('[VMSAuth] Session invalid or unauthenticated. Performing login...');
+      const bodyText = await page.locator('body').innerText().catch(() => '');
+      const hasPermissionError = /not permission|doesn't have permission/i.test(bodyText);
+
+      if (needsLogin || page.url().includes('/login') || hasPermissionError) {
+        console.log('[VMSAuth] Session invalid, unauthenticated, or lacks permission. Performing login...');
         await performVmsLogin(page, context, cfg);
+        
+        // Navigate via UI menu to ensure proper session initialization
+        await page.goto(`${cfg.vmsUrl}/`, { waitUntil: 'domcontentloaded', timeout: cfg.navigationTimeoutMs });
+        await page.waitForTimeout(1000);
+        const vendorMenu = page.locator('.ant-menu-submenu:has-text("Vendor") .ant-menu-submenu-title, text=Vendor').first();
+        if (await vendorMenu.isVisible().catch(() => false)) {
+          await vendorMenu.click().catch(() => {});
+          await page.waitForTimeout(500);
+          const scLink = page.locator('.ant-menu-sub a[href*="service-catalog"], text="Service Catalog"').first();
+          if (await scLink.isVisible().catch(() => false)) {
+            await scLink.click().catch(() => {});
+            await page.waitForTimeout(1500);
+          }
+        }
         if (!page.url().includes('/service-catalog')) {
           await page.goto(`${cfg.vmsUrl}/service-catalog`, { waitUntil: 'domcontentloaded', timeout: cfg.navigationTimeoutMs });
+        }
+        if (cfg.sessionPath) {
+          await context.storageState({ path: cfg.sessionPath }).catch(() => {});
         }
       }
     } catch (err) {
@@ -105,13 +138,60 @@ async function getAuthenticatedVmsPage(options = {}) {
       if (!page.url().includes('/service-catalog')) {
         await page.goto(`${cfg.vmsUrl}/service-catalog`, { waitUntil: 'domcontentloaded', timeout: cfg.navigationTimeoutMs });
       }
+      if (cfg.sessionPath) {
+        await context.storageState({ path: cfg.sessionPath }).catch(() => {});
+      }
     }
   }
 
   return { browser, context, page, isNewBrowser: !options.existingBrowser, headless };
 }
 
+/**
+ * Extract POS_SID cookie value from stored session file
+ */
+function getStoredVmsSessionCookie(config = {}) {
+  const cfg = loadVmsConfig(config);
+  if (!cfg.sessionPath || !fs.existsSync(cfg.sessionPath)) {
+    return null;
+  }
+  try {
+    const raw = fs.readFileSync(cfg.sessionPath, 'utf8');
+    const data = JSON.parse(raw);
+    const cookie = data.cookies?.find(c => c.name === 'POS_SID');
+    return cookie ? cookie.value : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * Ensure valid VMS session cookie exists, performing login if missing or forced
+ */
+async function ensureVmsSessionCookie(options = {}) {
+  const cfg = loadVmsConfig(options);
+  const existingCookie = getStoredVmsSessionCookie(cfg);
+  if (existingCookie && !options.forceRefresh) {
+    return existingCookie;
+  }
+
+  console.log('[VMSAuth] Acquiring fresh VMS session cookie via headless login...');
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  try {
+    await performVmsLogin(page, context, cfg);
+    return getStoredVmsSessionCookie(cfg);
+  } finally {
+    await page.close().catch(() => {});
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+}
+
 module.exports = {
   performVmsLogin,
   getAuthenticatedVmsPage,
+  getStoredVmsSessionCookie,
+  ensureVmsSessionCookie,
 };

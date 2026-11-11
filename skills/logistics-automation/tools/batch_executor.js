@@ -22,6 +22,10 @@ const { executeOrder } = require('./order_executor');
 const { executeOrderPayment } = require('./payment_executor');
 const { resolveSpecification, formatSpecificationReview } = require('./order_specification');
 const { performFreshLogin } = require('./auth_manager');
+const {
+  resolveOmsEnvironment,
+  OMS_ENVIRONMENTS,
+} = require('../config/oms_environments');
 
 const DEFAULT_SESSION_PATH = path.resolve(__dirname, '../../../.sessions/staging-oms_kevin_d_imas_gmail_com_session.json');
 
@@ -206,6 +210,8 @@ async function executeBatchWorkerItem(item, index, totalItems, browser, options 
   let orderRecord = {
     label: orderLabel,
     index: index + 1,
+    environment: options.environment || 'Smart Routing',
+    environmentUrl: options.omsUrl || '',
     success: false,
     attempts: 0,
     orderId: null,
@@ -256,6 +262,7 @@ async function executeBatchWorkerItem(item, index, totalItems, browser, options 
 
       // Execute order creation
       const { result: createResult } = await executeOrder(resolvedSpec, {
+        ...options,
         headless,
         existingBrowser: browser,
         existingContext: context,
@@ -293,6 +300,7 @@ async function executeBatchWorkerItem(item, index, totalItems, browser, options 
           shipmentId: orderRecord.shipmentId,
           amount: orderRecord.amount,
         }, {
+          ...options,
           headless,
           sandboxUrl: options.sandboxUrl,
           apiEndpoint: options.apiEndpoint,
@@ -407,6 +415,24 @@ async function runWithConcurrency(taskRunners, concurrency = 3) {
  */
 async function executeBatch(batchInput, options = {}) {
   const items = normalizeBatchInput(batchInput);
+
+  let resolvedEnv = null;
+  if (options.environment) {
+    resolvedEnv = resolveOmsEnvironment(options.environment);
+    if (!resolvedEnv) {
+      throw new Error(`[BatchExecutor] Invalid OMS environment: "${options.environment}". Valid environments are: Smart Routing, Staging.`);
+    }
+  } else if (options.omsUrl) {
+    resolvedEnv = resolveOmsEnvironment(options.omsUrl);
+  }
+
+  const defaultBaseUrl = OMS_ENVIRONMENTS['Smart Routing']?.baseUrl || 'https://sr-pos-oms-web.nisims.web.id';
+  const defaultApiEndpoint = OMS_ENVIRONMENTS['Smart Routing']?.apiEndpoint || 'https://sr-pos-oms-api.nisims.web.id/api/v1';
+
+  const omsUrl = (options.omsUrl || (resolvedEnv ? resolvedEnv.baseUrl : defaultBaseUrl)).replace(/\/+$/, '');
+  const apiEndpoint = options.apiEndpoint || (resolvedEnv ? resolvedEnv.apiEndpoint : defaultApiEndpoint);
+  const envName = resolvedEnv ? resolvedEnv.name : (options.environment || 'Smart Routing');
+
   const headless = options.headless !== false; // Keep all workers headless by default
   const autoPay = options.autoPay !== undefined ? options.autoPay : true;
   const maxRetries = options.maxRetries !== undefined ? options.maxRetries : 2;
@@ -417,6 +443,7 @@ async function executeBatch(batchInput, options = {}) {
 
   console.log(`\n======================================================`);
   console.log(`[BatchExecutor] Starting batch of ${items.length} order(s)`);
+  console.log(`- Environment: ${envName} (${omsUrl})`);
   console.log(`- Browser Mode: ${headless ? 'Headless (background)' : 'Headed (visible browser)'}`);
   console.log(`- Concurrency: ${concurrency} worker(s) (${concurrency > 1 ? 'Concurrent' : 'Sequential'})`);
   console.log(`- Payment Simulation: ${autoPay ? 'YES' : 'NO'}`);
@@ -426,6 +453,8 @@ async function executeBatch(batchInput, options = {}) {
   const results = {
     total: items.length,
     concurrency,
+    environment: envName,
+    environmentUrl: omsUrl,
     succeeded: 0,
     failed: 0,
     totalAmountPaid: 0,
@@ -442,6 +471,9 @@ async function executeBatch(batchInput, options = {}) {
     const taskRunners = items.map((item, index) => {
       return () => executeBatchWorkerItem(item, index, items.length, browser, {
         ...options,
+        environment: envName,
+        omsUrl,
+        apiEndpoint,
         headless,
         autoPay,
         maxRetries,

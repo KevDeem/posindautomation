@@ -7,7 +7,11 @@
 
 const readline = require('readline/promises');
 const { stdin: input, stdout: output } = require('process');
-const { loadConfig } = require('./config');
+const { loadConfig, createExecutionContext } = require('./config');
+const {
+  promptOmsEnvironment,
+  resolveOmsEnvironment,
+} = require('../config/oms_environments');
 const { parseOrderPrompt } = require('./nl_parser');
 const { saveExecutionRecord, listExecutionRecords } = require('./history_manager');
 const {
@@ -191,7 +195,16 @@ function validateSpecificationForExecution(resolvedSpec, sources = {}, userPromp
 /**
  * Handle single order flow
  */
-async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', autoPay = true } = {}) {
+async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', autoPay = true, environment = null } = {}) {
+  let executionConfig = config;
+  if (environment) {
+    executionConfig = createExecutionContext(environment, { headless: config.headless });
+  } else if (rl) {
+    const selectedEnv = await promptOmsEnvironment(rl);
+    executionConfig = createExecutionContext(selectedEnv, { headless: config.headless });
+  }
+
+  console.log(`[Environment: ${executionConfig.environment}]`);
   console.log('\n=== Create Order and Simulate Payment ===');
   console.log('You can type your order in natural language, or press Enter to use default baseline.');
   console.log('Example: "Pickup in Tebet Jakarta Selatan to Gubeng Surabaya on 1 Dec 2026 at 08:00"');
@@ -252,17 +265,22 @@ async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', aut
   // Policy log & direct execution
   console.log('\n[POLICY] All orders submitted strictly as Non-Contract with no automatic inquiry fallback.');
 
-  const modeLabel = config.headless ? 'Headless (background)' : 'Headed (visible browser)';
-  console.log(`\nLaunching order execution (Browser Mode: ${modeLabel})...`);
+  const modeLabel = executionConfig.headless ? 'Headless (background)' : 'Headed (visible browser)';
+  console.log(`\nLaunching order execution on ${executionConfig.environment} (Browser Mode: ${modeLabel})...`);
   const batchResult = await executeBatch([resolvedSpec], {
-    headless: config.headless,
+    environment: executionConfig.environment,
+    omsUrl: executionConfig.omsUrl,
+    apiEndpoint: executionConfig.apiEndpoint,
+    headless: executionConfig.headless,
     autoPay: isPaymentRequested,
-    maxRetries: config.maxRetries,
-    sessionPath: config.sessionPath,
+    maxRetries: executionConfig.maxRetries,
+    sessionPath: executionConfig.sessionPath,
   });
 
   // Save execution record
   const savedRecord = saveExecutionRecord({
+    environment: executionConfig.environment,
+    environmentUrl: executionConfig.omsUrl,
     request: userPrompt || 'Default single order',
     menuOption: 'Single Order + Payment',
     orderType: resolvedSpec.orderType,
@@ -283,6 +301,7 @@ async function handleSingleOrderFlow(rl, config, { defaultType = 'domestic', aut
   console.log('              TRANSACTION EXECUTION REPORT            ');
   console.log('======================================================');
   const o = batchResult.orders[0] || {};
+  console.log(`Environment:            ${executionConfig.environment} (${executionConfig.omsUrl})`);
   console.log(`Order ID:               ${o.orderId || '-'}`);
   console.log(`Shipment ID:            ${o.shipmentId || '-'}`);
   console.log(`Service Catalog:        ${o.serviceCatalog || '-'}`);
@@ -353,11 +372,20 @@ async function promptBatchExecutionMode(rl, defaultConcurrency = 3) {
 /**
  * Handle batch orders flow (supporting mixed Domestic & International orders)
  */
-async function handleBatchOrderFlow(rl, config, { autoPay = true, executionMode = null, concurrency: customConcurrency = null } = {}) {
+async function handleBatchOrderFlow(rl, config, { autoPay = true, executionMode = null, concurrency: customConcurrency = null, environment = null } = {}) {
+  let executionConfig = config;
+  if (environment) {
+    executionConfig = createExecutionContext(environment, { headless: config.headless });
+  } else if (rl) {
+    const selectedEnv = await promptOmsEnvironment(rl);
+    executionConfig = createExecutionContext(selectedEnv, { headless: config.headless });
+  }
+
+  console.log(`[Environment: ${executionConfig.environment}]`);
   console.log('\n=== Create Multiple Orders and Simulate Payment ===');
 
-  const defaultConcurrency = (config && config.batchConcurrency !== undefined && config.batchConcurrency > 0)
-    ? config.batchConcurrency
+  const defaultConcurrency = (executionConfig && executionConfig.batchConcurrency !== undefined && executionConfig.batchConcurrency > 0)
+    ? executionConfig.batchConcurrency
     : 3;
 
   let selectedMode;
@@ -498,26 +526,32 @@ async function handleBatchOrderFlow(rl, config, { autoPay = true, executionMode 
   const concurrency = selectedMode.concurrency;
 
   console.log(`\n[Batch Summary]`);
+  console.log(`- Environment: ${executionConfig.environment} (${executionConfig.omsUrl})`);
   console.log(`- Total Orders to create: ${batchItems.length} (${domesticCount} Domestic, ${intlCount} International)`);
-  console.log(`- Execution Mode: ${selectedMode.label} (${config.maxRetries} max retries per order)`);
+  console.log(`- Execution Mode: ${selectedMode.label} (${executionConfig.maxRetries} max retries per order)`);
   console.log(`- Payment Simulation: YES (Pospay VA + Sandbox)`);
   console.log(`- Browser Mode: Headless (background)`);
 
   const isPaymentRequested = autoPay !== false;
 
-  console.log(`\nLaunching batch execution for ${batchItems.length} orders (Browser Mode: Headless (background), Execution Mode: ${selectedMode.label})...`);
+  console.log(`\nLaunching batch execution on ${executionConfig.environment} for ${batchItems.length} orders (Browser Mode: Headless (background), Execution Mode: ${selectedMode.label})...`);
   const batchResult = await executeBatch(batchItems, {
+    environment: executionConfig.environment,
+    omsUrl: executionConfig.omsUrl,
+    apiEndpoint: executionConfig.apiEndpoint,
     headless: true, // Batch executions must strictly run headlessly per requirements
     concurrency,
     autoPay: isPaymentRequested,
-    maxRetries: config.maxRetries,
-    sessionPath: config.sessionPath,
+    maxRetries: executionConfig.maxRetries,
+    sessionPath: executionConfig.sessionPath,
   });
 
   const isMixed = domesticCount > 0 && intlCount > 0;
   const orderTypeSummary = isMixed ? 'mixed' : (intlCount > 0 ? 'international' : 'domestic');
 
   const savedRecord = saveExecutionRecord({
+    environment: executionConfig.environment,
+    environmentUrl: executionConfig.omsUrl,
     request: userPrompt || `Batch ${batchItems.length} orders`,
     menuOption: 'Multiple Orders + Payment',
     orderType: orderTypeSummary,
@@ -538,6 +572,7 @@ async function handleBatchOrderFlow(rl, config, { autoPay = true, executionMode 
   console.log('\n======================================================');
   console.log('                 BATCH EXECUTION REPORT               ');
   console.log('======================================================');
+  console.log(`Environment: ${executionConfig.environment} (${executionConfig.omsUrl})`);
   console.log(`Mode: ${selectedMode.label}`);
   console.log(`Total: ${batchResult.total} | Succeeded: ${batchResult.succeeded} | Failed: ${batchResult.failed}`);
   console.log(`Total Amount Paid: ${formatRupiah(batchResult.totalAmountPaid)}`);
@@ -574,12 +609,14 @@ async function handleViewHistory(rl) {
 
   records.forEach((r, idx) => {
     console.log(`\n[${idx + 1}] ID: ${r.id} (${r.timestamp})`);
-    console.log(`    Request:  "${r.request}"`);
-    console.log(`    Mode:     ${r.menuOption} | Orders: ${r.summary.succeeded}/${r.summary.total} succeeded`);
-    console.log(`    Total Rp: Rp${r.summary.totalAmountPaid}`);
+    console.log(`    Environment: ${r.environment || 'Smart Routing'}${r.environmentUrl ? ` (${r.environmentUrl})` : ''}`);
+    console.log(`    Request:     "${r.request}"`);
+    console.log(`    Mode:        ${r.menuOption} | Orders: ${r.summary.succeeded}/${r.summary.total} succeeded`);
+    console.log(`    Total Rp:    Rp${r.summary.totalAmountPaid}`);
     if (r.orders && r.orders.length > 0) {
       r.orders.forEach(o => {
-        console.log(`    -> Order: ${o.orderId || 'N/A'} (VA: ${o.vaNumber || 'N/A'}, Status: ${o.status})`);
+        const envLabel = o.environment || r.environment || 'Smart Routing';
+        console.log(`    -> [${envLabel}] Order: ${o.orderId || 'N/A'} (VA: ${o.vaNumber || 'N/A'}, Status: ${o.status})`);
       });
     }
   });
@@ -608,7 +645,6 @@ async function startOrderingBot(options = {}) {
 
   const modeLabel = config.headless ? 'Headless (background)' : 'Headed (visible browser)';
   console.log(`\n[Browser Mode] Selected: ${modeLabel}`);
-  console.log(`Environment: ${config.environment} | Browser Mode: ${modeLabel}`);
 
   let running = true;
   while (running) {
@@ -657,6 +693,8 @@ module.exports = {
   validateSpecificationForExecution,
   promptQuestion,
   promptBrowserMode,
+  promptOmsEnvironment,
+  resolveOmsEnvironment,
   promptBatchExecutionMode,
   promptSpecificationEdits,
   splitBatchPrompt,

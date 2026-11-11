@@ -11,6 +11,7 @@ const vmsSpecBuilder = require('./vms_spec_builder');
 const catalogManager = require('./catalog_manager');
 const catalogCache = require('./catalog_cache');
 const routeManager = require('./route_manager');
+const batchCatalogManager = require('./batch_catalog_manager');
 const vmsMenu = require('./vms_menu');
 
 module.exports = {
@@ -22,5 +23,6 @@ module.exports = {
   ...catalogManager,
   ...catalogCache,
   ...routeManager,
+  ...batchCatalogManager,
   ...vmsMenu,
 };

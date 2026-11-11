@@ -25,6 +25,12 @@ const {
   formatCatalogReview,
   formatRouteReview,
 } = require('./vms_spec_builder');
+const {
+  parseBatchCatalogInput,
+  formatBatchReview,
+  formatBatchSummaryReport,
+  executeBatchCatalogs,
+} = require('./batch_catalog_manager');
 
 /**
  * Prompt helper matching order_bot readline convention
@@ -87,6 +93,36 @@ async function handleCreateCatalogFlow(rl, options = {}) {
     return normalizeRouteSpecification(parsed);
   });
 
+  // Verify location resolutions
+  let hasLocationError = false;
+  console.log('\n======================================================');
+  console.log('         LOCATION RESOLUTION REVIEW');
+  console.log('======================================================');
+  normalizedRoutes.forEach((r, idx) => {
+    const origInfo = r.origin.portName
+      ? `${r.origin.portName} (${r.origin.city}, ${r.origin.country}) [PORT]`
+      : `${r.origin.district}, ${r.origin.city}, ${r.origin.province} [DOOR] (Match: ${r.origin.confidence || 'NORMAL'})`;
+    const destInfo = r.destination.portName
+      ? `${r.destination.portName} (${r.destination.city}, ${r.destination.country}) [PORT]`
+      : `${r.destination.district}, ${r.destination.city}, ${r.destination.province} [DOOR] (Match: ${r.destination.confidence || 'NORMAL'})`;
+
+    console.log(`[Route #${idx + 1}] Input: "${r.rawPrompt || r.routeName}"`);
+    console.log(`  • Resolved Origin:      ${origInfo}`);
+    console.log(`  • Resolved Destination: ${destInfo}`);
+
+    if (r.origin.error || r.destination.error || !r.origin.city || !r.destination.city) {
+      console.log(`  [ERROR] Location resolution failed or incomplete for Route #${idx + 1}!`);
+      hasLocationError = true;
+    }
+  });
+  console.log('======================================================');
+
+  if (hasLocationError) {
+    console.log('\n[VMS ERROR] Cannot proceed: One or more route locations could not be resolved reliably.');
+    console.log('Aborting catalog creation to prevent incorrect route creation in VMS.\n');
+    return;
+  }
+
   const catalogSpec = {
     name: catalogName,
     startDate,
@@ -98,7 +134,7 @@ async function handleCreateCatalogFlow(rl, options = {}) {
   console.log('\n' + formatCatalogReview(catalogSpec));
 
   // Confirm execution
-  const confirm = await promptQuestion(rl, '\nApprove and execute catalog creation in VMS? [y/N]: ');
+  const confirm = await promptQuestion(rl, '\nConfirm resolved locations and approve catalog creation in VMS? [y/N]: ');
   if (!/^(?:y|yes|ya)$/i.test(confirm)) {
     console.log('[CANCELED] Catalog creation aborted. No changes made in VMS.');
     return;
@@ -311,6 +347,36 @@ async function handleAddRoutesToExistingCatalogFlow(rl, options = {}) {
     return normalizeRouteSpecification(parsed);
   });
 
+  // Verify location resolutions explicitly before execution
+  let hasLocationError = false;
+  console.log('\n======================================================');
+  console.log('         LOCATION RESOLUTION REVIEW');
+  console.log('======================================================');
+  normalizedRoutes.forEach((r, idx) => {
+    const origInfo = r.origin.portName
+      ? `${r.origin.portName} (${r.origin.city}, ${r.origin.country}) [PORT]`
+      : `${r.origin.district}, ${r.origin.city}, ${r.origin.province} [DOOR] (Match: ${r.origin.confidence || 'NORMAL'})`;
+    const destInfo = r.destination.portName
+      ? `${r.destination.portName} (${r.destination.city}, ${r.destination.country}) [PORT]`
+      : `${r.destination.district}, ${r.destination.city}, ${r.destination.province} [DOOR] (Match: ${r.destination.confidence || 'NORMAL'})`;
+
+    console.log(`[Route #${idx + 1}] Input: "${r.rawPrompt || r.routeName}"`);
+    console.log(`  • Resolved Origin:      ${origInfo}`);
+    console.log(`  • Resolved Destination: ${destInfo}`);
+
+    if (r.origin.error || r.destination.error || !r.origin.city || !r.destination.city) {
+      console.log(`  [ERROR] Location resolution failed or incomplete for Route #${idx + 1}!`);
+      hasLocationError = true;
+    }
+  });
+  console.log('======================================================');
+
+  if (hasLocationError) {
+    console.log('\n[VMS ERROR] Cannot proceed: One or more route locations could not be resolved reliably.');
+    console.log('Aborting route submission to prevent incorrect route creation in VMS.\n');
+    return;
+  }
+
   console.log('\n======================================================');
   console.log(`ROUTES TO BE ADDED TO: "${targetCatalog.name}"`);
   console.log('======================================================');
@@ -319,7 +385,7 @@ async function handleAddRoutesToExistingCatalogFlow(rl, options = {}) {
   });
   console.log('======================================================\n');
 
-  const confirm = await promptQuestion(rl, 'Approve and execute route submission to VMS? [y/N]: ');
+  const confirm = await promptQuestion(rl, 'Confirm resolved locations and approve route submission to VMS? [y/N]: ');
   if (!/^(?:y|yes|ya)$/i.test(confirm)) {
     console.log('[CANCELED] Route submission aborted. No changes made in VMS.');
     return;
@@ -359,6 +425,97 @@ async function handleAddRoutesToExistingCatalogFlow(rl, options = {}) {
 }
 
 /**
+ * Flow 2: Create Multiple Service Catalogs in Batch
+ * - Accepts multi-catalog natural language input
+ * - Parses and normalizes each catalog independently
+ * - Displays complete batch review
+ * - Allows approval, cancellation, or individual editing
+ * - Executes in a single session without sequential/concurrent mode prompting
+ * - Summarizes batch results
+ */
+async function handleCreateMultipleCatalogsFlow(rl, options = {}) {
+  const modeLabel = options.headless ? 'Headless (background)' : 'Headed (visible browser)';
+  console.log('\n=== Create Multiple Service Catalogs (Batch) ===');
+  console.log('Enter multiple catalog specifications in natural language.');
+  console.log('Example:');
+  console.log('1. Catalog Smart Routing Domestic');
+  console.log('   Valid from 1 December 2026 until 31 December 2026');
+  console.log('   Domestic Land FTL\n');
+  console.log('2. Catalog Smart Routing International');
+  console.log('   Valid from 1 December 2026 until 31 December 2026');
+  console.log('   International Sea FCL\n');
+  console.log('(Enter specifications line by line; submit an empty line or "done" to finish):');
+
+  const inputLines = [];
+  while (true) {
+    const line = await promptQuestion(rl, '> ');
+    if (!line || /^(?:done|selesai|submit)$/i.test(line.trim())) {
+      if (inputLines.length > 0) break;
+      console.log('Please enter at least one catalog specification or type "cancel" to exit.');
+      continue;
+    }
+    if (/^(?:cancel|batal|q|exit)$/i.test(line.trim())) {
+      console.log('[CANCELED] Batch catalog creation canceled.');
+      return;
+    }
+    inputLines.push(line);
+  }
+
+  const rawInput = inputLines.join('\n');
+  let catalogs = parseBatchCatalogInput(rawInput);
+
+  if (catalogs.length === 0) {
+    console.log('[CANCELED] No valid catalog specifications parsed.');
+    return;
+  }
+
+  // Batch review & edit loop
+  while (true) {
+    console.log('\n' + formatBatchReview(catalogs));
+
+    console.log('Batch Actions:');
+    console.log('  [Y] Approve and execute batch');
+    console.log('  [E] Edit an individual catalog before execution');
+    console.log('  [N] Cancel batch');
+
+    const action = await promptQuestion(rl, '\nSelect action [y/e/N]: ');
+
+    if (/^(?:y|yes|ya|approve)$/i.test(action)) {
+      break;
+    } else if (/^(?:e|edit)$/i.test(action)) {
+      const idxStr = await promptQuestion(rl, `Enter catalog number to edit [1-${catalogs.length}]: `);
+      const catIdx = parseInt(idxStr, 10);
+      if (isNaN(catIdx) || catIdx < 1 || catIdx > catalogs.length) {
+        console.log('Invalid catalog index.');
+        continue;
+      }
+
+      const target = catalogs[catIdx - 1];
+      console.log(`\nEditing Catalog #${catIdx}: "${target.name}"`);
+      const newName = await promptQuestion(rl, `Catalog Name (Current: "${target.name}", press Enter to keep): `);
+      if (newName) target.name = newName;
+
+      const newStart = await promptQuestion(rl, `Start Date (Current: "${target.startDate}", press Enter to keep): `);
+      if (newStart) target.startDate = newStart;
+
+      const newEnd = await promptQuestion(rl, `End Date (Current: "${target.endDate}", press Enter to keep): `);
+      if (newEnd) target.endDate = newEnd;
+
+      console.log(`Catalog #${catIdx} updated.`);
+      continue;
+    } else {
+      console.log('[CANCELED] Batch catalog creation aborted. No changes made in VMS.');
+      return;
+    }
+  }
+
+  console.log(`\n[VMS] Launching ${modeLabel} browser to execute batch catalog creation...`);
+  const results = await executeBatchCatalogs(catalogs, options);
+  const report = formatBatchSummaryReport(results);
+  console.log(report.summaryText);
+}
+
+/**
  * VMS Main Interactive Menu
  */
 async function handleVmsMenu(rl, options = {}) {
@@ -366,23 +523,27 @@ async function handleVmsMenu(rl, options = {}) {
   while (inVms) {
     console.log('\n--- VMS SERVICE CATALOG MENU ---');
     console.log('1. Create Service Catalog');
-    console.log('2. Manage Existing Service Catalogs');
-    console.log('3. Add Routes to Existing Catalog');
-    console.log('4. Return to Main Menu');
+    console.log('2. Create Multiple Service Catalogs');
+    console.log('3. Manage Existing Service Catalogs');
+    console.log('4. Add Routes to Existing Catalog');
+    console.log('5. Return to Main Menu');
 
-    const choice = await promptQuestion(rl, '\nSelect option [1-4]: ');
+    const choice = await promptQuestion(rl, '\nSelect option [1-5]: ');
 
     switch (choice) {
       case '1':
         await handleCreateCatalogFlow(rl, options);
         break;
       case '2':
-        await handleListCatalogsFlow(rl, options);
+        await handleCreateMultipleCatalogsFlow(rl, options);
         break;
       case '3':
-        await handleAddRoutesToExistingCatalogFlow(rl, options);
+        await handleListCatalogsFlow(rl, options);
         break;
       case '4':
+        await handleAddRoutesToExistingCatalogFlow(rl, options);
+        break;
+      case '5':
       case 'back':
       case 'return':
       case 'q':
@@ -390,7 +551,7 @@ async function handleVmsMenu(rl, options = {}) {
         inVms = false;
         break;
       default:
-        console.log('Invalid selection. Please choose an option between 1 and 4.');
+        console.log('Invalid selection. Please choose an option between 1 and 5.');
         break;
     }
   }
@@ -399,6 +560,7 @@ async function handleVmsMenu(rl, options = {}) {
 module.exports = {
   handleVmsMenu,
   handleCreateCatalogFlow,
+  handleCreateMultipleCatalogsFlow,
   handleListCatalogsFlow,
   handleAddRoutesToExistingCatalogFlow,
   promptQuestion,

@@ -10,7 +10,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const { getAuthenticatedVmsPage } = require('./vms_auth');
+const { getAuthenticatedVmsPage, getStoredVmsSessionCookie, ensureVmsSessionCookie } = require('./vms_auth');
 const { loadVmsConfig } = require('./vms_config');
 const { getOrFetchCatalogs, invalidateCatalogCache } = require('./catalog_cache');
 
@@ -149,16 +149,17 @@ async function waitForCatalogTableLoaded(page, timeoutMs = 15000) {
   // Wait for table container to mount
   await page.locator('.ant-table-wrapper, .ant-table').first().waitFor({ state: 'visible', timeout: timeoutMs }).catch(() => {});
 
-  // Wait for loading spinners or skeleton pulses to detach/hide
-  await page.locator('.ant-spin-spinning, .ant-skeleton, .ant-spin').first().waitFor({ state: 'hidden', timeout: timeoutMs }).catch(() => {});
+  // Wait for active spinning overlays to detach/hide (specifically .ant-spin-spinning, avoiding static .ant-spin)
+  await page.locator('.ant-spin-spinning, .ant-skeleton-active').first().waitFor({ state: 'hidden', timeout: Math.min(timeoutMs, 3000) }).catch(() => {});
 
-  // Wait for either rows or empty state to appear
+  // Wait for either populated table rows or empty placeholder to appear
   await Promise.race([
-    page.waitForSelector('.ant-table-tbody tr.ant-table-row', { state: 'visible', timeout: timeoutMs }).catch(() => null),
-    page.waitForSelector('.ant-empty, .ant-table-placeholder', { state: 'visible', timeout: timeoutMs }).catch(() => null),
+    page.locator('.ant-table-tbody tr.ant-table-row td:not(:empty)').first().waitFor({ state: 'visible', timeout: timeoutMs }).catch(() => null),
+    page.locator('.ant-table-tbody tr.ant-table-row:not(.ant-table-measure-row)').first().waitFor({ state: 'visible', timeout: timeoutMs }).catch(() => null),
+    page.locator('.ant-empty, .ant-table-placeholder').first().waitFor({ state: 'visible', timeout: timeoutMs }).catch(() => null),
   ]);
 
-  await page.waitForTimeout(600);
+  await page.waitForTimeout(300);
 }
 
 /**
@@ -294,6 +295,14 @@ async function listServiceCatalogs(page, options = {}) {
 async function verifyCatalogDetailPage(page, expectedCatalogName, timeoutMs = 10000) {
   const targetClean = (expectedCatalogName || '').trim().toLowerCase();
 
+  // Wait for detail content h1 to render if navigating live
+  const detailTitleCandidateSelector = 'main section h1, main h1, .ant-layout-content h1, h1.text-\\[24px\\]';
+  try {
+    await page.locator(detailTitleCandidateSelector).first().waitFor({ state: 'visible', timeout: Math.min(timeoutMs, 8000) });
+  } catch (waitErr) {
+    // If specific h1 did not mount within timeout, proceed to evaluate error banners or DOM state
+  }
+
   // Check for immediate error banners
   const permissionError = await page.evaluate(() => {
     const text = document.body ? document.body.innerText : '';
@@ -309,56 +318,270 @@ async function verifyCatalogDetailPage(page, expectedCatalogName, timeoutMs = 10
       verified: false,
       displayedName: permissionError,
       reason: `Page displayed error banner: "${permissionError}"`,
+      inspectedElement: 'body (permission check)',
     };
   }
 
-  // Check for catalog name in header, title, breadcrumbs, descriptions, or content
-  const displayedInfo = await page.evaluate((targetClean) => {
-    const candidateSelectors = [
-      '.ant-page-header-heading-title',
-      '.ant-page-header-heading-sub-title',
-      '.ant-breadcrumb',
-      'h1, h2, h3, h4, h5',
-      '.ant-descriptions-item-content',
-      '.ant-descriptions-item',
-      '.ant-card-head-title',
-      '.catalog-name, .catalog-title',
-    ];
+  // Extract catalog title specifically from detail page main content
+  const domInspection = await page.evaluate((targetClean) => {
+    const isExcluded = (text) => {
+      if (!text) return true;
+      const lower = text.toLowerCase();
+      return (
+        lower.includes('vendor management system') ||
+        lower.startsWith('hi,') ||
+        lower.includes('dashboard vendor') ||
+        lower.includes('live chat') ||
+        lower === 'rute aktif' ||
+        lower === 'rute tidak aktif' ||
+        lower === 'total rute' ||
+        lower === 'service rute' ||
+        lower === 'katalog layanan'
+      );
+    };
 
-    for (const sel of candidateSelectors) {
-      const els = document.querySelectorAll(sel);
-      for (const el of els) {
-        const text = (el.innerText || '').trim();
-        if (text && text.toLowerCase().includes(targetClean)) {
-          return { found: true, text, selector: sel };
+    // Strategy 1: Title element located in detail header container above validity period
+    // In VMS: <section class="mb-5">...<h1 class="text-[24px] font-semibold mb-2">Title</h1>...<p>Berlaku ...</p>
+    const allP = Array.from(document.querySelectorAll('main p, .ant-layout-content p, section p, p'));
+    const validityP = allP.find(p => (p.innerText || '').includes('Berlaku'));
+    if (validityP) {
+      const container = validityP.closest('div.w-full, .ant-col, section') || validityP.parentElement;
+      if (container) {
+        const titleH1 = container.querySelector('h1.text-\\[24px\\], h1.font-semibold, h1');
+        if (titleH1) {
+          const titleText = (titleH1.innerText || '').trim();
+          if (titleText && !isExcluded(titleText)) {
+            return {
+              strategy: 'validity_header_container',
+              selector: 'section.mb-5 h1.text-[24px]',
+              displayedName: titleText,
+              outerHTML: titleH1.outerHTML,
+              tag: titleH1.tagName,
+              matches: titleText.toLowerCase() === targetClean || titleText.toLowerCase().includes(targetClean),
+            };
+          }
         }
       }
     }
 
-    const bodyText = (document.body ? document.body.innerText : '').trim();
-    if (bodyText.toLowerCase().includes(targetClean)) {
-      return { found: true, text: targetClean, selector: 'body' };
+    // Strategy 2: Specific detail page title locators within main / ant-layout-content
+    const mainTitleSelectors = [
+      'main section h1.text-\\[24px\\]',
+      '.ant-layout-content section h1.text-\\[24px\\]',
+      'section.mb-5 h1',
+      'main h1.text-\\[24px\\]',
+      '.ant-layout-content h1.text-\\[24px\\]',
+      'main h1.font-semibold',
+      'main h1',
+      '.ant-layout-content h1',
+      '.ant-page-header-heading-title',
+    ];
+
+    for (const sel of mainTitleSelectors) {
+      const els = document.querySelectorAll(sel);
+      for (const el of els) {
+        const text = (el.innerText || '').trim();
+        if (text && !isExcluded(text)) {
+          return {
+            strategy: 'main_title_selector',
+            selector: sel,
+            displayedName: text,
+            outerHTML: el.outerHTML,
+            tag: el.tagName,
+            matches: text.toLowerCase() === targetClean || text.toLowerCase().includes(targetClean),
+          };
+        }
+      }
     }
 
-    const fallbackEl = document.querySelector('.ant-page-header-heading-title, h1, h2, h3, .ant-descriptions-item-content');
-    const fallbackText = fallbackEl ? (fallbackEl.innerText || '').trim() : 'Unknown';
+    // Strategy 3: Check headings within main, filtering out known stats and branding
+    const mainEl = document.querySelector('main.ant-layout-content, main, .ant-layout-content') || document.body;
+    const headings = Array.from(mainEl.querySelectorAll('h1, h2, h3'));
+    for (const h of headings) {
+      const text = (h.innerText || '').trim();
+      if (text && !isExcluded(text)) {
+        return {
+          strategy: 'main_headings_fallback',
+          selector: `${mainEl.tagName.toLowerCase()} ${h.tagName.toLowerCase()}.${(h.className || '').trim().replace(/\\s+/g, '.')}`,
+          displayedName: text,
+          outerHTML: h.outerHTML,
+          tag: h.tagName,
+          matches: text.toLowerCase() === targetClean || text.toLowerCase().includes(targetClean),
+        };
+      }
+    }
 
-    return { found: false, text: fallbackText, selector: null };
-  }, targetClean).catch(() => ({ found: false, text: 'Evaluation error', selector: null }));
+    return {
+      strategy: 'not_found',
+      selector: null,
+      displayedName: 'Not Found',
+      outerHTML: null,
+      tag: null,
+      matches: false,
+    };
+  }, targetClean).catch((err) => ({
+    strategy: 'eval_error',
+    selector: null,
+    displayedName: 'Evaluation error',
+    outerHTML: null,
+    tag: null,
+    matches: false,
+    error: err.message,
+  }));
 
-  if (displayedInfo.found) {
+  if (domInspection.matches) {
     return {
       verified: true,
-      displayedName: displayedInfo.text,
-      matchedSelector: displayedInfo.selector,
+      displayedName: domInspection.displayedName,
+      matchedSelector: domInspection.selector,
+      strategy: domInspection.strategy,
+      inspectedElement: domInspection.outerHTML || domInspection.selector,
     };
   }
 
   return {
     verified: false,
-    displayedName: displayedInfo.text,
-    reason: `Catalog name "${expectedCatalogName}" not found on detail page`,
+    displayedName: domInspection.displayedName,
+    reason: `Catalog name "${expectedCatalogName}" does not match displayed detail title "${domInspection.displayedName}"`,
+    inspectedElement: domInspection.outerHTML || domInspection.selector || 'No valid title element found in main layout',
+    strategy: domInspection.strategy,
   };
+}
+
+const DEFAULT_VMS_NEXT_ACTION_ID = '403d98f6100e1212a1c6c8c0d5bdcf5bcd5d958bed';
+let _currentNextActionId = DEFAULT_VMS_NEXT_ACTION_ID;
+
+function setVmsNextActionId(actionId) {
+  if (actionId && typeof actionId === 'string') {
+    _currentNextActionId = actionId;
+  }
+}
+
+function getVmsNextActionId() {
+  return _currentNextActionId;
+}
+
+const INDO_MONTHS = [
+  'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
+  'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'
+];
+
+function formatIndonesianDate(isoStr) {
+  if (!isoStr) return '';
+  const d = new Date(isoStr);
+  if (isNaN(d.getTime())) return isoStr;
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  const month = INDO_MONTHS[d.getUTCMonth()];
+  const year = d.getUTCFullYear();
+  return `${day} ${month} ${year}`;
+}
+
+function mapStatusCodeToIndonesian(statusCode, isActive) {
+  if (!statusCode) return isActive ? 'Aktif' : 'Tidak Aktif';
+  switch (statusCode.toUpperCase()) {
+    case 'ACTIVE':
+      return 'Aktif';
+    case 'UPCOMING':
+      return 'Akan Datang';
+    case 'EXPIRED':
+      return 'Kadaluwarsa';
+    case 'INACTIVE':
+      return 'Tidak Aktif';
+    default:
+      return statusCode;
+  }
+}
+
+function parseRscResponse(text) {
+  if (!text) return null;
+  const lines = text.split('\n');
+  for (const line of lines) {
+    const colonIdx = line.indexOf(':');
+    if (colonIdx !== -1) {
+      const candidate = line.slice(colonIdx + 1).trim();
+      try {
+        const json = JSON.parse(candidate);
+        if (json && (json.data?.data || Array.isArray(json.data))) {
+          return json;
+        }
+      } catch (_) {}
+    }
+  }
+  try {
+    const directJson = JSON.parse(text);
+    if (directJson && (directJson.data?.data || Array.isArray(directJson.data))) {
+      return directJson;
+    }
+  } catch (_) {}
+  return null;
+}
+
+/**
+ * Fetch service catalogs directly via Next.js Server Action endpoint.
+ * Highly optimized (<250ms), reuses authenticated session cookie (POS_SID).
+ */
+async function fetchServiceCatalogsApi(options = {}) {
+  const cfg = loadVmsConfig(options);
+  const actionId = options.nextActionId || process.env.VMS_CATALOG_NEXT_ACTION_ID || _currentNextActionId;
+
+  // Ensure authenticated session cookie
+  let cookie = getStoredVmsSessionCookie(cfg);
+  if (!cookie) {
+    cookie = await ensureVmsSessionCookie(options);
+  }
+
+  const endpointUrl = `${cfg.vmsUrl}/service-catalog`;
+  const pageNum = options.page || 1;
+  const limitNum = options.limit || 50;
+
+  async function performFetch(cookieVal) {
+    return await fetch(endpointUrl, {
+      method: 'POST',
+      headers: {
+        'cookie': `POS_SID=${cookieVal}`,
+        'next-action': actionId,
+        'accept': 'text/x-component',
+        'content-type': 'text/plain;charset=UTF-8',
+        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+      body: JSON.stringify([{ page: pageNum, limit: limitNum }]),
+    });
+  }
+
+  let res = await performFetch(cookie);
+
+  // If unauthorized / forbidden or redirected, refresh cookie once
+  if (res.status === 401 || res.status === 403 || res.status === 302) {
+    console.log(`[VMSCatalog] Session cookie expired or unauthorized (status ${res.status}). Refreshing cookie...`);
+    cookie = await ensureVmsSessionCookie({ ...options, forceRefresh: true });
+    res = await performFetch(cookie);
+  }
+
+  if (!res.ok) {
+    throw new Error(`Server Action request failed with HTTP ${res.status} ${res.statusText}`);
+  }
+
+  const responseText = await res.text();
+  const parsed = parseRscResponse(responseText);
+
+  if (!parsed || !parsed.data || !Array.isArray(parsed.data.data)) {
+    throw new Error('Unexpected RSC response format from VMS Server Action');
+  }
+
+  const items = parsed.data.data;
+  return items.map((item, index) => ({
+    rowIndex: index,
+    catalogId: item.catalog_header_code || null,
+    detailUrl: null, // UI navigation uses action menu "Lihat Route"
+    name: item.catalog_name || '',
+    services: String(item.services !== undefined ? item.services : 0),
+    startDate: formatIndonesianDate(item.start_date),
+    endDate: formatIndonesianDate(item.end_date),
+    status: mapStatusCodeToIndonesian(item.status_code, item.is_active),
+    pageIndex: pageNum,
+    catalogHeaderCode: item.catalog_header_code,
+    isActive: item.is_active,
+  }));
 }
 
 /**
@@ -377,10 +600,30 @@ async function retrieveAvailableCatalogsHeadless(options = {}) {
 }
 
 /**
- * Get available catalogs using cache or headless fetch
+ * Retrieve available catalogs.
+ * Tries direct Server Action API first (fastest, ~200ms).
+ * Transparently falls back to headless browser extraction if skipApi is true or if API fails.
+ */
+async function retrieveAvailableCatalogs(options = {}) {
+  if (!options.skipApi) {
+    try {
+      const startTime = Date.now();
+      const catalogs = await fetchServiceCatalogsApi(options);
+      console.log(`[VMSCatalog] Retrieved ${catalogs.length} catalogs via direct API in ${Date.now() - startTime}ms`);
+      return catalogs;
+    } catch (apiErr) {
+      console.warn(`[VMSCatalog] Direct API fetch failed (${apiErr.message}), falling back to headless browser extraction...`);
+    }
+  }
+
+  return await retrieveAvailableCatalogsHeadless(options);
+}
+
+/**
+ * Get available catalogs using cache or API/headless fetch
  */
 async function getAvailableCatalogs(options = {}) {
-  return await getOrFetchCatalogs(() => retrieveAvailableCatalogsHeadless(options), options);
+  return await getOrFetchCatalogs(() => retrieveAvailableCatalogs(options), options);
 }
 
 /**
@@ -431,18 +674,28 @@ async function openCatalogDetail(page, catalogInfo, options = {}) {
     const rows = await extractVisibleCatalogRows(page);
     checkedCatalogs.push(...rows);
 
-    // Exact match first
-    let matchIdx = rows.findIndex(r => r.name.trim().toLowerCase() === targetClean);
-    let isExact = true;
-    if (matchIdx === -1) {
-      matchIdx = rows.findIndex(r => r.name.trim().toLowerCase().includes(targetClean));
-      isExact = false;
+    // Locate exact row using Playwright locator scoped to table and exact text
+    const exactRowLocator = page.locator('.ant-table-tbody tr.ant-table-row').filter({
+      has: page.locator('td').first().filter({ hasText: new RegExp(`^\\s*${catalogName.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\s*$`, 'i') })
+    }).or(
+      page.locator('.ant-table-tbody tr.ant-table-row').filter({
+        hasText: new RegExp(`^\\s*${catalogName.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\s*`, 'i')
+      })
+    ).first();
+
+    if (await exactRowLocator.isVisible().catch(() => false)) {
+      foundPage = p + 1;
+      howLocated = `Exact name match on table page ${foundPage}`;
+      targetRow = exactRowLocator;
+      break;
     }
 
+    // Fallback: search extracted row index
+    const matchIdx = rows.findIndex(r => r.name.trim().toLowerCase() === targetClean || r.name.trim().toLowerCase().includes(targetClean));
     if (matchIdx !== -1) {
       foundPage = p + 1;
       foundRowIndex = rows[matchIdx].rowIndex;
-      howLocated = `${isExact ? 'Exact name match' : 'Partial name match'} on table page ${foundPage} (row index ${foundRowIndex})`;
+      howLocated = `Name match on table page ${foundPage} (row index ${foundRowIndex})`;
       const tableRows = await page.locator('.ant-table-tbody tr.ant-table-row').all();
       if (tableRows[foundRowIndex]) {
         targetRow = tableRows[foundRowIndex];
@@ -464,12 +717,22 @@ async function openCatalogDetail(page, catalogInfo, options = {}) {
 
   console.log(`[VMSCatalog] How catalog was located in UI: ${howLocated}`);
 
-  // Trigger verified detail navigation control
-  const actionBtn = targetRow.locator('.ant-dropdown-trigger, button:has-text("..."), .anticon-more').first();
-  await actionBtn.click();
+  // Locate three-dot action button strictly scoped to the matched catalog row
+  const rowActionBtn = targetRow.locator(
+    'button.ant-dropdown-trigger, .ant-dropdown-trigger, button:has-text("..."), .anticon-more, button[aria-haspopup="menu"], td:last-child button, td:last-child .ant-dropdown-trigger'
+  ).first();
+
+  await rowActionBtn.waitFor({ state: 'visible', timeout: cfg.actionTimeoutMs });
+  await rowActionBtn.click();
   await page.waitForTimeout(500);
 
-  const lihatRouteItem = page.locator('.ant-dropdown:not(.ant-dropdown-hidden) .ant-dropdown-menu-item').filter({ hasText: /Lihat\s+(?:Route|Rute|Detail)/i }).first();
+  // Click "Lihat Route" menu item from opened action menu (ignoring "Edit" & "Nonaktifkan Katalog")
+  const lihatRouteItem = page.locator('.ant-dropdown:not(.ant-dropdown-hidden) .ant-dropdown-menu-item').filter({
+    hasText: /^\s*Lihat\s+Route\s*$/i
+  }).or(
+    page.locator('.ant-dropdown:not(.ant-dropdown-hidden) .ant-dropdown-menu-item:has-text("Lihat Route")')
+  ).first();
+
   await lihatRouteItem.waitFor({ state: 'visible', timeout: cfg.actionTimeoutMs });
   await lihatRouteItem.click();
 
@@ -543,7 +806,14 @@ module.exports = {
   captureVmsScreenshot,
   listServiceCatalogs,
   retrieveAvailableCatalogsHeadless,
+  retrieveAvailableCatalogs,
   getAvailableCatalogs,
+  fetchServiceCatalogsApi,
+  setVmsNextActionId,
+  getVmsNextActionId,
+  formatIndonesianDate,
+  mapStatusCodeToIndonesian,
+  parseRscResponse,
   waitForCatalogTableLoaded,
   extractVisibleCatalogRows,
   captureCatalogLookupDiagnostics,

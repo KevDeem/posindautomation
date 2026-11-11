@@ -25,10 +25,26 @@ const {
   listExecutionRecords,
   sanitizeObject,
 } = require('../bot/history_manager');
-const { loadConfig } = require('../bot/config');
+const { loadConfig, createExecutionContext } = require('../bot/config');
+const {
+  OMS_ENVIRONMENTS,
+  getOmsEnvironments,
+  getOmsEnvironmentList,
+  resolveOmsEnvironment,
+  formatEnvironmentSelectionMenu,
+  promptOmsEnvironment,
+} = require('../config/oms_environments');
+const { handleViewHistory } = require('../bot/order_bot');
 const { resolveSpecification, DEFAULT_SPECIFICATION, formatSpecificationReview } = require('./order_specification');
 const { normalizeBatchInput, classifyFailure, executeBatch, runWithConcurrency } = require('./batch_executor');
-const { executeOrderPayment, formatRupiah, parseCurrency } = require('./payment_executor');
+const {
+  executeOrderPayment,
+  submitVasbuPosPayment,
+  buildVasbuPosPayload,
+  VASBUPOS_PAYMENT_URL,
+  formatRupiah,
+  parseCurrency,
+} = require('./payment_executor');
 const {
   extractAdminPrefix,
   normalizeAdminCityName,
@@ -762,62 +778,106 @@ async function runBotTests() {
   assert.notStrictEqual(extractedVa, shipmentId, 'VA must not equal Shipment ID');
   console.log('  [PASS] Dedicated VA extraction and anti-collision assertions verified.');
 
-  // Test 32: Payment sandbox simulation
-  console.log('\n[Test 32] Testing Payment Sandbox simulation flow...');
-  await contextPay.route('https://pospay-sandbox.vercel.app/**', route => {
-    route.fulfill({
+  // Test 32: vasbupos_payment API Endpoint, Headers & Payload Structure
+  console.log('\n[Test 32] Testing vasbupos_payment API endpoint, headers and exact payload schema...');
+  assert.strictEqual(
+    VASBUPOS_PAYMENT_URL,
+    'https://pos-oms-api-staging.nisims.web.id/api/v1/pospay/vasbupos_payment',
+    'Endpoint URL must match reference specification'
+  );
+
+  // Validate payload generation: ONLY nomor_va and nominal are dynamic
+  const sampleVa = '81026749';
+  const sampleAmount = 301753;
+  const payload = buildVasbuPosPayload(sampleVa, sampleAmount);
+
+  // Dynamic fields
+  assert.strictEqual(payload.nomor_va, sampleVa, 'nomor_va must dynamically match order VA');
+  assert.strictEqual(typeof payload.nomor_va, 'string', 'nomor_va must be string');
+  assert.strictEqual(payload.nominal, sampleAmount, 'nominal must dynamically match payment amount');
+  assert.strictEqual(typeof payload.nominal, 'number', 'nominal must be numeric');
+
+  // Exact static fields from cURL
+  assert.strictEqual(payload.kode_inst, '121', 'kode_inst must be "121"');
+  assert.strictEqual(payload.channel_id, '9001', 'channel_id must be "9001"');
+  assert.strictEqual(payload.admin, 0, 'admin must be 0');
+  assert.strictEqual(payload.refnumber, '0981879221111', 'refnumber must be "0981879221111"');
+  assert.strictEqual(payload.waktu_proses, '2025-11-30 20:20:00.000', 'waktu_proses must match reference timestamp');
+  assert.strictEqual(payload.nopen, '50000', 'nopen must be "50000"');
+  assert.strictEqual(payload.hashing, '', 'hashing must be empty string');
+  assert.strictEqual(payload.created_by, 'GLID', 'created_by must be "GLID"');
+
+  // Test submitVasbuPosPayment HTTP call mocking
+  let capturedUrl = null;
+  let capturedOptions = null;
+  const mockFetchSuccess = async (url, opts) => {
+    capturedUrl = url;
+    capturedOptions = opts;
+    return {
+      ok: true,
       status: 200,
-      contentType: 'text/html',
-      body: `
-        <html>
-          <body>
-            <h1>POSPAY Payment</h1>
-            <input id="environment" value="" />
-            <input id="nomorVA" value="" />
-            <input id="nominal" value="" />
-            <button id="btn-pay">Pay Now</button>
-            <div id="result"></div>
-            <script>
-              document.getElementById('btn-pay').addEventListener('click', () => {
-                const va = document.getElementById('nomorVA').value;
-                const res = document.getElementById('result');
-                if (va === '81026749') {
-                  res.innerText = 'Payment Successful 00 {"payment_status": "SUCCESS"}';
-                } else {
-                  res.innerText = 'Payment Failed {"payment_status": "FAILED"}';
-                }
-              });
-            </script>
-          </body>
-        </html>
-      `,
-    });
+      text: async () => JSON.stringify({ rc: '00', status: 'SUCCESS', message: 'Payment processed' }),
+    };
+  };
+
+  const paymentApiResult = await submitVasbuPosPayment(sampleVa, sampleAmount, { fetchFn: mockFetchSuccess });
+  assert.strictEqual(capturedUrl, VASBUPOS_PAYMENT_URL, 'Request must target vasbupos_payment URL');
+  assert.strictEqual(capturedOptions.method, 'POST', 'HTTP method must be POST');
+  assert.strictEqual(capturedOptions.headers['Content-Type'], 'application/json', 'Content-Type must be application/json');
+  assert.strictEqual(capturedOptions.headers['accept'], '*/*', 'accept header must be */*');
+  assert.deepStrictEqual(JSON.parse(capturedOptions.body), payload, 'Request body must match exact payload');
+  assert.strictEqual(paymentApiResult.isSuccess, true, 'Result must be marked isSuccess');
+  console.log('  [PASS] vasbupos_payment API endpoint, headers, and exact payload schema verified.');
+
+  // Test 33: Payment Execution via API and Status Handling without requiring OMS paid verification
+  console.log('\n[Test 33] Testing Payment API execution & status handling (Do NOT require OMS paid-status verification)...');
+
+  // Successful API payment
+  const mockPagePay = await contextPay.newPage();
+  await mockPagePay.setContent(`
+    <html>
+      <body>
+        <h3>Instruksi Pembayaran</h3>
+        <span>VA : 81026749</span>
+        <p>Total Tagihan Rp301.753</p>
+      </body>
+    </html>
+  `);
+
+  const execSuccessResult = await executeOrderPayment(mockPagePay, contextPay, {
+    orderId: 'ORCA1001',
+    shipmentId: 'SOCB1001',
+    amount: 301753,
+  }, {
+    fetchFn: mockFetchSuccess,
   });
 
-  const sandboxPageSuccess = await contextPay.newPage();
-  await sandboxPageSuccess.goto('https://pospay-sandbox.vercel.app');
-  await sandboxPageSuccess.locator('#environment').fill('https://sr-pos-oms-api.nisims.web.id/api/v1');
-  await sandboxPageSuccess.locator('#nomorVA').fill('81026749');
-  await sandboxPageSuccess.locator('#nominal').fill('301753');
-  await sandboxPageSuccess.getByRole('button', { name: /pay now/i }).click();
-  await sandboxPageSuccess.waitForTimeout(100);
-  const resSuccessText = await sandboxPageSuccess.locator('#result').innerText();
-  assert(resSuccessText.includes('Payment Successful'), 'Sandbox must report Payment Successful');
-  console.log('  [PASS] Payment sandbox success simulation verified.');
+  assert.strictEqual(execSuccessResult.vaNumber, '81026749', 'VA must be extracted');
+  assert.strictEqual(execSuccessResult.amount, 301753, 'Amount must be matched');
+  assert.strictEqual(execSuccessResult.sandboxResult, 'SUCCESS', 'Payment result must be SUCCESS');
+  assert.strictEqual(execSuccessResult.paymentStatus, 'PAYMENT_VERIFIED', 'Status must be PAYMENT_VERIFIED');
+  assert.strictEqual(execSuccessResult.overallStatus, 'SUCCESS', 'Overall status must be SUCCESS');
+  console.log('  [PASS] Successful API payment execution verified without OMS paid requirement.');
 
-  // Test 33: Sandbox Payment Successful verification without requiring OMS paid verification
-  console.log('\n[Test 33] Testing Sandbox Payment Successful verification (Do NOT require OMS paid-status verification)...');
-  const sandboxDirectPage = await contextPay.newPage();
-  await sandboxDirectPage.goto('https://pospay-sandbox.vercel.app');
-  await sandboxDirectPage.locator('#environment').fill('https://sr-pos-oms-api.nisims.web.id/api/v1');
-  await sandboxDirectPage.locator('#nomorVA').fill('81026749');
-  await sandboxDirectPage.locator('#nominal').fill('301753');
-  await sandboxDirectPage.getByRole('button', { name: /pay now/i }).click();
-  await sandboxDirectPage.waitForTimeout(100);
-  const directText = await sandboxDirectPage.locator('#result').innerText();
-  const isDirectSuccess = directText.includes('Payment Successful') || directText.includes('PEMBAYARAN BERHASIL');
-  assert.strictEqual(isDirectSuccess, true, 'Payment status must be based on actual sandbox confirmation');
-  console.log('  [PASS] Sandbox UI confirmation (Payment Successful!) verified without OMS requirement.');
+  // Failed API payment
+  const mockFetchFailure = async () => ({
+    ok: false,
+    status: 500,
+    text: async () => JSON.stringify({ rc: '99', message: 'Internal server error' }),
+  });
+
+  const execFailResult = await executeOrderPayment(mockPagePay, contextPay, {
+    orderId: 'ORCA1002',
+    shipmentId: 'SOCB1002',
+    amount: 301753,
+  }, {
+    fetchFn: mockFetchFailure,
+  });
+
+  assert.strictEqual(execFailResult.sandboxResult, 'FAILED', 'Failed API payment must report sandboxResult FAILED');
+  assert.strictEqual(execFailResult.paymentStatus, 'PAYMENT_FAILED', 'Status must be PAYMENT_FAILED');
+  assert.strictEqual(execFailResult.overallStatus, 'ORDER_CREATED_PAYMENT_PENDING', 'Failed payment must report ORDER_CREATED_PAYMENT_PENDING');
+  console.log('  [PASS] Failed API payment error handling and ORDER_CREATED_PAYMENT_PENDING status verified.');
 
   // Test 34: Incomplete payment reporting & non-retryable gate
   console.log('\n[Test 34] Testing Incomplete payment reporting (ORDER_CREATED_PAYMENT_PENDING)...');
@@ -3002,7 +3062,7 @@ async function runBotTests() {
   assert(typeof handleVmsMenu === 'function', 'handleVmsMenu must be exported by vms module');
 
   // 1. Direct VMS menu navigation: invalid input -> return to main menu
-  const vmsMockRl = createMockRl(['99', '4']);
+  const vmsMockRl = createMockRl(['99', '5']);
   const vmsLogs = [];
   const origLogVms = console.log;
   console.log = (...args) => {
@@ -3014,15 +3074,16 @@ async function runBotTests() {
 
   assert(vmsLogs.some(l => l.includes('--- VMS SERVICE CATALOG MENU ---')), 'Must render VMS menu header');
   assert(vmsLogs.some(l => l.includes('1. Create Service Catalog')), 'Must list Option 1: Create Service Catalog');
-  assert(vmsLogs.some(l => l.includes('2. Manage Existing Service Catalogs')), 'Must list Option 2: Manage Existing Service Catalogs');
-  assert(vmsLogs.some(l => l.includes('3. Add Routes to Existing Catalog')), 'Must list Option 3: Add Routes to Existing Catalog');
-  assert(vmsLogs.some(l => l.includes('4. Return to Main Menu')), 'Must list Option 4: Return to Main Menu');
-  assert(vmsLogs.some(l => l.includes('Invalid selection. Please choose an option between 1 and 4.')), 'Must handle invalid choice');
-  assert(vmsLogs.some(l => l.includes('Returning to POSIND main menu...')), 'Option 4 must exit VMS menu loop');
+  assert(vmsLogs.some(l => l.includes('2. Create Multiple Service Catalogs')), 'Must list Option 2: Create Multiple Service Catalogs');
+  assert(vmsLogs.some(l => l.includes('3. Manage Existing Service Catalogs')), 'Must list Option 3: Manage Existing Service Catalogs');
+  assert(vmsLogs.some(l => l.includes('4. Add Routes to Existing Catalog')), 'Must list Option 4: Add Routes to Existing Catalog');
+  assert(vmsLogs.some(l => l.includes('5. Return to Main Menu')), 'Must list Option 5: Return to Main Menu');
+  assert(vmsLogs.some(l => l.includes('Invalid selection. Please choose an option between 1 and 5.')), 'Must handle invalid choice');
+  assert(vmsLogs.some(l => l.includes('Returning to POSIND main menu...')), 'Option 5 must exit VMS menu loop');
   console.log('  [PASS] Direct VMS menu options, input validation, and return navigation verified.');
 
-  // 2. Full main menu loop integration with Headed browser mode: Main Menu (4) -> VMS Menu -> Return (4) -> Main Menu (5) Exit
-  const headedMockRl = createMockRl(['4', 'invalid', '4', '5']);
+  // 2. Full main menu loop integration with Headed browser mode: Main Menu (4) -> VMS Menu -> Return (5) -> Main Menu (5) Exit
+  const headedMockRl = createMockRl(['4', 'invalid', '5', '5']);
   const headedLogs = [];
   const origLogHeaded = console.log;
   console.log = (...args) => {
@@ -3041,7 +3102,7 @@ async function runBotTests() {
   console.log('  [PASS] Full CLI navigation with Headed browser mode verified.');
 
   // 3. Headless browser mode verification
-  const headlessMockRl = createMockRl(['4', '4', '5']);
+  const headlessMockRl = createMockRl(['4', '5', '5']);
   const headlessLogs = [];
   const origLogHeadless = console.log;
   console.log = (...args) => {
@@ -3210,6 +3271,151 @@ async function runBotTests() {
 
   await pageMockPort.close();
   await portBrowser.close();
+
+  // ==========================================
+  // Test 79: OMS Environment Selection, Propagation & History Tagging
+  // ==========================================
+  console.log('\n[Test 79] Testing OMS Environment Selection, Propagation & History Tagging...');
+
+  // 1. Centralized Environment Configuration Verification
+  assert(OMS_ENVIRONMENTS['Smart Routing'], 'Must define Smart Routing environment');
+  assert.strictEqual(OMS_ENVIRONMENTS['Smart Routing'].baseUrl, 'https://sr-pos-oms-web.nisims.web.id');
+  assert.strictEqual(OMS_ENVIRONMENTS['Smart Routing'].apiEndpoint, 'https://sr-pos-oms-api.nisims.web.id/api/v1');
+
+  assert(OMS_ENVIRONMENTS['Staging'], 'Must define Staging environment');
+  assert.strictEqual(OMS_ENVIRONMENTS['Staging'].baseUrl, 'https://pos-oms-staging-web.nisims.web.id/sr');
+  assert.strictEqual(OMS_ENVIRONMENTS['Staging'].apiEndpoint, 'https://pos-oms-staging-api.nisims.web.id/api/v1');
+
+  const envList = getOmsEnvironmentList();
+  assert.strictEqual(envList.length, 2, 'Must list exactly 2 environments');
+  assert.strictEqual(envList[0].name, 'Smart Routing', 'Environment 1 must be Smart Routing');
+  assert.strictEqual(envList[1].name, 'Staging', 'Environment 2 must be Staging');
+  console.log('  [PASS] Centralized OMS environment definitions and exact ordering verified.');
+
+  // 2. Strict Environment Resolution & No Silent Fallback
+  assert.strictEqual(resolveOmsEnvironment('1').name, 'Smart Routing');
+  assert.strictEqual(resolveOmsEnvironment('Smart Routing').name, 'Smart Routing');
+  assert.strictEqual(resolveOmsEnvironment('smart-routing').name, 'Smart Routing');
+  assert.strictEqual(resolveOmsEnvironment('https://sr-pos-oms-web.nisims.web.id').name, 'Smart Routing');
+
+  assert.strictEqual(resolveOmsEnvironment('2').name, 'Staging');
+  assert.strictEqual(resolveOmsEnvironment('Staging').name, 'Staging');
+  assert.strictEqual(resolveOmsEnvironment('staging').name, 'Staging');
+  assert.strictEqual(resolveOmsEnvironment('https://pos-oms-staging-web.nisims.web.id/sr').name, 'Staging');
+
+  // Verify non-existent / invalid environments return null (never silently fall back)
+  assert.strictEqual(resolveOmsEnvironment('3'), null, 'Selection 3 must be null');
+  assert.strictEqual(resolveOmsEnvironment('0'), null, 'Selection 0 must be null');
+  assert.strictEqual(resolveOmsEnvironment('production'), null, 'Production must be null');
+  assert.strictEqual(resolveOmsEnvironment('dev'), null, 'Dev must be null');
+  assert.strictEqual(resolveOmsEnvironment(''), null, 'Empty string must be null');
+  assert.strictEqual(resolveOmsEnvironment(null), null, 'Null must return null');
+  console.log('  [PASS] Strict environment resolution and absence of silent fallback verified.');
+
+  // 3. Exact CLI Menu Banner Formatting
+  const menuBanner = formatEnvironmentSelectionMenu();
+  const expectedBanner = [
+    '========================================',
+    'Select OMS Environment',
+    '========================================',
+    '1. Smart Routing',
+    '2. Staging',
+    '========================================',
+  ].join('\n');
+  assert.strictEqual(menuBanner, expectedBanner, 'CLI menu banner must match exact specified layout');
+  console.log('  [PASS] Exact CLI environment selection menu banner format verified.');
+
+  // 4. Interactive CLI Prompt & Re-prompting on Invalid Input
+  const mockRlEnv = createMockRl(['invalid', '99', '', '2']);
+  const chosenEnv = await promptOmsEnvironment(mockRlEnv);
+  assert.strictEqual(chosenEnv.name, 'Staging');
+  assert.strictEqual(chosenEnv.baseUrl, 'https://pos-oms-staging-web.nisims.web.id/sr');
+
+  const mockRlEnv1 = createMockRl(['1']);
+  const chosenEnv1 = await promptOmsEnvironment(mockRlEnv1);
+  assert.strictEqual(chosenEnv1.name, 'Smart Routing');
+  console.log('  [PASS] promptOmsEnvironment input validation, re-prompting, and selection verified.');
+
+  // 5. Execution Context Creation & Session Separation
+  const srContext = createExecutionContext('Smart Routing');
+  assert.strictEqual(srContext.environment, 'Smart Routing');
+  assert.strictEqual(srContext.omsUrl, 'https://sr-pos-oms-web.nisims.web.id');
+  assert.strictEqual(srContext.apiEndpoint, 'https://sr-pos-oms-api.nisims.web.id/api/v1');
+  assert(srContext.sessionPath.includes('smart-routing'), 'Smart routing must use smart-routing session file');
+
+  const stagingContext = createExecutionContext('Staging');
+  assert.strictEqual(stagingContext.environment, 'Staging');
+  assert.strictEqual(stagingContext.omsUrl, 'https://pos-oms-staging-web.nisims.web.id/sr');
+  assert.strictEqual(stagingContext.apiEndpoint, 'https://pos-oms-staging-api.nisims.web.id/api/v1');
+  assert.strictEqual(stagingContext.username, 'kevin.d.imas@gmail.com', 'Staging context must use kevin.d.imas@gmail.com');
+  assert.strictEqual(stagingContext.password, '@Admin123!', 'Staging context must use @Admin123!');
+  assert(stagingContext.sessionPath.includes('staging-oms'), 'Staging must use staging-oms session file');
+  assert.notStrictEqual(srContext.sessionPath, stagingContext.sessionPath, 'Sessions must be completely independent');
+
+  // Verify invalid context creation throws
+  assert.throws(() => {
+    createExecutionContext('InvalidEnvironment');
+  }, /Invalid OMS environment/);
+  console.log('  [PASS] createExecutionContext with isolated sessions and endpoints verified.');
+
+  // 6. Batch Worker Environment Inheritance & Validation
+  // Invalid environment in batch must fail immediately
+  await assert.rejects(async () => {
+    await executeBatch([], { environment: 'NonExistentEnv' });
+  }, /Invalid OMS environment/);
+
+  // Normal batch retains environment metadata
+  const mockBatchResult = await executeBatch([], { environment: 'Staging' });
+  assert.strictEqual(mockBatchResult.environment, 'Staging');
+  assert.strictEqual(mockBatchResult.environmentUrl, 'https://pos-oms-staging-web.nisims.web.id/sr');
+  console.log('  [PASS] executeBatch environment validation and metadata attachment verified.');
+
+  // 7. Execution History Persistence and View History Display with Environment Tagging
+  const savedRecordStaging = saveExecutionRecord({
+    environment: 'Staging',
+    environmentUrl: 'https://pos-oms-staging-web.nisims.web.id/sr',
+    request: 'Test staging order',
+    menuOption: 'Single Order + Payment',
+    orderType: 'domestic',
+    batchCount: 1,
+    summary: { total: 1, succeeded: 1, failed: 0, totalAmountPaid: 50000 },
+    orders: [{
+      index: 1,
+      label: 'Order #1',
+      orderId: 'STG12345',
+      shipmentId: 'SHIP12345',
+      amount: 50000,
+      vaNumber: '99990001',
+      status: 'SUCCESS',
+      environment: 'Staging',
+      environmentUrl: 'https://pos-oms-staging-web.nisims.web.id/sr',
+    }],
+  });
+
+  assert.strictEqual(savedRecordStaging.environment, 'Staging');
+  assert.strictEqual(savedRecordStaging.environmentUrl, 'https://pos-oms-staging-web.nisims.web.id/sr');
+  assert.strictEqual(savedRecordStaging.orders[0].environment, 'Staging');
+
+  // Verify listExecutionRecords retrieves the environment
+  const recentRecords = listExecutionRecords(5);
+  const foundStg = recentRecords.find(r => r.id === savedRecordStaging.id);
+  assert(foundStg, 'Saved staging record must be retrieved in history');
+  assert.strictEqual(foundStg.environment, 'Staging');
+
+  // Verify handleViewHistory displays Environment
+  const histRl = createMockRl(['']);
+  const histLogs = [];
+  const origHistLog = console.log;
+  console.log = (...args) => {
+    histLogs.push(args.join(' '));
+    origHistLog(...args);
+  };
+  await handleViewHistory(histRl);
+  console.log = origHistLog;
+
+  assert(histLogs.some(l => l.includes('Environment: Staging (https://pos-oms-staging-web.nisims.web.id/sr)')), 'View history must display Environment header');
+  assert(histLogs.some(l => l.includes('[Staging] Order: STG12345')), 'View history must tag order with [Staging]');
+  console.log('  [PASS] Execution history persistence and handleViewHistory environment display verified.');
 
   console.log('\n>>> ALL POSIND ORDERING BOT TESTS PASSED SUCCESSFULLY! <<<');
 }

@@ -43,6 +43,8 @@ function saveExecutionRecord(data) {
   const record = {
     id,
     timestamp: new Date().toISOString(),
+    environment: data.environment || 'Smart Routing',
+    environmentUrl: data.environmentUrl || '',
     request: data.request || '',
     menuOption: data.menuOption || '',
     orderType: data.orderType || 'domestic',
@@ -52,6 +54,8 @@ function saveExecutionRecord(data) {
     orders: (data.orders || []).map(o => ({
       index: o.index,
       label: o.label,
+      environment: o.environment || data.environment || 'Smart Routing',
+      environmentUrl: o.environmentUrl || data.environmentUrl || '',
       orderId: o.orderId,
       shipmentId: o.shipmentId,
       amount: o.amount,

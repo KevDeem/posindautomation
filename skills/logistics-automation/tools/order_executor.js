@@ -48,6 +48,10 @@ const {
   validatePIC,
   normalizeCountry,
 } = require('./pic_manager');
+const {
+  resolveOmsEnvironment,
+  OMS_ENVIRONMENTS,
+} = require('../config/oms_environments');
 
 const DEFAULT_SESSION_PATH = path.resolve(__dirname, '../../../.sessions/staging-oms_kevin_d_imas_gmail_com_session.json');
 const DEFAULT_INTL_PIC_ATTACHMENT_PATH = '/Users/kevin/Downloads/WhatsApp Image 2026-05-29 at 15.30.23.jpeg';
@@ -105,7 +109,7 @@ async function selectAntLocationOption(page, dialog, fieldId, searchTerm, matchR
   await container.click();
   await page.waitForTimeout(300);
 
-  // 3. Type search term using pressSequentially if provided
+  // 3. Insert location search query directly using fill()
   let query = searchTerm ? getSearchTerm(searchTerm) : '';
   if (/jakarta/i.test(query)) query = 'Jakarta';
   if (/surabaya/i.test(query)) query = 'Surabaya';
@@ -114,9 +118,8 @@ async function selectAntLocationOption(page, dialog, fieldId, searchTerm, matchR
 
   if (query && String(query).trim() !== '') {
     await input.click();
-    await input.fill('');
-    await input.pressSequentially(query, { delay: 60 });
-    await page.waitForTimeout(600);
+    await input.fill(query);
+    await page.waitForTimeout(400);
   }
 
   // 4. Locate active dropdown
@@ -319,10 +322,9 @@ async function selectAntAutocompleteOption(page, containerLocator, searchTerm, p
   const input = containerLocator.locator('input');
   if (localityQuery && await input.count() > 0) {
     await input.click();
-    await input.fill('');
-    await input.pressSequentially(localityQuery, { delay: 60 });
+    await input.fill(localityQuery);
     // Wait for dropdown rendering / debounce
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(500);
   }
 
   const dropdown = page.locator('.ant-select-dropdown:not(.ant-select-dropdown-hidden)').filter({
@@ -2949,9 +2951,29 @@ async function executeOrder(inputSpecification = {}, options = {}) {
     throw new Error(`Order specification cannot be executed. Missing mandatory fields: ${missingMandatory.join(', ')}`);
   }
 
+  let resolvedEnv = null;
+  if (options.environment) {
+    resolvedEnv = resolveOmsEnvironment(options.environment);
+    if (!resolvedEnv) {
+      throw new Error(`[OrderExecutor] Invalid OMS environment: "${options.environment}". Valid environments are: Smart Routing, Staging.`);
+    }
+  } else if (options.omsUrl) {
+    resolvedEnv = resolveOmsEnvironment(options.omsUrl);
+  }
+
+  const defaultBaseUrl = OMS_ENVIRONMENTS['Smart Routing']?.baseUrl || 'https://sr-pos-oms-web.nisims.web.id';
+  const omsUrl = (options.omsUrl || (resolvedEnv ? resolvedEnv.baseUrl : defaultBaseUrl)).replace(/\/+$/, '');
+  const envName = resolvedEnv ? resolvedEnv.name : (options.environment || 'Smart Routing');
+
+  const executionOptions = {
+    ...options,
+    environment: envName,
+    omsUrl,
+  };
+
   const headless = options.headless === true;
   const sessionPath = options.sessionPath || DEFAULT_SESSION_PATH;
-  console.log(`[OrderExecutor] Executing ${resolvedSpec.orderType} order (Browser Mode: ${headless ? 'Headless (background)' : 'Headed (visible browser)'})`);
+  console.log(`[OrderExecutor] Executing ${resolvedSpec.orderType} order on ${envName} (${omsUrl}) (Browser Mode: ${headless ? 'Headless (background)' : 'Headed (visible browser)'})`);
 
   let browser = options.existingBrowser;
   let context = options.existingContext;
@@ -2974,18 +2996,20 @@ async function executeOrder(inputSpecification = {}, options = {}) {
   try {
     if (!options.skipLogin) {
       await performFreshLogin(page, context, {
-        ...options,
+        ...executionOptions,
         sessionPath,
       });
     }
 
     if (resolvedSpec.orderType === 'international') {
-      result = await executeInternationalOrderUI(page, resolvedSpec, options);
+      result = await executeInternationalOrderUI(page, resolvedSpec, executionOptions);
     } else {
-      result = await executeDomesticOrderUI(page, resolvedSpec, options);
+      result = await executeDomesticOrderUI(page, resolvedSpec, executionOptions);
     }
 
     result.success = true;
+    result.environment = envName;
+    result.environmentUrl = omsUrl;
     result.specification = resolvedSpec;
 
     // Save successful specification as remembered baseline
@@ -2998,6 +3022,8 @@ async function executeOrder(inputSpecification = {}, options = {}) {
       orderId: null,
       shipmentId: null,
       amount: null,
+      environment: envName,
+      environmentUrl: omsUrl,
       status: 'FAILED',
       error: err.message,
       diagnostic: err.diagnostic || page._lastDiagnostic || null,

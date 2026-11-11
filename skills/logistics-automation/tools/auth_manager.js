@@ -13,6 +13,11 @@
 
 const fs = require('fs');
 const path = require('path');
+const {
+  resolveOmsEnvironment,
+  OMS_ENVIRONMENTS,
+  getOmsCredentials,
+} = require('../config/oms_environments');
 
 const ROOT_DIR = path.resolve(__dirname, '../../..');
 const SCREENSHOTS_DIR = path.join(ROOT_DIR, '.artifacts/screenshots');
@@ -43,18 +48,31 @@ async function captureScreenshot(page, prefix = 'auth_error') {
  * @param {import('playwright').BrowserContext} context
  * @param {Object} options
  * @param {string} [options.omsUrl]
+ * @param {string} [options.environment]
  * @param {string} [options.username]
  * @param {string} [options.password]
  * @param {string} [options.sessionPath]
  * @returns {Promise<boolean>}
  */
 async function performFreshLogin(page, context, options = {}) {
-  const omsUrl = (options.omsUrl || 'https://sr-pos-oms-web.nisims.web.id').replace(/\/+$/, '');
-  const username = options.username || process.env.OMS_USERNAME || 'kev.indimas@gmail.com';
-  const password = options.password || process.env.OMS_PASSWORD || '@Admin123.';
+  let resolvedEnv = null;
+  if (options.environment) {
+    resolvedEnv = resolveOmsEnvironment(options.environment);
+    if (!resolvedEnv) {
+      throw new Error(`[Authentication] Invalid OMS environment: "${options.environment}". Valid environments are: Smart Routing, Staging.`);
+    }
+  } else if (options.omsUrl) {
+    resolvedEnv = resolveOmsEnvironment(options.omsUrl);
+  }
+
+  const envName = resolvedEnv ? resolvedEnv.name : (options.environment || 'Smart Routing');
+  const omsUrl = (options.omsUrl || (resolvedEnv ? resolvedEnv.baseUrl : OMS_ENVIRONMENTS['Smart Routing'].baseUrl)).replace(/\/+$/, '');
+  const envCreds = getOmsCredentials(resolvedEnv || options.environment || omsUrl);
+  const username = options.username || envCreds.username;
+  const password = options.password || envCreds.password;
   const sessionPath = options.sessionPath;
 
-  console.log('[Authentication] Starting fresh OMS login...');
+  console.log(`[Authentication] Starting fresh OMS login... (${envName}: ${omsUrl})`);
 
   // 1. Clear any existing cookies to avoid stale session interference
   if (context && typeof context.clearCookies === 'function') {
@@ -188,7 +206,18 @@ async function performFreshLogin(page, context, options = {}) {
  * @returns {Promise<boolean>}
  */
 async function navigateToShippingPage(page, orderType = 'domestic', options = {}) {
-  const omsUrl = (options.omsUrl || 'https://sr-pos-oms-web.nisims.web.id').replace(/\/+$/, '');
+  let resolvedEnv = null;
+  if (options.environment) {
+    resolvedEnv = resolveOmsEnvironment(options.environment);
+    if (!resolvedEnv) {
+      throw new Error(`[Navigation] Invalid OMS environment: "${options.environment}". Valid environments are: Smart Routing, Staging.`);
+    }
+  } else if (options.omsUrl) {
+    resolvedEnv = resolveOmsEnvironment(options.omsUrl);
+  }
+
+  const defaultBaseUrl = OMS_ENVIRONMENTS['Smart Routing']?.baseUrl || 'https://sr-pos-oms-web.nisims.web.id';
+  const omsUrl = (options.omsUrl || (resolvedEnv ? resolvedEnv.baseUrl : defaultBaseUrl)).replace(/\/+$/, '');
   const isIntl = orderType === 'international';
   const targetUrl = isIntl ? `${omsUrl}/international-shipping` : `${omsUrl}/domestic-shipping`;
   const workflowName = isIntl ? 'International Shipping' : 'Domestic Shipping';
