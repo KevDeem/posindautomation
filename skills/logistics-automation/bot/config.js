@@ -50,12 +50,18 @@ function createExecutionContext(envInput, overrides = {}) {
 
   const base = loadConfig();
   const sessionFileName = `${resolvedEnv.sessionFilePrefix}_kevin_d_imas_gmail_com_session.json`;
-  const envCreds = getOmsCredentials(resolvedEnv);
+  let username = overrides.username;
+  let password = overrides.password;
+  if (!username || !password) {
+    const envCreds = getOmsCredentials(resolvedEnv);
+    if (!username) username = envCreds.username;
+    if (!password) password = envCreds.password;
+  }
 
   return {
     ...base,
-    username: overrides.username || envCreds.username,
-    password: overrides.password || envCreds.password,
+    username,
+    password,
     ...overrides,
     environment: resolvedEnv.name,
     environmentKey: resolvedEnv.key,
@@ -93,9 +99,17 @@ function loadConfig(options = {}) {
     ? path.join(ROOT_DIR, '.sessions', `${resolvedEnv.sessionFilePrefix}_kevin_d_imas_gmail_com_session.json`)
     : DEFAULT_CONFIG.sessionPath;
 
-  const envCreds = getOmsCredentials(resolvedEnv || environment);
-  const username = options.username || fileConfig.username || envCreds.username;
-  const password = options.password || fileConfig.password || envCreds.password;
+  let username = options.username || fileConfig.username;
+  let password = options.password || fileConfig.password;
+  if (!username || !password) {
+    try {
+      const envCreds = getOmsCredentials(resolvedEnv || environment);
+      if (!username) username = envCreds.username;
+      if (!password) password = envCreds.password;
+    } catch (e) {
+      // If credentials missing and not provided in options, keep them null/undefined until explicitly needed
+    }
+  }
 
   return {
     ...DEFAULT_CONFIG,

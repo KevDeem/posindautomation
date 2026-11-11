@@ -67,9 +67,13 @@ async function performFreshLogin(page, context, options = {}) {
 
   const envName = resolvedEnv ? resolvedEnv.name : (options.environment || 'Smart Routing');
   const omsUrl = (options.omsUrl || (resolvedEnv ? resolvedEnv.baseUrl : OMS_ENVIRONMENTS['Smart Routing'].baseUrl)).replace(/\/+$/, '');
-  const envCreds = getOmsCredentials(resolvedEnv || options.environment || omsUrl);
-  const username = options.username || envCreds.username;
-  const password = options.password || envCreds.password;
+  let username = options.username;
+  let password = options.password;
+  if (!username || !password) {
+    const envCreds = getOmsCredentials(resolvedEnv || options.environment || omsUrl);
+    if (!username) username = envCreds.username;
+    if (!password) password = envCreds.password;
+  }
   const sessionPath = options.sessionPath;
 
   console.log(`[Authentication] Starting fresh OMS login... (${envName}: ${omsUrl})`);

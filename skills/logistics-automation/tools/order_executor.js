@@ -1768,6 +1768,7 @@ async function executeDomesticOrderUI(page, spec, options = {}) {
     throw new Error('Order ID could not be identified after final submission in OMS UI.');
   }
 
+  result.orderType = 'domestic';
   result.status = 'CREATED';
   console.log(`[${name}] Order successfully created: ${result.orderId} (Shipment: ${result.shipmentId}, Amount: Rp${result.amount})`);
   return result;
@@ -2003,6 +2004,7 @@ async function executeInternationalOrderUI(page, spec, options = {}) {
     }
   }
 
+  result.orderType = 'international';
   if (result.orderId) {
     result.status = 'CREATED';
     console.log(`[${name}] International Order successfully created: ${result.orderId} (Shipment: ${result.shipmentId || 'N/A'}, Amount: Rp${result.amount || 'N/A'})`);
@@ -3008,6 +3010,7 @@ async function executeOrder(inputSpecification = {}, options = {}) {
     }
 
     result.success = true;
+    result.orderType = resolvedSpec.orderType;
     result.environment = envName;
     result.environmentUrl = omsUrl;
     result.specification = resolvedSpec;

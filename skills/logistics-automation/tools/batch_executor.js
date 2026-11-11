@@ -299,8 +299,11 @@ async function executeBatchWorkerItem(item, index, totalItems, browser, options 
           orderId: orderRecord.orderId,
           shipmentId: orderRecord.shipmentId,
           amount: orderRecord.amount,
+          orderType: resolvedSpec.orderType || createResult.orderType || orderRecord.orderType,
+          specification: resolvedSpec,
         }, {
           ...options,
+          orderType: resolvedSpec.orderType || createResult.orderType || orderRecord.orderType,
           headless,
           sandboxUrl: options.sandboxUrl,
           apiEndpoint: options.apiEndpoint,

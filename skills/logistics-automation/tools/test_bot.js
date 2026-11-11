@@ -749,6 +749,43 @@ async function runBotTests() {
   assert.strictEqual(await pageMethod.locator('text=81026749').isVisible(), true, 'Screen must show payment instructions after save');
   console.log('  [PASS] Pospay selection and payment method saving verified.');
 
+  // Test 30b: International Order: Pospay selection & Simpan Detail Pengiriman
+  console.log('\n[Test 30b] Testing International Order: Pospay selection & Simpan Detail Pengiriman...');
+  const pageMethodIntl = await contextPay.newPage();
+  await pageMethodIntl.setContent(`
+    <html>
+      <body>
+        <h2>Pilih Metode Pembayaran</h2>
+        <button id="radio-container" class="p-[16px] cursor-pointer">
+          <input type="radio" id="PTMI_INTL_123" name="payment_channel">
+          <span>pospay</span>
+          <p>Pembayaran menggunakan aplikasi pospay</p>
+        </button>
+        <button id="btn-back">Kembali</button>
+        <button id="btn-simpan-detail" class="primary-btn">Simpan Detail Pengiriman &gt;</button>
+        <script>
+          window.intlDetailSaved = false;
+          document.getElementById('btn-simpan-detail').addEventListener('click', () => {
+            window.intlDetailSaved = true;
+            document.body.innerHTML = '<h2>Instruksi Pembayaran</h2><span>VA : 99887766</span><p>Total Biaya Rp1.690.500</p>';
+          });
+        </script>
+      </body>
+    </html>
+  `);
+
+  const pospayRadioIntl = pageMethodIntl.locator('#radio-container, input[type="radio"]').first();
+  assert.strictEqual(await pospayRadioIntl.isVisible(), true, 'Pospay option must be visible');
+  await pospayRadioIntl.click();
+  const simpanDetailBtn = pageMethodIntl.locator('button:has-text("Simpan Detail Pengiriman")').first();
+  assert.strictEqual(await simpanDetailBtn.isVisible(), true, 'Simpan Detail Pengiriman button must be visible for international payment');
+  await simpanDetailBtn.click();
+  await pageMethodIntl.waitForTimeout(200);
+  const isIntlSaved = await pageMethodIntl.evaluate(() => window.intlDetailSaved);
+  assert.strictEqual(isIntlSaved, true, 'Simpan Detail Pengiriman must trigger save for international order');
+  assert.strictEqual(await pageMethodIntl.locator('text=99887766').isVisible(), true, 'Screen must show payment instructions after save');
+  console.log('  [PASS] International order Simpan Detail Pengiriman payment method save verified.');
+
   // Test 31: Dedicated VA extraction & strict assertion
   console.log('\n[Test 31] Testing Dedicated VA extraction & strict assertion...');
   const pageVa = await contextPay.newPage();
@@ -858,6 +895,44 @@ async function runBotTests() {
   assert.strictEqual(execSuccessResult.paymentStatus, 'PAYMENT_VERIFIED', 'Status must be PAYMENT_VERIFIED');
   assert.strictEqual(execSuccessResult.overallStatus, 'SUCCESS', 'Overall status must be SUCCESS');
   console.log('  [PASS] Successful API payment execution verified without OMS paid requirement.');
+
+  // Successful API payment for International Order with Simpan Detail Pengiriman
+  const mockPagePayIntl = await contextPay.newPage();
+  await mockPagePayIntl.setContent(`
+    <html>
+      <body>
+        <h2>Pilih Metode Pembayaran</h2>
+        <button id="radio-container" class="p-[16px] cursor-pointer">
+          <input type="radio" id="PTMI_INTL_E2E" name="payment_channel">
+          <span>pospay</span>
+          <p>Pembayaran menggunakan aplikasi pospay</p>
+        </button>
+        <button id="btn-back">Kembali</button>
+        <button id="btn-simpan-detail" class="primary-btn">Simpan Detail Pengiriman &gt;</button>
+        <script>
+          document.getElementById('btn-simpan-detail').addEventListener('click', () => {
+            document.body.innerHTML = '<h2>Instruksi Pembayaran</h2><span>VA : 77665544</span><p>Total Tagihan Rp1.690.500</p>';
+          });
+        </script>
+      </body>
+    </html>
+  `);
+
+  const execIntlSuccessResult = await executeOrderPayment(mockPagePayIntl, contextPay, {
+    orderId: 'ORCA1794381901647',
+    shipmentId: 'SOCB1794381901837',
+    amount: 1690500,
+    orderType: 'international',
+  }, {
+    fetchFn: mockFetchSuccess,
+  });
+
+  assert.strictEqual(execIntlSuccessResult.vaNumber, '77665544', 'VA must be generated via Simpan Detail Pengiriman');
+  assert.strictEqual(execIntlSuccessResult.amount, 1690500, 'Amount must be matched');
+  assert.strictEqual(execIntlSuccessResult.sandboxResult, 'SUCCESS', 'Payment result must be SUCCESS');
+  assert.strictEqual(execIntlSuccessResult.paymentStatus, 'PAYMENT_VERIFIED', 'Status must be PAYMENT_VERIFIED');
+  assert.strictEqual(execIntlSuccessResult.overallStatus, 'SUCCESS', 'Overall status must be SUCCESS');
+  console.log('  [PASS] Successful international order payment execution with Simpan Detail Pengiriman verified.');
 
   // Failed API payment
   const mockFetchFailure = async () => ({
@@ -3337,20 +3412,49 @@ async function runBotTests() {
   console.log('  [PASS] promptOmsEnvironment input validation, re-prompting, and selection verified.');
 
   // 5. Execution Context Creation & Session Separation
+  // Verify missing credentials fail safely
+  const originalEnv = { ...process.env };
+  delete process.env.OMS_USERNAME;
+  delete process.env.OMS_PASSWORD;
+  delete process.env.OMS_STAGING_USERNAME;
+  delete process.env.OMS_STAGING_PASSWORD;
+  delete process.env.OMS_SMARTROUTING_USERNAME;
+  delete process.env.OMS_SMARTROUTING_PASSWORD;
+
+  assert.throws(() => {
+    createExecutionContext('Staging');
+  }, /Missing required credentials for environment "Staging"/);
+
+  assert.throws(() => {
+    createExecutionContext('Smart Routing');
+  }, /Missing required credentials for environment "Smart Routing"/);
+
+  // Set mock environment variables for testing context creation
+  process.env.OMS_STAGING_USERNAME = 'staging_tester@example.com';
+  process.env.OMS_STAGING_PASSWORD = 'staging_secret_mock';
+  process.env.OMS_SMARTROUTING_USERNAME = 'sr_tester@example.com';
+  process.env.OMS_SMARTROUTING_PASSWORD = 'sr_secret_mock';
+
   const srContext = createExecutionContext('Smart Routing');
   assert.strictEqual(srContext.environment, 'Smart Routing');
   assert.strictEqual(srContext.omsUrl, 'https://sr-pos-oms-web.nisims.web.id');
   assert.strictEqual(srContext.apiEndpoint, 'https://sr-pos-oms-api.nisims.web.id/api/v1');
+  assert.strictEqual(srContext.username, 'sr_tester@example.com');
+  assert.strictEqual(srContext.password, 'sr_secret_mock');
   assert(srContext.sessionPath.includes('smart-routing'), 'Smart routing must use smart-routing session file');
 
   const stagingContext = createExecutionContext('Staging');
   assert.strictEqual(stagingContext.environment, 'Staging');
   assert.strictEqual(stagingContext.omsUrl, 'https://pos-oms-staging-web.nisims.web.id/sr');
   assert.strictEqual(stagingContext.apiEndpoint, 'https://pos-oms-staging-api.nisims.web.id/api/v1');
-  assert.strictEqual(stagingContext.username, 'kevin.d.imas@gmail.com', 'Staging context must use kevin.d.imas@gmail.com');
-  assert.strictEqual(stagingContext.password, '@Admin123!', 'Staging context must use @Admin123!');
+  assert.strictEqual(stagingContext.username, 'staging_tester@example.com');
+  assert.strictEqual(stagingContext.password, 'staging_secret_mock');
   assert(stagingContext.sessionPath.includes('staging-oms'), 'Staging must use staging-oms session file');
   assert.notStrictEqual(srContext.sessionPath, stagingContext.sessionPath, 'Sessions must be completely independent');
+
+  // Restore original environment
+  Object.keys(process.env).forEach(k => { if (!(k in originalEnv)) delete process.env[k]; });
+  Object.assign(process.env, originalEnv);
 
   // Verify invalid context creation throws
   assert.throws(() => {

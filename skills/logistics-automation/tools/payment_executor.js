@@ -134,7 +134,13 @@ async function executeOrderPayment(page, context, orderResult = {}, options = {}
   const {
     orderId,
     shipmentId,
+    orderType,
+    specification,
   } = orderResult;
+
+  const isInternational = (orderType === 'international') ||
+                          (options.orderType === 'international') ||
+                          (specification && specification.orderType === 'international');
 
   let resolvedEnv = null;
   if (options.environment) {
@@ -313,12 +319,30 @@ async function executeOrderPayment(page, context, orderResult = {}, options = {}
         await page.waitForTimeout(500);
       }
 
-      const simpanMetodeBtn = page.getByRole('button', { name: /simpan metode pembayaran/i })
-        .or(page.locator('button:has-text("Simpan Metode Pembayaran")')).first();
-      await simpanMetodeBtn.waitFor({ state: 'visible', timeout: 15000 });
-      console.log(`[Payment:Step B] Clicking 'Simpan Metode Pembayaran'...`);
-      await simpanMetodeBtn.click();
+      // In international orders, the button is 'Simpan Detail Pengiriman'; in domestic orders, 'Simpan Metode Pembayaran'
+      const intlSaveLocator = page.getByRole('button', { name: /simpan detail pengiriman/i })
+        .or(page.locator('button:has-text("Simpan Detail Pengiriman")'));
+      const domesticSaveLocator = page.getByRole('button', { name: /simpan metode pembayaran/i })
+        .or(page.locator('button:has-text("Simpan Metode Pembayaran")'));
+
+      const simpanBtn = isInternational
+        ? intlSaveLocator.or(domesticSaveLocator).first()
+        : domesticSaveLocator.or(intlSaveLocator).first();
+
+      const buttonLabel = isInternational ? 'Simpan Detail Pengiriman' : 'Simpan Metode Pembayaran';
+      console.log(`[Payment:Step B] Waiting for '${buttonLabel}' button (${isInternational ? 'International' : 'Domestic'} order)...`);
+      await simpanBtn.waitFor({ state: 'visible', timeout: 15000 });
+      console.log(`[Payment:Step B] Clicking '${buttonLabel}'...`);
+      await simpanBtn.click();
       await page.waitForTimeout(4000);
+
+      // Check if confirmation modal dialog appears (e.g., 'Iya, Simpan' or 'Konfirmasi')
+      const confirmModalBtn = page.getByRole('button', { name: /iya|ya,\s*simpan|konfirmasi|lanjut/i }).first();
+      if (await confirmModalBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        console.log(`[Payment:Step B] Confirming payment modal dialog...`);
+        await confirmModalBtn.click();
+        await page.waitForTimeout(3000);
+      }
 
       paymentResult.paymentStatus = 'PAYMENT_METHOD_SELECTED';
     } else {
