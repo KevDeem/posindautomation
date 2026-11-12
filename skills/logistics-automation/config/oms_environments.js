@@ -11,6 +11,47 @@
  * - VMS workflows and configurations are completely independent and unmodified.
  */
 
+const fs = require('fs');
+const path = require('path');
+
+/**
+ * Automatically load environment variables from .env if present in workspace root
+ * Does not overwrite existing process.env variables.
+ */
+function loadDotEnv() {
+  const envCandidates = [
+    path.resolve(process.cwd(), '.env'),
+    path.resolve(__dirname, '../../../.env'),
+  ];
+  for (const envPath of envCandidates) {
+    if (fs.existsSync(envPath)) {
+      try {
+        const content = fs.readFileSync(envPath, 'utf8');
+        content.split('\n').forEach(line => {
+          const trimmed = line.trim();
+          if (trimmed && !trimmed.startsWith('#')) {
+            const idx = trimmed.indexOf('=');
+            if (idx > -1) {
+              const k = trimmed.slice(0, idx).trim();
+              let v = trimmed.slice(idx + 1).trim();
+              if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+                v = v.slice(1, -1);
+              }
+              if (k && process.env[k] === undefined) {
+                process.env[k] = v;
+              }
+            }
+          }
+        });
+        break;
+      } catch (_) {}
+    }
+  }
+}
+
+// Ensure .env is read if present
+loadDotEnv();
+
 const OMS_ENVIRONMENTS = Object.freeze({
   'Smart Routing': Object.freeze({
     name: 'Smart Routing',
