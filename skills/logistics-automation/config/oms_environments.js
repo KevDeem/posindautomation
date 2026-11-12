@@ -2,8 +2,8 @@
  * Centralized OMS Environment Configuration & Resolver
  * 
  * Configures the supported OMS environments:
- * 1. Smart Routing: https://sr-pos-oms-web.nisims.web.id
- * 2. Staging:       https://pos-oms-staging-web.nisims.web.id/sr
+ * 1. Smart Routing: https://pos-oms-staging-web.nisims.web.id/sr
+ * 2. Staging:       https://pos-oms-staging-web.nisims.web.id
  * 
  * Strict separation:
  * - Credentials are kept strictly separate from environment definitions.
@@ -56,7 +56,7 @@ const OMS_ENVIRONMENTS = Object.freeze({
   'Smart Routing': Object.freeze({
     name: 'Smart Routing',
     key: 'smart-routing',
-    baseUrl: 'https://sr-pos-oms-web.nisims.web.id',
+    baseUrl: 'https://pos-oms-staging-web.nisims.web.id/sr',
     apiEndpoint: 'https://sr-pos-oms-api.nisims.web.id/api/v1',
     description: 'Smart Routing OMS Environment',
     sessionFilePrefix: 'smart-routing',
@@ -64,7 +64,7 @@ const OMS_ENVIRONMENTS = Object.freeze({
   'Staging': Object.freeze({
     name: 'Staging',
     key: 'staging',
-    baseUrl: 'https://pos-oms-staging-web.nisims.web.id/sr',
+    baseUrl: 'https://pos-oms-staging-web.nisims.web.id',
     apiEndpoint: 'https://pos-oms-staging-api.nisims.web.id/api/v1',
     description: 'POSIND OMS Staging Environment',
     sessionFilePrefix: 'staging-oms',

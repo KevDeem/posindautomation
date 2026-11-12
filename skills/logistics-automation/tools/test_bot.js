@@ -3354,11 +3354,11 @@ async function runBotTests() {
 
   // 1. Centralized Environment Configuration Verification
   assert(OMS_ENVIRONMENTS['Smart Routing'], 'Must define Smart Routing environment');
-  assert.strictEqual(OMS_ENVIRONMENTS['Smart Routing'].baseUrl, 'https://sr-pos-oms-web.nisims.web.id');
+  assert.strictEqual(OMS_ENVIRONMENTS['Smart Routing'].baseUrl, 'https://pos-oms-staging-web.nisims.web.id/sr');
   assert.strictEqual(OMS_ENVIRONMENTS['Smart Routing'].apiEndpoint, 'https://sr-pos-oms-api.nisims.web.id/api/v1');
 
   assert(OMS_ENVIRONMENTS['Staging'], 'Must define Staging environment');
-  assert.strictEqual(OMS_ENVIRONMENTS['Staging'].baseUrl, 'https://pos-oms-staging-web.nisims.web.id/sr');
+  assert.strictEqual(OMS_ENVIRONMENTS['Staging'].baseUrl, 'https://pos-oms-staging-web.nisims.web.id');
   assert.strictEqual(OMS_ENVIRONMENTS['Staging'].apiEndpoint, 'https://pos-oms-staging-api.nisims.web.id/api/v1');
 
   const envList = getOmsEnvironmentList();
@@ -3371,12 +3371,12 @@ async function runBotTests() {
   assert.strictEqual(resolveOmsEnvironment('1').name, 'Smart Routing');
   assert.strictEqual(resolveOmsEnvironment('Smart Routing').name, 'Smart Routing');
   assert.strictEqual(resolveOmsEnvironment('smart-routing').name, 'Smart Routing');
-  assert.strictEqual(resolveOmsEnvironment('https://sr-pos-oms-web.nisims.web.id').name, 'Smart Routing');
+  assert.strictEqual(resolveOmsEnvironment('https://pos-oms-staging-web.nisims.web.id/sr').name, 'Smart Routing');
 
   assert.strictEqual(resolveOmsEnvironment('2').name, 'Staging');
   assert.strictEqual(resolveOmsEnvironment('Staging').name, 'Staging');
   assert.strictEqual(resolveOmsEnvironment('staging').name, 'Staging');
-  assert.strictEqual(resolveOmsEnvironment('https://pos-oms-staging-web.nisims.web.id/sr').name, 'Staging');
+  assert.strictEqual(resolveOmsEnvironment('https://pos-oms-staging-web.nisims.web.id').name, 'Staging');
 
   // Verify non-existent / invalid environments return null (never silently fall back)
   assert.strictEqual(resolveOmsEnvironment('3'), null, 'Selection 3 must be null');
@@ -3404,7 +3404,7 @@ async function runBotTests() {
   const mockRlEnv = createMockRl(['invalid', '99', '', '2']);
   const chosenEnv = await promptOmsEnvironment(mockRlEnv);
   assert.strictEqual(chosenEnv.name, 'Staging');
-  assert.strictEqual(chosenEnv.baseUrl, 'https://pos-oms-staging-web.nisims.web.id/sr');
+  assert.strictEqual(chosenEnv.baseUrl, 'https://pos-oms-staging-web.nisims.web.id');
 
   const mockRlEnv1 = createMockRl(['1']);
   const chosenEnv1 = await promptOmsEnvironment(mockRlEnv1);
@@ -3437,7 +3437,7 @@ async function runBotTests() {
 
   const srContext = createExecutionContext('Smart Routing');
   assert.strictEqual(srContext.environment, 'Smart Routing');
-  assert.strictEqual(srContext.omsUrl, 'https://sr-pos-oms-web.nisims.web.id');
+  assert.strictEqual(srContext.omsUrl, 'https://pos-oms-staging-web.nisims.web.id/sr');
   assert.strictEqual(srContext.apiEndpoint, 'https://sr-pos-oms-api.nisims.web.id/api/v1');
   assert.strictEqual(srContext.username, 'sr_tester@example.com');
   assert.strictEqual(srContext.password, 'sr_secret_mock');
@@ -3445,7 +3445,7 @@ async function runBotTests() {
 
   const stagingContext = createExecutionContext('Staging');
   assert.strictEqual(stagingContext.environment, 'Staging');
-  assert.strictEqual(stagingContext.omsUrl, 'https://pos-oms-staging-web.nisims.web.id/sr');
+  assert.strictEqual(stagingContext.omsUrl, 'https://pos-oms-staging-web.nisims.web.id');
   assert.strictEqual(stagingContext.apiEndpoint, 'https://pos-oms-staging-api.nisims.web.id/api/v1');
   assert.strictEqual(stagingContext.username, 'staging_tester@example.com');
   assert.strictEqual(stagingContext.password, 'staging_secret_mock');
@@ -3471,13 +3471,13 @@ async function runBotTests() {
   // Normal batch retains environment metadata
   const mockBatchResult = await executeBatch([], { environment: 'Staging' });
   assert.strictEqual(mockBatchResult.environment, 'Staging');
-  assert.strictEqual(mockBatchResult.environmentUrl, 'https://pos-oms-staging-web.nisims.web.id/sr');
+  assert.strictEqual(mockBatchResult.environmentUrl, 'https://pos-oms-staging-web.nisims.web.id');
   console.log('  [PASS] executeBatch environment validation and metadata attachment verified.');
 
   // 7. Execution History Persistence and View History Display with Environment Tagging
   const savedRecordStaging = saveExecutionRecord({
     environment: 'Staging',
-    environmentUrl: 'https://pos-oms-staging-web.nisims.web.id/sr',
+    environmentUrl: 'https://pos-oms-staging-web.nisims.web.id',
     request: 'Test staging order',
     menuOption: 'Single Order + Payment',
     orderType: 'domestic',
@@ -3492,12 +3492,12 @@ async function runBotTests() {
       vaNumber: '99990001',
       status: 'SUCCESS',
       environment: 'Staging',
-      environmentUrl: 'https://pos-oms-staging-web.nisims.web.id/sr',
+      environmentUrl: 'https://pos-oms-staging-web.nisims.web.id',
     }],
   });
 
   assert.strictEqual(savedRecordStaging.environment, 'Staging');
-  assert.strictEqual(savedRecordStaging.environmentUrl, 'https://pos-oms-staging-web.nisims.web.id/sr');
+  assert.strictEqual(savedRecordStaging.environmentUrl, 'https://pos-oms-staging-web.nisims.web.id');
   assert.strictEqual(savedRecordStaging.orders[0].environment, 'Staging');
 
   // Verify listExecutionRecords retrieves the environment
@@ -3517,7 +3517,7 @@ async function runBotTests() {
   await handleViewHistory(histRl);
   console.log = origHistLog;
 
-  assert(histLogs.some(l => l.includes('Environment: Staging (https://pos-oms-staging-web.nisims.web.id/sr)')), 'View history must display Environment header');
+  assert(histLogs.some(l => l.includes('Environment: Staging (https://pos-oms-staging-web.nisims.web.id)')), 'View history must display Environment header');
   assert(histLogs.some(l => l.includes('[Staging] Order: STG12345')), 'View history must tag order with [Staging]');
   console.log('  [PASS] Execution history persistence and handleViewHistory environment display verified.');
 

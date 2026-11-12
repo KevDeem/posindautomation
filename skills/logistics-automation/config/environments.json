@@ -5,7 +5,7 @@
       "name": "Smart Routing",
       "key": "smart-routing",
       "description": "Smart Routing OMS Environment",
-      "applicationUrl": "https://sr-pos-oms-web.nisims.web.id",
+      "applicationUrl": "https://pos-oms-staging-web.nisims.web.id/sr",
       "apiEndpoint": "https://sr-pos-oms-api.nisims.web.id/api/v1",
       "defaultAccount": "kevin.d.imas@gmail.com",
       "accounts": {
@@ -51,7 +51,7 @@
       "name": "Staging",
       "key": "staging",
       "description": "POSIND OMS Staging Environment",
-      "applicationUrl": "https://pos-oms-staging-web.nisims.web.id/sr",
+      "applicationUrl": "https://pos-oms-staging-web.nisims.web.id",
       "apiEndpoint": "https://pos-oms-staging-api.nisims.web.id/api/v1",
       "defaultAccount": "kevin.d.imas@gmail.com",
       "accounts": {
@@ -97,7 +97,7 @@
       "name": "Smart Routing",
       "key": "smart-routing",
       "description": "Legacy alias for Smart Routing OMS Environment",
-      "applicationUrl": "https://sr-pos-oms-web.nisims.web.id",
+      "applicationUrl": "https://pos-oms-staging-web.nisims.web.id/sr",
       "apiEndpoint": "https://sr-pos-oms-api.nisims.web.id/api/v1",
       "defaultAccount": "kevin.d.imas@gmail.com",
       "accounts": {
